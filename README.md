@@ -27,17 +27,23 @@
 
 ### Поддержать проект
 
-[![Donate ETH / USDT](https://img.shields.io/badge/Donate-ETH%20%7C%20USDT%20%7C%20BNB-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white)](https://etherscan.io/address/0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed)
+[![Donate BTC](https://img.shields.io/badge/Donate-BTC-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white)](https://mempool.space/address/bc1q472jja3q5zftdrsj07hnj44wjnh2kgup6ypzze)
+[![Donate ETH / USDT](https://img.shields.io/badge/Donate-ETH%20%7C%20USDT-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white)](https://etherscan.io/address/0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed)
+[![Donate USDT TRC-20](https://img.shields.io/badge/Donate-USDT%20TRC--20-EB0029?style=for-the-badge&logo=tether&logoColor=white)](https://tronscan.org/#/address/TDfN2H5ANr3oyBiN6BGgJWNBYDPEDACzsZ)
+[![Donate SOL](https://img.shields.io/badge/Donate-SOL-9945FF?style=for-the-badge&logo=solana&logoColor=white)](https://solscan.io/account/7C8F58uvaU3ooBtrmatbMfSTrL6abZVpw8Pxpc54rHRj)
 
-**Кошелёк (EVM):** `0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed`
+| Сеть | Что отправлять | Адрес |
+|---|---|---|
+| Bitcoin | BTC | `bc1q472jja3q5zftdrsj07hnj44wjnh2kgup6ypzze` |
+| Ethereum, BNB Smart Chain, Polygon, Arbitrum, Base | ETH, BNB, USDT, USDC | `0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed` |
+| TRON | USDT (TRC-20), TRX | `TDfN2H5ANr3oyBiN6BGgJWNBYDPEDACzsZ` |
+| Solana | SOL, USDT, USDC | `7C8F58uvaU3ooBtrmatbMfSTrL6abZVpw8Pxpc54rHRj` |
 
-Принимаются ETH, USDT и USDC в сетях Ethereum (ERC-20), BNB Smart Chain (BEP-20), Polygon,
-Arbitrum и Base. Донаты двигают разработку: hh регулярно меняет вёрстку, и бота приходится
-подстраивать.
+Донаты двигают разработку: hh регулярно меняет вёрстку, и бота приходится подстраивать.
 
 > [!CAUTION]
-> Это адрес EVM-кошелька. Не отправляйте на него BTC и USDT в сети TRON (TRC-20): такие переводы
-> не дойдут.
+> Отправляйте монету только на адрес её сети из таблицы. Перевод в чужую сеть, например USDT
+> TRC-20 на адрес Ethereum, не дойдёт.
 
 Не хотите платить, поставьте звезду: так бот проще найти другим соискателям.
 

@@ -1,1 +1,5 @@
-custom: ["https://etherscan.io/address/0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed"]
+custom:
+  - "https://mempool.space/address/bc1q472jja3q5zftdrsj07hnj44wjnh2kgup6ypzze"
+  - "https://etherscan.io/address/0xdc07c830a2E7A641f28465dc69aaf94e622c64Ed"
+  - "https://tronscan.org/#/address/TDfN2H5ANr3oyBiN6BGgJWNBYDPEDACzsZ"
+  - "https://solscan.io/account/7C8F58uvaU3ooBtrmatbMfSTrL6abZVpw8Pxpc54rHRj"
