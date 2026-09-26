@@ -1,0 +1,90 @@
+# HeadHunter Bot & Python GitIgnore
+
+# Личные конфигурации и токены (НЕ загружать в репозиторий)
+hh_token.json
+hh_app_token.json
+hh_token_debug.json
+hh_selenium_config.json
+.env
+
+# Сессия и профиль браузера (содержит cookies и авторизацию)
+chrome_profile/
+profiles/
+docker-data/
+.run.lock
+
+# Локальные базы данных и кеш
+*.db
+*.sqlite
+*.sqlite3
+hh_data.db
+vacancies_cache.json
+applied_vacancies.json
+applied_vacancies_selenium.json
+external_vacancies.csv
+
+# Резервные копии
+*.backup*
+*.bak
+
+# Флаги управления процессами
+*.flag
+pause.flag
+stop.flag
+
+# Лог-файлы
+*.log
+
+# Отчеты аудита
+rejection_analysis_report.md
+rejection_analysis_report.html
+
+# Временные каталоги
+scratch/
+
+# Python и окружение
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env/
+.venv/
+
+# Pytest / Тестирование
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE и редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Резервные копии с суффиксом (hh_selenium_config.json.bak-service и т.п.):
+# шаблон *.bak их не ловил, а в копиях настроек — ключи API и личные данные.
+*.bak-*
+*.bak.*
+*.db.bak*
+*.broken-*
+*.tmp
+
+# Личные данные и состояние бота
+ai_stats.json
+bump_schedule.json
+rejected_chats_cache.json
+email_outreach_log.json
+chrome_window_geometry.json
+resume_text.txt
+about_backup_*.txt
+chat_rejection_analysis_report.md
+chat_rejection_analysis_report.html
+*.bak*
+resume_dump.json
+vacancies_with_tests.json
+screenshoot/
+.agents/

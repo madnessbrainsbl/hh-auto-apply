@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    environment:
+      HH_PROFILE_ID: ${HH_PROFILE_ID:-default}
+    volumes:
+      - hh_data:/data
+    command: ["python", "hh.py", "schedule", "--headless", "--every-minutes", "${HH_INTERVAL_MINUTES:-240}"]
+  auth:
+    build: .
+    init: true
+    profiles: [tools]
+    shm_size: 1gb
+    environment:
+      HH_PROFILE_ID: ${HH_PROFILE_ID:-default}
+      DISPLAY: :99
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - hh_data:/data
+    command: ["python", "docker_login.py"]
+volumes:
+  hh_data:

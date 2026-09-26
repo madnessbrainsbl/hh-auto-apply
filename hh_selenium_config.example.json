@@ -1,0 +1,43 @@
+{
+  "resume_id": "",
+  "resume_title": "",
+  "search_url": "",
+  "api_cache_file": "vacancies_cache.json",
+  "cover_letter": "Добрый день! Заинтересован в данной позиции. Буду рад обсудить задачи компании.",
+  "max_applications": 200,
+  "skip_with_tests": true,
+  "skip_applied": true,
+  "search_queries": [],
+  "topup_enabled": true,
+  "topup_search_queries": [],
+  "keywords_include": [],
+  "keywords_exclude": [],
+  "search_area": "113",
+  "max_search_pages": 50,
+  "max_consecutive_failures": 6,
+  "ai_config": {
+    "enabled": true,
+    "provider": "gemini",
+    "model": "gemini-flash-latest",
+    "api_key": "",
+    "timeout_seconds": 15,
+    "temperature": 0.3
+  },
+  "candidate_profile": {},
+  "answer_policy": {
+    "yes_to_conditions": true,
+    "detailed_answers": true
+  },
+  "letter_after_response": true,
+  "neutral_answer": "Готов обсудить этот вопрос на собеседовании",
+  "ai_filter": {
+    "mode": "off",
+    "prompt": ""
+  },
+  "captcha": {
+    "enabled": false,
+    "max_attempts": 2,
+    "timeout_seconds": 20,
+    "model": ""
+  }
+}
