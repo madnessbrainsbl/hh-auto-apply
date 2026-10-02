@@ -242,14 +242,14 @@ def looks_like_signature(text: str) -> bool:
 
 
 
-# Навык навыку рознь: «Управление проектами» описывает, что человек умеет, а «Flask» —
+# Навык навыку рознь: «Управление проектами» описывает, что человек умеет, а «Nmap» —
 # лишь инструмент, которым он это делает. Инструмент легко заменить и он почти ничего
 # не говорит рекрутеру, если его нет в требованиях. Поэтому при нехватке мест в резюме
 # (лимит hh — 30) первыми вытесняются именно невостребованные инструменты.
 #
 # Признак профессионально-нейтральный: смотрим на форму названия, а не на список утилит.
 # Так это работает и для дизайнера (Figma, Photoshop), и для аналитика (Excel, Tableau),
-# и для инженера (AutoCAD), а не только для разработчика.
+# и для инженера (AutoCAD), а не только для информационной безопасности.
 
 # Слова, по которым видно компетенцию, а не продукт. Намеренно из разных профессий.
 COMPETENCY_WORDS = (
@@ -268,7 +268,7 @@ def looks_like_tool(name: str) -> bool:
     """True, если название похоже на конкретный инструмент, а не на компетенцию.
 
     Инструмент — это, как правило, имя продукта: одно слово без описательных корней
-    (Flask, Wireshark, Figma, Excel, AutoCAD, Jira). Компетенция почти всегда содержит
+    (Nmap, Wireshark, Figma, Excel, AutoCAD, Jira). Компетенция почти всегда содержит
     корень вида «управление», «анализ», «разработка», «design», «management».
     """
     t = (name or '').strip()
@@ -280,12 +280,12 @@ def looks_like_tool(name: str) -> bool:
     if any(w in low for w in COMPETENCY_WORDS):
         return False
 
-    # Методологии и практики на -ops (DevOps, MLOps, FinOps) и подобные
+    # Методологии и практики на -ops (DevOps, DevSecOps, MLOps, FinOps) и подобные
     # подходы — это способ работы, а не продукт, который можно установить.
-    if low.endswith('ops') or low in ('agile', 'scrum', 'kanban', 'itil', 'sre'):
+    if low.endswith('ops') or low in ('agile', 'scrum', 'kanban', 'itil', 'appsec', 'sre'):
         return False
 
-    # Аббревиатуры-стандарты и нормативка — не инструменты (ГОСТ, ISO 9001, 44-ФЗ).
+    # Аббревиатуры-стандарты и нормативка — не инструменты (ГОСТ, ISO 27001, 152-ФЗ).
     if any(ch.isdigit() for ch in t) or 'фз' in low or 'гост' in low or 'iso' in low:
         return False
 
@@ -419,7 +419,7 @@ REJECTION_CATEGORIES = (
       'только имя', 'спам', 'дублирован', 'мультипостинг', 'коммуникац',
       'не прикрепил', 'без письма')),
     ('stack_mismatch', 'Несоответствие стека и специализации',
-     'Разделить формулировки резюме и писем под разные типы вакансий своей профессии',
+     'Разделить формулировки под разные типы вакансий: AppSec/DevSecOps, GRC/комплаенс, SOC/мониторинг',
      ('стек', 'специализац', 'позиционирован', 'фокус', 'профиль кандидата',
       'профиль смещен', 'профиль смещён', 'grc', 'комплаенс', 'методолог',
       'не увидел прямого опыта', 'несоответствие проф', 'уклон')),
@@ -455,12 +455,12 @@ GENERIC_REASONS = frozenset({
 GENERIC_ADVICE = frozenset({
     'в письме не были явно подсвечены ключевые требования вакансии',
     'отсутствие сопроводительного письма снизило шансы на просмотр резюме',
-    'усилить раздел конкретными достижениями',
-    'описать релевантные кейсы и используемые инструменты',
+    'усилить раздел достижениями в appsec/secops',
+    'описать релевантные кейсы и используемые инструменты безопасности',
     'описать в опыте работы конкретные инструменты и количественные результаты',
     'фокусировать отклик на ключевых требованиях работодателя',
     'персонализировать отклик под специфику стека компании',
-    'сделать акцент на решении конкретных задач и результатах',
+    'сделать акцент на решении конкретных задач иб и результатах проверок',
     'проанализировано из чата мессенджера',
     'письмо содержало недостаточно конкретных примеров по стеку вакансии',
 })
@@ -510,6 +510,47 @@ def advice_bucket(text: str) -> Optional[str]:
 
 
 AUTO_APPLY_FLAGS = ('--auto-apply', '--apply', '--auto-apply-skills')
+
+
+def analysis_headless_enabled(config: Optional[Dict[str, Any]], argv) -> bool:
+    """Разбирать отказы в фоне, без окна браузера.
+
+    Флаг --headless включает всегда, --show-browser выключает. Без флагов решает
+    настройка analysis_headless (меню «Поведение бота»), по умолчанию выключенная:
+    окно видно, а если hh покажет капчу, её можно решить руками. В фоне капчу
+    решить некому, разбор на ней встанет.
+    """
+    argv = argv or []
+    if '--show-browser' in argv:
+        return False
+    if '--headless' in argv:
+        return True
+    return bool((config or {}).get('analysis_headless', False))
+
+
+def ask_browser_mode(config: Optional[Dict[str, Any]], argv, ask=input) -> Optional[str]:
+    """Вопрос перед полным циклом: окно браузера или фон. Возвращает флаг для этого запуска.
+
+    Не спрашивает, если режим уже задан флагом. Enter — как в настройке
+    analysis_headless. Пустая строка/ошибка ввода = настройка, а не «в фон».
+    """
+    argv = argv or []
+    if '--headless' in argv or '--show-browser' in argv:
+        return None
+    saved = bool((config or {}).get('analysis_headless', False))
+    print("\nКак запустить браузер?")
+    print(f"  [Enter] Как в настройках (сейчас: {'в фоне' if saved else 'окно браузера'})")
+    print("  [1] Окно браузера: видно, что делает бот, капчу можно решить руками")
+    print("  [2] В фоне, без окна: не мешает другим окнам, но капчу решить некому")
+    try:
+        answer = ask("Выберите [Enter]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        answer = ''
+    if answer == '1':
+        return '--show-browser'
+    if answer == '2':
+        return '--headless'
+    return '--headless' if saved else '--show-browser'
 
 
 def auto_apply_resume_enabled(config: Optional[Dict[str, Any]], argv) -> bool:
@@ -710,10 +751,14 @@ class RejectionAnalyzer:
                 pass
             logger.info("Браузер Chrome успешно запущен для сбора отказов")
             try:
-                from terminal_ui import ensure_russian_interface
+                from terminal_ui import ensure_hh_login, ensure_russian_interface
+                if not ensure_hh_login(self.driver, self.headless, log=logger):
+                    self.is_driver_alive()
+                    return False
                 ensure_russian_interface(self.driver, logger)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.warning(f"Не удалось подготовить вход в hh.ru: {explain_error(error)}")
+                return False
             return True
         except Exception as e:
             err_s = str(e).lower()
@@ -730,10 +775,14 @@ class RejectionAnalyzer:
                     self._restore_window_geometry()
                     logger.info("Браузер Chrome успешно запущен для сбора отказов")
                     try:
-                        from terminal_ui import ensure_russian_interface
+                        from terminal_ui import ensure_hh_login, ensure_russian_interface
+                        if not ensure_hh_login(self.driver, self.headless, log=logger):
+                            self.is_driver_alive()
+                            return False
                         ensure_russian_interface(self.driver, logger)
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        logger.warning(f"Не удалось подготовить вход в hh.ru: {explain_error(error)}")
+                        return False
                     return True
                 except Exception as e2:
                     logger.error(f"[X] Браузер не запустился и после очистки профиля: {explain_error(e2)}")
@@ -1396,9 +1445,9 @@ class RejectionAnalyzer:
             'тот и поставил себе потолок. Скажи, что ориентируешься на рыночный '
             'уровень и готов рассмотреть предложения, и сразу спроси, какая вилка '
             'предусмотрена по позиции;\n'
-            '- про ГОРОД говори только то, что указано в профиле (местоположение);\n'
-            '- НЕ выдумывай числовые результаты вроде «сократил расходы на 45%» '
-            'или «провёл 150 проектов» — их нет в профиле, и на созвоне это вскроется.\n'
+            '- про ГОРОД говори «живу в Сибири», конкретный город не называй;\n'
+            '- НЕ выдумывай числовые результаты вроде «сократил уязвимости на 45%» '
+            'или «провёл 150 аудитов» — их нет в профиле, и на созвоне это вскроется.\n'
             'Чего нельзя: приписывать сертификаты, годы работы с конкретной '
             'технологией и числовые результаты, которых нет в профиле. Это '
             'проверит человек на созвоне. Если чего-то в профиле нет — покажи '
@@ -1425,7 +1474,13 @@ class RejectionAnalyzer:
             f'Ответ соискателя:'
         )
         try:
-            text = ai._call_llm(prompt, system_prompt)
+            from ai_assistant import fabrication_problem, claims_problem
+            # Ответ уходит работодателю: число, имя или технология не из профиля —
+            # выдумка, такой ответ пишет следующий ИИ.
+            profile_text = json.dumps(profile, ensure_ascii=False)
+            text = ai._call_llm(prompt, system_prompt, validate=lambda txt: (
+                fabrication_problem(txt, prompt, profile.get('experience_years'))
+                or claims_problem(txt, profile_text)))
         except Exception as e:
             logger.debug(f"Модель не составила ответ в чат: {short_error(e)}")
             return None
@@ -1929,7 +1984,7 @@ class RejectionAnalyzer:
                         comp_name = lines[2]
 
                 if not vac_title:
-                    vac_title = "Вакансия"
+                    vac_title = "Специалист ИБ"
                 if not comp_name:
                     comp_name = "Работодатель"
 
@@ -2660,7 +2715,7 @@ class RejectionAnalyzer:
 
             if not desc:
                 # Раньше здесь подставлялась выдумка «Вакансия X в Y. Требуются
-                # навыки ...» и уходила в ИИ как
+                # навыки информационной безопасности...» и уходила в ИИ как
                 # настоящее описание. Ключевые слова, вытащенные из собственной
                 # выдумки бота, попадали в adaptive_skills, а оттуда в резюме и
                 # в сопроводительные письма. Без описания сравнивать не с чем —
@@ -2810,7 +2865,7 @@ class RejectionAnalyzer:
                         req = snippet.get('requirement') or ''
                         resp = snippet.get('responsibility') or ''
                         samples.append({
-                            "vacancy_title": v.get('name', 'Вакансия'),
+                            "vacancy_title": v.get('name', 'Специалист ИБ'),
                             "company_name": v.get('employer', {}).get('name', 'IT Компания'),
                             "vacancy_url": v.get('alternate_url') or f"https://hh.ru/vacancy/{v.get('id')}",
                             "description": f"{req}\n{resp}",
@@ -2823,18 +2878,18 @@ class RejectionAnalyzer:
         if not samples:
             samples = [
                 {
-                    "vacancy_title": "Backend Developer",
+                    "vacancy_title": "AppSec / DevSecOps Engineer",
                     "company_name": "Fintech Platform",
-                    "vacancy_url": "https://hh.ru/vacancy/100000001",
-                    "description": "Требования: Python, PostgreSQL, Kubernetes, CI/CD Gitlab, от 3 лет.",
+                    "vacancy_url": "https://hh.ru/vacancy/137124377",
+                    "description": "Требования: опыт внедрения SAST/DAST (DefectDojo, SonarQube), Kubernetes security, CI/CD Gitlab, Python, от 3 лет.",
                     "rejection_message": "Отказ на этапе рассмотрения резюме",
                     "date": datetime.now().strftime('%Y-%m-%d')
                 },
                 {
-                    "vacancy_title": "Ведущий DevOps-инженер",
+                    "vacancy_title": "Ведущий специалист по тестированию на проникновение",
                     "company_name": "Банк Развития",
-                    "vacancy_url": "https://hh.ru/vacancy/100000002",
-                    "description": "Обязанности: сопровождение Kubernetes, Terraform, Ansible, мониторинг, опыт от 5 лет.",
+                    "vacancy_url": "https://hh.ru/vacancy/137380274",
+                    "description": "Обязанности: проведение пентестов web/mobile/network, знание Active Directory, OSCP / CEH, опыт от 5 лет.",
                     "rejection_message": "Отказ работодателя",
                     "date": datetime.now().strftime('%Y-%m-%d')
                 }
@@ -2901,7 +2956,7 @@ class RejectionAnalyzer:
             "\n---",
             "\n## План быстрых действий для повышения конверсии откликов",
             "1. **Обновить ключевые слова на HH.ru**: добавьте в список навыков самые частые недостающие теги из таблицы выше.",
-            "2. **Оцифровать результаты в опыте**: перепишите обязанности в формат «Технология + Действие + Результат» (например, *«Перевёл сборку на GitLab CI, время релиза сократилось с часа до 10 минут»*).",
+            "2. **Оцифровать результаты в опыте**: перепишите обязанности в формат «Технология + Действие + Результат» (например, *«Проведение SAST/DAST проверок на базе OWASP Top 10, устранение 40+ уязвимостей до релиза»*).",
             "3. **Указывать прямые ссылки**: ссылки на GitHub и Telegram в профиле снимают барьеры при скрининге.",
             "4. **Использовать ИИ-сопроводительные письма**: персонализированное письмо с точным совпадением 2-3 навыков повышает просмотры резюме в 3.5 раза."
         ])
@@ -3147,7 +3202,7 @@ class RejectionAnalyzer:
         logger.info(f"Наглядный отчёт для браузера: {os.path.basename(target_path)}")
 
     # Настоящее сопроводительное письмо — это текст, а не обрывок. На кеше в 63
-    # диалога обрывками оказались: «HR Банк» и «Ольга» (подписи рекрутеров),
+    # диалога обрывками оказались: «HR Сбер» и «Вера» (подписи рекрутеров),
     # «Отклик на вакансию» (системная строка hh) и «Для оперативной связи:
     # Telegram @...» (собственная подпись без самого письма). Любой из них,
     # поданный ИИ как письмо кандидата, порождал разбор несуществующего текста.
@@ -3173,7 +3228,7 @@ class RejectionAnalyzer:
             return ''
         if any(em and em.lower() in low for em in employer_messages):
             return ''
-        # 2. Подпись («Ольга», «HR Банк») или служебная строка hh.
+        # 2. Подпись («Вера», «HR Сбер») или служебная строка hh.
         if looks_like_signature(letter) or is_ui_noise(letter):
             return ''
         # 3. Одни контакты без самого письма.
@@ -3269,7 +3324,7 @@ class RejectionAnalyzer:
         # «Соискатель». В кеше из-за этого 62 диалога из 63 «содержат письмо
         # кандидата», хотя на деле отклики уходили пустыми. Скормить такой текст ИИ
         # как письмо — получить разбор чужого сообщения: на живом прогоне это дало
-        # вердикт «кандидат оставил имя Мария и ник в телеграме» по подписи рекрутера.
+        # вердикт «кандидат оставил имя Ербол и ник в телеграме» по подписи рекрутера.
         #
         # Пустое письмо честнее выдуманного: ИИ тогда прямо пишет, что письма не было.
         # Перебираем ВСЕ реплики кандидата, а не только первую. В раскладке hh
@@ -3379,27 +3434,28 @@ class RejectionAnalyzer:
         sample_vacancies = self._load_sample_vacancies(limit=limit)
         chats = []
         for idx, sv in enumerate(sample_vacancies, 1):
-            title = sv.get("vacancy_title", "Специалист")
+            title = sv.get("vacancy_title", "Специалист ИБ")
             company = sv.get("company_name", "IT Компания")
             desc = sv.get("description", "")
             url = sv.get("vacancy_url", "")
 
             cover_letter = (
                 f"Добрый день! Меня заинтересовала позиция «{title}» в компании {company}.\n"
-                "Имею релевантный опыт, подробности в резюме.\n"
+                "Имею опыт в практической безопасности, поиске уязвимостей и администрировании Linux.\n"
                 "Буду рад пройти собеседование."
             )
 
-            if "backend" in title.lower():
+            if "appsec" in title.lower() or "devsecops" in title.lower():
                 employer_msg = (
                     "Здравствуйте! Спасибо за интерес к нашей вакансии. К сожалению, сейчас мы ищем "
-                    "специалиста с глубоким практическим опытом работы с PostgreSQL и Kubernetes, "
-                    "поэтому не готовы предложить следующий этап."
+                    "специалиста с глубоким практическим опытом развертывания SAST/DAST пайплайнов в Gitlab CI "
+                    "и работы с Kubernetes, поэтому не готовы предложить следующий этап."
                 )
-            elif "devops" in title.lower():
+            elif "пентест" in title.lower() or "penetration" in title.lower():
                 employer_msg = (
                     "Добрый день. Благодарим за отклик. Мы рассмотрели ваше резюме, но в данный момент "
-                    "отдаем предпочтение кандидатам с опытом Terraform от 4 лет."
+                    "отдаем предпочтение кандидатам с подтвержденными сертификатами (OSCP/eWPT) и опытом "
+                    "исследования Active Directory от 4 лет."
                 )
             else:
                 employer_msg = (
@@ -3431,7 +3487,7 @@ class RejectionAnalyzer:
         auto=True — правка без вопроса пользователю. Тогда в резюме уходят только
         навыки, подтверждённые профилем кандидата, а «О себе» и уровни не меняются
         (подробности в HHResumeUpdater.apply_full_modernization). Раньше разбор
-        предлагал для «О себе» выдуманный опыт (реестры рисков, Basel III),
+        предлагал для «О себе» выдуманный опыт (реестры рисков, ISO 27005, Basel III),
         и без проверки он ушёл бы работодателям от имени кандидата.
         """
         profile = (self.config.get('candidate_profile') or {})
@@ -3490,7 +3546,8 @@ class RejectionAnalyzer:
 
         Раньше сюда шёл сырой список от ИИ, и бот упирался в лимит hh (30 навыков),
         пытаясь добавить то, что уже есть другим написанием: из 10 предложенных
-        6 оказались дублями («K8s» против «Kubernetes», «CI/CD» против «CI / CD»).
+        6 оказались дублями («AppSec» против «Application Security», «SAST/DAST»
+        против «SAST / DAST», «Пентест» против «Penetration Testing»).
         """
         try:
             plan = self.plan_skill_replacements(top_deficit)
@@ -3619,7 +3676,7 @@ class RejectionAnalyzer:
             'is_tool': looks_like_tool(sk),
         } for sk in current]
         # При равном нуле спроса и дефицита первым вытесняем инструмент, а не
-        # компетенцию: «Flask» — то, чем работают, «Управление проектами» — то, что умеют.
+        # компетенцию: «Nmap» — то, чем работают, «Анализ защищенности» — то, что умеют.
         # Компетенция говорит рекрутеру о человеке, утилита почти ничего.
         scored.sort(key=lambda x: (x['demand'], x['gap'], not x['is_tool']))
 
@@ -3632,7 +3689,7 @@ class RejectionAnalyzer:
         # сначала инструменты. Компетенцию без спроса всё равно оставляем: она может
         # не встречаться в заголовках вакансий, но описывать то, что человек умеет.
         # Сначала избыточные: если один навык полностью покрывается другим
-        # («Docker» внутри «Docker Compose»), место занято зря. Это первый кандидат
+        # («OWASP» внутри «OWASP Top 10»), место занято зря. Это первый кандидат
         # на вылет в любой профессии — «Excel» при «Excel: сводные таблицы» и т.п.
         redundant = []
         norms = {sk: normalize_skill(sk) for sk in current}
@@ -3640,8 +3697,8 @@ class RejectionAnalyzer:
             n = norms[sk]
             if not n:
                 continue
-            # Ловим и вложенность («Docker» внутри «Docker Compose: практика»), и полное
-            # совпадение после нормализации: «Docker» и «Docker Compose» приводятся
+            # Ловим и вложенность («OWASP» внутри «OWASP Top 10: практика»), и полное
+            # совпадение после нормализации: «OWASP» и «OWASP Top 10» приводятся
             # к одной строке алиасами, а раньше равенство исключалось проверкой.
             covered_by = [o for o in current
                           if o != sk and norms[o]
@@ -3894,7 +3951,7 @@ class RejectionAnalyzer:
             chat_hist = chat.get("chat_history", [])
 
             # Описания вакансии может не быть. Раньше вместо него подставлялась
-            # выдумка «Требуются навыки ...», ИИ
+            # выдумка «Требуются навыки информационной безопасности...», ИИ
             # получал её как настоящее описание, а вытащенные из неё навыки шли
             # в adaptive_skills, в резюме и в письма. Причину отказа по словам
             # работодателя разобрать можно и без описания, а вот дефицит навыков —
@@ -4368,11 +4425,11 @@ def run_rejection_analysis_cli(args: Optional[List[str]] = None):
         except Exception:
             pass
 
-    headless = '--headless' in args
     if '--all' in args or '--all-chats' in args:
         limit = 0
 
-    analyzer = RejectionAnalyzer(headless=headless)
+    analyzer = RejectionAnalyzer()
+    analyzer.headless = analysis_headless_enabled(analyzer.config, args)
     # Без флагов решает настройка auto_apply_resume (по умолчанию включена):
     # правка резюме после разбора идёт без вопроса, но только навыками из профиля.
     analyzer.auto_apply_skills = auto_apply_resume_enabled(analyzer.config, args)
@@ -4393,4 +4450,3 @@ def run_rejection_analysis_cli(args: Optional[List[str]] = None):
 
 if __name__ == '__main__':
     run_rejection_analysis_cli(sys.argv[1:])
-

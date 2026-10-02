@@ -33,26 +33,26 @@ DEFAULT_CANDIDATE_PROFILE: Dict[str, Any] = {
     "about": ""
 }
 
-# Стек, который ищется в тексте вакансии при разборе отказа.
-TECH_KEYWORDS = [
-    'python', 'go', 'golang', 'java', 'kotlin', 'c++', 'c#', 'javascript', 'typescript',
-    'react', 'vue', 'node.js', 'php', 'bash', 'powershell', 'sql', 'postgresql', 'mysql',
-    'redis', 'kafka', 'rabbitmq', 'docker', 'kubernetes', 'k8s', 'ci/cd', 'gitlab',
-    'github actions', 'terraform', 'ansible', 'aws', 'linux', 'windows', 'active directory',
-]
 
 
-
-# Один и тот же навык пишется по-разному: «k8s» и «kubernetes», «CI/CD» и
-# «ci / cd». Простое вхождение подстроки такие пары не ловило, и навык, который
-# у кандидата ЕСТЬ, попадал в дефицитные.
+# Один и тот же навык пишется по-разному: «appsec» и «application security»,
+# «SAST/DAST» и «sast / dast», «CI/CD» и «ci / cd». Простое вхождение подстроки
+# такие пары не ловило, и навык, который у кандидата ЕСТЬ, попадал в дефицитные.
+# Из-за этого ATS Match Score занижался, а бот «доучивал» уже имеющиеся навыки:
+# в топе дефицита стояли appsec (12 раз) и SAST/DAST (9 раз) при наличии
+# «application security» и «sast / dast» в профиле.
 SKILL_ALIASES = {
+    'appsec': 'application security',
+    'application security': 'application security',
+    'devsecops': 'devsecops',
+    'pentest': 'penetration testing',
+    'пентест': 'penetration testing',
+    'penetration testing': 'penetration testing',
+    'owasp': 'owasp top 10',
+    'owasp top 10': 'owasp top 10',
     'ad': 'active directory',
     'k8s': 'kubernetes',
-    'golang': 'go',
-    'postgres': 'postgresql',
-    'js': 'javascript',
-    'ts': 'typescript',
+    'иб': 'информационная безопасность',
 }
 
 
@@ -89,24 +89,33 @@ def normalize_skill(name: str) -> str:
 
 
 # Как навык пишут люди. Канонический ключ в базе — строчный (нужен для сверки и
-# счётчиков), но письмо читает работодатель, и строка «стек: postgresql,
-# github actions, node.js» выдаёт машинную генерацию с первого взгляда.
+# счётчиков), но письмо читает работодатель, и строка «стек: application security,
+# devsecops, owasp top 10» выдаёт машинную генерацию с первого взгляда.
 SKILL_DISPLAY = {
+    'application security': 'Application Security',
+    'penetration testing': 'Penetration Testing',
+    'devsecops': 'DevSecOps',
+    'appsec': 'AppSec',
+    'owasp top 10': 'OWASP Top 10',
+    'sast/dast': 'SAST/DAST',
+    'ci/cd security': 'CI/CD Security',
     'ci/cd': 'CI/CD',
     'active directory': 'Active Directory',
-    'github actions': 'GitHub Actions',
-    'gitlab': 'GitLab',
-    'postgresql': 'PostgreSQL',
-    'mysql': 'MySQL',
-    'javascript': 'JavaScript',
-    'typescript': 'TypeScript',
-    'node.js': 'Node.js',
-    'rabbitmq': 'RabbitMQ',
+    'pci dss': 'PCI DSS',
+    'burp suite': 'Burp Suite',
+    'kali linux': 'Kali Linux',
+    'threat modeling': 'Threat Modeling',
+    'incident response': 'Incident Response',
+    'web security': 'Web Security',
+    'api security': 'API Security',
+    'iso 27001': 'ISO 27001',
 }
 
 # Слова, которые пишутся заглавными целиком.
-_UPPER_TOKENS = {'iam', 'api', 'ci', 'cd', 'sql', 'vpn', 'dns', 'tls', 'ssl',
-                 'aws', 'gcp', 'php', 'crm', 'erp', 'etl', 'bi', 'ui', 'ux', 'qa'}
+_UPPER_TOKENS = {'sast', 'dast', 'siem', 'soc', 'waf', 'dlp', 'edr', 'xdr', 'iam',
+                 'api', 'ci', 'cd', 'sql', 'xss', 'ssrf', 'rce', 'vpn', 'dns',
+                 'tls', 'ssl', 'aws', 'gcp', 'kkm', 'grc', 'ids', 'ips', 'pam',
+                 'фстэк', 'фсб', 'гост', 'скзи', 'иб', 'асу', 'тп', 'кии'}
 
 
 def display_skill(name: str) -> str:
@@ -134,8 +143,8 @@ def display_skill(name: str) -> str:
             elif not piece[:1].isalpha():
                 parts.append(piece)
             elif piece[:1] in 'абвгдежзийклмнопрстуфхцчшщъыьэюя':
-                # Русская фраза пишется как предложение: «Управление проектами»,
-                # а не «Управление Проектами» — второе выглядит переводом с английского.
+                # Русская фраза пишется как предложение: «Анализ защищенности»,
+                # а не «Анализ Защищенности» — второе выглядит переводом с английского.
                 parts.append(piece[:1].upper() + piece[1:] if idx == 0 else piece)
             else:
                 parts.append(piece[:1].upper() + piece[1:])
@@ -199,8 +208,25 @@ _SERVICE_MARKERS = (
     'is not supported', 'unsupported model', 'model not found', 'has been deprecated',
     'rate limit', 'quota exceeded', 'exceeded your', 'please try again later',
     'internal server error', 'service unavailable', 'invalid api key',
-    'as an ai', 'как языковая модель', 'я языковая модель', 'я — языковая модель',
 )
+# Модель рассказывает о себе, а не отвечает — это ловим в тексте любой длины.
+_IDENTITY_MARKERS = ('as an ai', 'как языковая модель', 'я языковая модель', 'я — языковая модель')
+# Ошибка сервиса — это весь ответ целиком, короткий. В длинном тексте те же слова
+# бывают по делу: 29.09 разбор отказа на SRE-вакансию («rate limit», «service
+# unavailable» в задачах роли) принимался за ошибку, и модель выключалась до конца прогона.
+_SERVICE_MESSAGE_MAX = 400
+
+
+SALARY_ANSWER = ('Ориентируюсь на рыночный уровень и готов рассмотреть ваши предложения. '
+                 'Подскажите, какая вилка предусмотрена по этой позиции?')
+_SALARY_MARKERS = ('зарплат', 'заработн', 'оклад', 'доход', 'salary', 'ожидания по зп',
+                   'на руки', 'финансовые ожидания', 'компенсаци', 'вознагражден')
+
+
+def is_salary_question(text: str) -> bool:
+    """Вопрос о деньгах. Сумму бот не называет: кто назвал число первым, тот и поставил потолок."""
+    low = str(text or '').lower()
+    return any(m in low for m in _SALARY_MARKERS)
 
 
 def service_message_problem(text: str) -> Optional[str]:
@@ -209,21 +235,197 @@ def service_message_problem(text: str) -> Optional[str]:
     Работодатель не должен получить «Gemini 3.5 Flash is no longer available».
     Английский сам по себе не признак: на английский вопрос отвечают по-английски.
     """
-    low = (text or '').strip().lower()
-    for marker in _SERVICE_MARKERS:
-        if marker in low:
-            return f'служебное сообщение сервиса («{text.strip()[:60]}…»)'
+    raw = (text or '').strip()
+    low = raw.lower()
+    if any(marker in low for marker in _IDENTITY_MARKERS):
+        return f'служебное сообщение сервиса («{raw[:60]}…»)'
+    # JSON по нашей схеме (разбор отказа, пакет ответов анкеты) — это ответ модели.
+    if raw.lstrip('`').lstrip('json').lstrip().startswith(('{', '[')):
+        return None
+    if len(raw) <= _SERVICE_MESSAGE_MAX and any(marker in low for marker in _SERVICE_MARKERS):
+        return f'служебное сообщение сервиса («{raw[:60]}…»)'
     return None
 
 
 _LEGAL_FORMS = ('ооо', 'оао', 'зао', 'пао', 'ао', 'тоо', 'ип', 'llc', 'llp', 'jsc', 'ltd', 'фгуп', 'гуп', 'мку')
 
 
+def _connection_refused(error) -> bool:
+    """Соединение не установилось вовсе (сервис не запущен), а не оборвалось посреди ответа."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        text = f"{type(error).__name__} {error}".lower()
+        if 'connecterror' in text or 'refused' in text or '10061' in text or 'getaddrinfo' in text:
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+_NUMBER = re.compile(r'(?<![\w-])\d+(?:[.,]\d+)?(?!\w)')
+_ADDRESSED_NAME = re.compile(
+    r'(?:(?i:уважаем\w*)\s+|(?i:здравствуйте|добрый день|доброе утро|добрый вечер),\s*)'
+    r'([А-ЯЁ][а-яё]{2,})\b'
+    r'|^\s*([А-ЯЁ][а-яё]{2,}),\s*(?i:здравствуйте|добрый день|доброе утро|добрый вечер)')
+# Обращение без имени: «Уважаемые Коллеги», «Здравствуйте, Команда».
+_NOT_NAMES = {'коллеги', 'команда', 'рекрутер', 'господа', 'работодатель', 'компания',
+              'специалист', 'менеджер', 'руководитель', 'друзья', 'партнеры', 'партнёры'}
+
+
+def fabrication_problem(text: str, source: str, experience_years=None) -> Optional[str]:
+    """Что ИИ выдумал относительно исходных данных (профиль, вакансия, переписка), или None.
+
+    28.09 разбор отказов через Groq писал в «О себе» и в письма «более 15
+    проектов», «6,5 лет руководил командой», ISO 27001, обращался к «Татьяне»,
+    которой в переписке не было. Человек копирует это в резюме и в чат.
+    Проверяем только то, что сверяется механически: числа и имена в обращении.
+    """
+    t, src = str(text or ''), str(source or '')
+    # Числа источника — любые цифровые группы, в том числе «00» из «14-00».
+    src_numbers = {n.replace(',', '.') for n in re.findall(r'\d+(?:[.,]\d+)?', src)}
+    # Телефон в письме форматируют иначе, чем в профиле: «+7 999 000-00-00» против
+    # «+79990000000». 30.09 из-за этого 11 разборов отбраковались «выдумкой телефонного номера».
+    phone_digits = [re.sub(r'\D', '', m) for m in re.findall(r'\+?\d[\d\s()\-]{8,}\d', src)]
+    t = re.sub(r'\+\d{1,3}(?=[\s(\d])', '', t)   # код страны «+7» — не число
+    list_markers = {m.group(1) for m in re.finditer(r'(?m)^\s*(\d{1,2})[.)]\s', t)}
+    for n in _NUMBER.findall(t):
+        value = n.replace(',', '.')
+        if n in list_markers:
+            continue
+        if value in src_numbers:
+            continue
+        if len(value) >= 2 and any(value in digits for digits in phone_digits):
+            continue
+        # «6,5 лет» при стаже 6.75 в профиле — округление, а не выдумка.
+        try:
+            if experience_years and abs(float(value) - float(experience_years)) <= 1:
+                continue
+        except ValueError:
+            pass
+        return f'число «{n}», которого нет ни в профиле, ни в вакансии, ни в переписке'
+    src_low = src.lower()
+    for m in _ADDRESSED_NAME.finditer(t):
+        name = m.group(1) or m.group(2)
+        if name.lower() in _NOT_NAMES:
+            continue
+        if name[:4].lower() not in src_low:
+            return f'обращение к «{name}», которого нет в переписке'
+    return None
+
+
+# Технологии, которые ИИ любит приписывать. Сверяем с профилем: 30.09 gemini писал в «О себе»
+# «развёртывание и эксплуатация VPN-шлюзов», «AWS, Azure», хотя в профиле их нет.
+_CLAIM_TERMS = sorted({
+    'aws', 'java', 'golang', 'c++', 'php', 'react', 'postgresql', 'mysql', 'sql',
+    'azure', 'gcp', 'ceph', 'vmware', 'hyper-v', 'cisco', 'mikrotik', 'bgp', 'ospf', 'zabbix', 'nagios',
+    'prometheus', 'grafana', 'elk', 'splunk', 'kafka', 'redis', 'mongodb', 'oracle', 'clickhouse',
+    'ansible', 'terraform', 'helm', 'argocd', 'jenkins', 'teamcity', 'nexus', 'artifactory',
+    'iso 27001', 'iso 27005', 'nist', 'pci dss', 'cissp', 'oscp', 'ceh', 'fortinet', 'palo alto',
+    'checkpoint', 'континент', 'vipnet', 'криптопро', 'maxpatrol', 'kuma', 'qradar', 'arcsight',
+    'wazuh', 'suricata', 'snort', 'ngfw', 'waf', 'dlp', 'edr', 'ids/ips', 'vpn', 'active directory',
+    'burp suite', 'nmap', 'metasploit', 'wireshark', 'sonarqube', 'semgrep', 'owasp zap',
+}, key=len, reverse=True)
+
+
+def unsupported_claims(text: str, profile_text: str) -> list:
+    """Технологии из текста, которых нет в профиле (регистр и «k8s»/«kubernetes» не важны)."""
+    low, prof = str(text or '').lower(), str(profile_text or '').lower()
+    prof_norm = ' ' + normalize_skill(prof) + ' ' + prof
+    found = []
+    for term in _CLAIM_TERMS:
+        if re.search(r'(?<![\w])' + re.escape(term) + r'(?![\w])', low):
+            if term not in prof_norm and normalize_skill(term) not in prof_norm:
+                found.append(term)
+    return found
+
+
+_HONEST_MARKERS = ('нет ', 'нет,', 'не работал', 'не использовал', 'не имею', 'не применял', 'не занимался',
+                   'не настраивал', 'не сталкивал', 'без опыта', 'не было', 'не приходилось', 'не владею',
+                   'готов освоить', 'готов изучить', 'могу освоить', 'быстро освою', 'изучаю', 'знаком лишь',
+                   'знаком поверхностно', 'смежн')
+
+
+def claims_problem(text: str, profile_text: str) -> Optional[str]:
+    """Предложения, где ИИ приписывает кандидату технологию, которой нет в профиле.
+
+    30.09 в чат РУСАЛу ушло «настраивал CI/CD пайплайны в Azure DevOps» — в профиле его нет.
+    Предложение с отрицанием или «готов освоить» пропускаем: «с Kafka не работал» — честно.
+    """
+    for sentence in re.split(r'(?<=[.!?])\s+|\n+', str(text or '')):
+        claims = unsupported_claims(sentence, profile_text)
+        if claims and not any(m in sentence.lower() for m in _HONEST_MARKERS):
+            return 'технологии, которых нет в профиле: ' + ', '.join(claims[:3])
+    return tenure_claim_problem(text, profile_text)
+
+
+_TENURE_TERMS = _CLAIM_TERMS + ['kubernetes', 'k8s', 'docker', 'gitlab', 'linux', 'python', 'siem', 'nginx',
+                                'ci/cd', 'devsecops', 'sast', 'dast']
+_TENURE_RE = re.compile(r'(?:\d+[.,+]?\d*|[а-яё]+)\s*(?:лет|года|год|years?|yrs?)\b')
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def tenure_claim_problem(text: str, profile_text: str = '') -> Optional[str]:
+    """Стаж, приписанный технологии («Kubernetes около шести лет»).
+
+    30.09 в анкетах было «Kubernetes 6 лет / 2+ года / 1+ year», «Docker 5»: общий стаж
+    не опыт с каждой технологией. Общий стаж без технологии в предложении пропускаем.
+    """
+    for sentence in _SENTENCE_SPLIT.split(str(text or '')):
+        low = sentence.lower()
+        if not _TENURE_RE.search(low) or any(m in low for m in _HONEST_MARKERS):
+            continue
+        for term in _TENURE_TERMS:
+            if re.search(r'(?<!\w)' + re.escape(term) + r'(?!\w)', low):
+                return 'стаж, приписанный технологии: ' + term
+    return None
+
+
+def answer_claims_problem(text: str, profile_text: str) -> Optional[str]:
+    """Ответы анкеты (одна строка или JSON-массив): выдуманные технологии и стаж."""
+    try:
+        data = json.loads(re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', str(text or '').strip()))
+    except ValueError:
+        data = None
+    for item in (data if isinstance(data, list) else [text]):
+        problem = claims_problem(str(item), profile_text)
+        if problem:
+            return problem
+    return None
+
+
+ANALYSIS_TEXT_FIELDS = ('improved_cover_letter', 'about_me_recommendation', 'experience_advice')
+
+
+def analysis_fabrication_problem(text: str, source: str, experience_years=None,
+                                 profile_text: str = '') -> Optional[str]:
+    """То же для JSON разбора отказа: проверяем поля, которые человек копирует к себе."""
+    match = re.search(r'\{.*\}', str(text or ''), re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for field in ANALYSIS_TEXT_FIELDS:
+        problem = fabrication_problem(data.get(field) or '', source, experience_years)
+        if problem:
+            return f'{field}: {problem}'
+    # Текст для резюме — только то, что есть в профиле (вакансию не считаем: упомянуть
+    # её технологию можно, приписать себе — нет).
+    if profile_text:
+        claims = unsupported_claims(data.get('about_me_recommendation') or '', profile_text)
+        if claims:
+            return 'about_me_recommendation: технологии, которых нет в профиле: ' + ', '.join(claims[:4])
+    return None
+
+
 def letter_quality_problem(text: str, company: str = '', title: str = '') -> Optional[str]:
     """Что не так с письмом от ИИ, или None, если всё в порядке.
 
     Только проверяемое без человека: длина, язык, разметка, привязка к
-    вакансии и выдуманные числа. Письмо «Сократил расходы на 45%» уйдёт
+    вакансии и выдуманные числа. Письмо «Сократил уязвимости на 45%» уйдёт
     работодателю от имени кандидата, а на созвоне это вскроется.
     """
     t = (text or '').strip()
@@ -244,6 +446,12 @@ def letter_quality_problem(text: str, company: str = '', title: str = '') -> Opt
         return 'не упоминает ни компанию, ни должность'
     if re.search(r'\d+\s*%', t):
         return 'проценты, которых нет в профиле'
+    # Слабые модели (LLM7 codestral и т.п.) оставляют «[Ваше имя]» и «рад(а)» —
+    # такое письмо уходит работодателю как есть и выдаёт шаблон.
+    if re.search(r'\[[^\]\n]{2,40}\]', t):
+        return 'заглушка в квадратных скобках вместо данных'
+    if re.search(r'[а-яё]\((?:а|ая|ый|на)\)', low):
+        return 'обращение с «(а)» вместо своего рода'
     return None
 
 
@@ -811,6 +1019,13 @@ class AIAssistant:
             if '429' in detail or 'rate limit' in detail.lower():
                 self._rest_until('_backup_rest_until', detail, 'Запасной помощник ИИ')
                 return None
+            if '403' in detail or 'forbidden' in detail.lower():
+                # Раньше здесь писало «hh.ru не разрешил это действие» — это общая
+                # подсказка explain_error про 403, а отказал Groq (ключ или регион/VPN).
+                logger.warning("Groq отказал в доступе (403): проверьте ключ Groq в меню [N] → [K] "
+                               "и что сервис доступен из вашей сети (VPN). Пока пишут остальные ИИ.")
+                self._backup_rest_until = time.time() + 600
+                return None
             logger.warning(f"Запасной помощник ИИ не ответил: {explain_error(e)}")
             # Полный текст — в журнал: в хвосте написано, когда можно повторить,
             # и без него не отличить минутный лимит от суточного.
@@ -939,12 +1154,15 @@ class AIAssistant:
                                only_model: Optional[str] = None) -> Optional[str]:
         """Перебирает сервисы и их модели по порядку. Текст ответа или None.
 
-        Сервис не запущен (локальный адрес отказывает сразу) — пропускаем его на
-        5 минут, чтобы не спрашивать на каждом письме. Модель упёрлась в лимит —
-        до конца прогона берём следующую.
+        Сервис не отвечает (локальный не запущен, удалённый недоступен или
+        отказал в доступе) — пропускаем его на 5 минут, чтобы не спрашивать на
+        каждом письме. Короткий лимит «подождите N с» — модель отдыхает N с.
+        Суточная квота, нет баланса, модели нет — до конца прогона берём следующую.
         """
         if not hasattr(self, '_compat_dead_models'):
             self._compat_dead_models, self._compat_rest, self._compat_clients = set(), {}, {}
+        if not hasattr(self, '_compat_model_rest'):
+            self._compat_model_rest = {}
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -968,6 +1186,8 @@ class AIAssistant:
                     continue
                 if only_model and model != only_model:
                     continue
+                if time.time() < self._compat_model_rest.get((name, model), 0):
+                    continue
                 try:
                     resp = client.chat.completions.create(
                         model=model, messages=messages, temperature=self.temperature)
@@ -989,15 +1209,48 @@ class AIAssistant:
                         return text
                 except Exception as e:
                     low = str(e).lower()
-                    if 'connection' in low or 'refused' in low or 'connect' in low:
-                        # Приложение закрыто — не дёргаем его 5 минут.
+                    status = getattr(e, 'status_code', None)
+                    local = any(h in p['base_url'] for h in ('127.0.0.1', 'localhost', '0.0.0.0'))
+                    # Нет связи — по типу ошибки, а не по слову «connect» в тексте:
+                    # 403 от Cloudflare у LLM7 тоже содержал это слово и выдавался
+                    # за «не запущен». Таймаут — это не «нет связи», у SDK он
+                    # наследник той же ошибки.
+                    try:
+                        from openai import APIConnectionError, APITimeoutError
+                        no_link = isinstance(e, APIConnectionError) and not isinstance(e, APITimeoutError)
+                    except ImportError:
+                        no_link = 'refused' in low
+                    if no_link and not _connection_refused(e):
+                        # Сервис жив, но бросил ответ («Server disconnected without
+                        # sending a response»): у Antigravity так отваливается аккаунт.
+                        # Раньше это считалось «не запущен» и все его модели молчали 5 минут.
+                        self._compat_model_rest[(name, model)] = time.time() + 30
+                        logger.info(f" {name}: {model} оборвал ответ — пишет следующая модель")
+                        continue
+                    if status in (500, 502, 503, 504):
+                        # Модель временно недоступна (у Antigravity — упал аккаунт): минута отдыха.
+                        self._compat_model_rest[(name, model)] = time.time() + 60
+                        logger.debug(f"{name} {model}: код {status}, отдыхает минуту")
+                        continue
+                    if no_link or status in (401, 403):
                         if name not in self._compat_rest:
-                            logger.warning(f"{name} не запущен — похоже, его забыли включить. "
-                                           f"Перехожу на доступный ИИ")
+                            if no_link and local:
+                                why = "не запущен — похоже, его забыли включить"
+                            elif no_link:
+                                why = "недоступен: нет связи с сервисом"
+                            else:
+                                why = f"отказал в доступе (код {status}) — проверьте ключ"
+                            logger.warning(f"{name} {why}. Перехожу на доступный ИИ, "
+                                           f"снова попробую через 5 минут")
                         self._compat_rest[name] = time.time() + 300
                         break
-                    if any(k in low for k in ('429', 'quota', 'rate limit', 'exhaust', '404', 'not found')):
+                    if any(k in low for k in ('insufficient', 'quota', 'exhaust', '404', 'not found', '402')):
                         self._compat_dead_models.add((name, model))
+                    elif status == 429 or 'rate limit' in low:
+                        # «Retry after 1 seconds» у LLM7 — поминутный лимит, а не
+                        # суточный: раньше одна такая ошибка выключала модель до
+                        # конца прогона.
+                        self._compat_model_rest[(name, model)] = time.time() + self.retry_after_seconds(str(e))
                     logger.debug(f"{name} {model}: {str(e)[:200]}")
         self._using_compat = None
         return None
@@ -1350,6 +1603,14 @@ class AIAssistant:
                         self._rest_until('_gemini_rest_until', e, 'Помощник ИИ')
                         return None
 
+                    if 'api_key_invalid' in err or 'api key not valid' in err:
+                        # Ключ «0» в настройках давал ошибку на каждом письме, а в
+                        # журнале — «неизвестный сбой». Ключ сам не починится.
+                        self._gemini_client = None
+                        logger.warning("Ключ Gemini недействителен — Gemini выключен до перезапуска. "
+                                       "Новый ключ: меню [N] → [G]. Письма пишут остальные ИИ из очереди.")
+                        return self._call_backup_provider(prompt, system_prompt)
+
                     if 'not found' in err or '404' in str(e):
                         text = self._retry_on_other_gemini_model(full_prompt)
                         if text:
@@ -1516,8 +1777,8 @@ class AIAssistant:
         персональными. Теперь подмена и видна в журнале, и доступна вызывающему.
         """
         self.last_letter_source = 'template'
-        # Роль — из профиля, а не одна профессия для всех: иначе для резюме
-        # другой профессии ИИ писал бы от чужого лица.
+        # Роль — из профиля, а не «кибербезопасность» для всех: иначе для резюме
+        # другой профессии ИИ писал бы как безопасник.
         spec = str(self.candidate_profile.get('specialization') or '').strip()
         role = f"опытный специалист ({spec})" if spec else "опытный специалист"
         system_prompt = (
@@ -1556,7 +1817,8 @@ class AIAssistant:
 
         llm_letter = self._call_llm(
             prompt, system_prompt,
-            validate=lambda t: letter_quality_problem(t, company_name, vacancy_title))
+            validate=lambda t: (letter_quality_problem(t, company_name, vacancy_title)
+                                or claims_problem(t, json.dumps(profile, ensure_ascii=False))))
         if llm_letter and len(llm_letter) >= 40:
             self.last_letter_source = 'ai'
             # Очистка от лишних кавычек
@@ -1594,9 +1856,28 @@ class AIAssistant:
         # Формирование футера с контактами: НИКАКИХ фейковых заглушек!
         footer = self._build_contacts_footer(contacts)
 
-        # Карта целевых ATS-ключей: только навыки из профиля кандидата,
-        # чтобы письмо не приписывало ему чужой стек.
-        TARGET_KEYWORDS_MAP = {s.lower(): s for s in profile_skills}
+        # Карта целевых ATS-ключей
+        TARGET_KEYWORDS_MAP = {
+            'burp': 'Burp Suite',
+            'owasp': 'OWASP Top 10',
+            'nmap': 'Nmap',
+            'metasploit': 'Metasploit',
+            'wireshark': 'Wireshark',
+            'active directory': 'Active Directory',
+            'bloodhound': 'BloodHound',
+            'devsecops': 'DevSecOps',
+            'appsec': 'AppSec',
+            'sast': 'SAST/DAST',
+            'docker': 'Docker',
+            'ci/cd': 'CI/CD security',
+            'python': 'Python',
+            'linux': 'Linux',
+            'siem': 'SIEM',
+            'soc': 'SOC',
+            'фстэк': 'ФСТЭК / 152-ФЗ',
+            '152-фз': '152-ФЗ',
+            'кии': '187-ФЗ (КИИ)',
+        }
 
         detected_keywords = []
 
@@ -1614,18 +1895,94 @@ class AIAssistant:
         if not detected_keywords:
             detected_keywords = profile_skills[:4]
 
+        # Разделяем технический стек инструментов и нормативные требования
+        compliance_markers = ('фстэк', '152-фз', '187-фз', 'кии', 'гост')
+        raw_compliance = [kw for kw in detected_keywords if any(m in kw.lower() for m in compliance_markers)]
+        clean_compliance = []
+        for c in raw_compliance:
+            if 'фстэк' in c.lower() and 'ФСТЭК' not in clean_compliance:
+                clean_compliance.append('ФСТЭК')
+            if '152' in c.lower() and '152-ФЗ' not in clean_compliance:
+                clean_compliance.append('152-ФЗ')
+            if ('187' in c.lower() or 'кии' in c.lower()) and '187-ФЗ (КИИ)' not in clean_compliance:
+                clean_compliance.append('187-ФЗ (КИИ)')
+
+        detected_tech = [kw for kw in detected_keywords if not any(m in kw.lower() for m in compliance_markers)]
+        if not detected_tech:
+            detected_tech = ["OWASP Top 10", "Python", "Linux", "SIEM"]
+
         # Навыки из базы лежат каноническими (строчными) — так сходятся счётчики.
         # В письмо работодателю они должны идти в человеческом написании, иначе
-        # строчный «стек: postgresql, node.js» выдаёт машинную генерацию.
-        tech_str = ", ".join(display_skill(t) for t in detected_keywords[:4])
-        stack_clause = f" Ключевые навыки: {tech_str}." if tech_str else ""
-        spec = str(profile.get('specialization') or '').strip()
-        area_clause = f" Моя специализация: {spec}." if spec else ""
+        # «стек: application security, devsecops» выдаёт машинную генерацию.
+        tech_str = ", ".join(display_skill(t) for t in detected_tech[:4])
+        compliance_clause = ""
+        if clean_compliance:
+            compliance_clause = f", а также выполнения требований регуляторов ({', '.join(clean_compliance)})"
 
+        # ИБ-варианты письма — только если кандидат сам из ИБ. Иначе резюме
+        # другой профессии получало письма «имею опыт в ИБ», а ветка SOC вообще
+        # срабатывала на обычные слова «мониторинг» и «инцидент».
+        spec = str(profile.get('specialization') or '')
+        profile_text = f"{spec} {profile.get('about') or ''}".lower()
+        is_security_profile = any(k in profile_text for k in (
+            'безопасн', 'security', 'appsec', 'пентест', 'pentest', 'soc', 'siem', 'devsecops'))
+
+        # Пентест / Red Team / Bug Bounty
+        if is_security_profile and any(k in full_text for k in ['пентест', 'pentest', 'red team', 'offensive', 'хакер', 'bug bounty']):
+            return (
+                f"{rand_text('{Добрый день|Здравствуйте}')}! {rand_text('{Заинтересовала|Привлекла|Обратил внимание на}')} вакансию «{vacancy_title}» в {company_name}.\n\n"
+                f"Специализируюсь на практической безопасности и поиске уязвимостей{compliance_clause}. "
+                f"Имею опыт тестирования защищенности веб-приложений (OWASP Top 10) и сетевой инфраструктуры, "
+                f"анализа векторов атак и автоматизации проверок на Python (профильный стек: {tech_str}). "
+                f"Готов выполнить тестовое задание или пройти техническое интервью.\n\n"
+                f"{footer}"
+            )
+
+        # AppSec / DevSecOps / Web Security
+        if is_security_profile and any(k in full_text for k in ['appsec', 'devsecops', 'безопасность приложений', 'sast', 'dast']):
+            return (
+                f"{rand_text('{Здравствуйте|Добрый день}')}! {rand_text('{Рассмотрел|Изучил|Внимательно посмотрел}')} позицию «{vacancy_title}» в {company_name}.\n\n"
+                f"Имею практический опыт в AppSec и DevSecOps: анализ защищенности кода (SAST/DAST), OWASP Top 10, "
+                f"автоматизация проверок на Python и интеграция безопасности в CI/CD (стек: {tech_str}{compliance_clause}). "
+                f"Понимаю специфику безопасной разработки и готов усилить защиту ваших сервисов.\n\n"
+                f"{footer}"
+            )
+
+        # SOC / SIEM / Мониторинг / Аналитик ИБ
+        if is_security_profile and any(k in full_text for k in ['soc', 'siem', 'инцидент', 'мониторинг', 'kuma', 'maxpatrol']):
+            return (
+                f"{rand_text('{Добрый день|Здравствуйте}')}! {rand_text('{С интересом ознакомился с позицией|Внимательно изучил позицию|Заинтересовала позиция}')} «{vacancy_title}» в {company_name}.\n\n"
+                f"Имею опыт работы в области информационной безопасности, анализа угроз и мониторинга{compliance_clause}. "
+                f"Понимаю векторы атак, логику работы SIEM и регламенты реагирования на инциденты (стек: {tech_str}). "
+                f"Готов оперативно включиться в работу команды.\n\n"
+                f"{footer}"
+            )
+
+        # Python / Разработка / Инженер
+        if any(k in full_text for k in ['python', 'разработчик', 'developer', 'backend', 'бэкенд']):
+            return (
+                f"{rand_text('{Здравствуйте|Добрый день}')}! {rand_text('{Привлекла|Заинтересовала|Обратила внимание}')} вакансия «{vacancy_title}» в {company_name}.\n\n"
+                f"Разрабатываю на Python с глубоким пониманием надежности и безопасности кода (стек: {tech_str}{compliance_clause}). "
+                f"Умею проектировать устойчивые сервисы и автоматизировать инфраструктурные задачи. Буду рад обсудить подробности сотрудничества.\n\n"
+                f"{footer}"
+            )
+
+        # Универсальное письмо для другой профессии — из её же профиля.
+        if not is_security_profile:
+            area = spec or 'своей области'
+            return (
+                f"{rand_text('{Добрый день|Здравствуйте}')}! {rand_text('{Заинтересовала|Привлекла|Рассмотрел}')} позиция «{vacancy_title}» в {company_name}.\n\n"
+                f"Имею практический опыт: {area}. В работе применяю: {tech_str}. "
+                f"Буду рад обсудить, чем могу быть полезен вашей команде.\n\n"
+                f"{footer}"
+            )
+
+        # Универсальное качественное письмо
         return (
             f"{rand_text('{Добрый день|Здравствуйте}')}! {rand_text('{Заинтересовала|Привлекла|Рассмотрел}')} позиция «{vacancy_title}» в {company_name}.\n\n"
-            f"{rand_text('{Мой опыт подробно описан в резюме|Подробности опыта есть в резюме}')}.{area_clause}{stack_clause} "
-            f"Буду рад обсудить задачи команды и ответить на вопросы на собеседовании.\n\n"
+            f"Обладаю подтвержденным опытом в области информационной безопасности и анализа защищенности{compliance_clause}. "
+            f"В работе применяю профильный технологический стек: {tech_str}. "
+            f"Готов применить свои навыки для защиты инфраструктуры и решения актуальных задач компании. Буду рад ответить на вопросы на интервью.\n\n"
             f"{footer}"
         )
 
@@ -1634,7 +1991,7 @@ class AIAssistant:
         # Никаких контактов по умолчанию: раньше при пустом профиле сюда вшивался
         # телеграм автора, и другой пользователь рассылал бы работодателям ЧУЖИЕ
         # контакты. Нет контактов в профиле — нет подписи.
-        PLACEHOLDERS = ('@username', 'telegram', '@ваш_ник')
+        PLACEHOLDERS = ('@security_specialist', '@username', 'telegram', '@ваш_ник')
 
         tg = (contacts.get('telegram') or '').strip()
         if tg in PLACEHOLDERS:
@@ -1746,7 +2103,7 @@ class AIAssistant:
             'образование, место работы. Если вариант «живу в Москве», а кандидат '
             'живёт не там, — выбирай вариант с готовностью к переезду. '
         ) if policy.get('yes_to_conditions', True) else ''
-        # 25.09: на «Опишите случай подключения очереди сообщений к сервису» модель
+        # 25.09: на «Опишите случай подключения источника логов к SIEM» модель
         # писала «готов обсудить на собеседовании» — ей уходили только 25
         # навыков, без мест работы, где этот опыт описан.
         detail_rule = '' if policy.get('detailed_answers', True) else (
@@ -1760,9 +2117,10 @@ class AIAssistant:
             'профиле. Нет прямого опыта — честно назови ближайший смежный из профиля '
             '(«Kafka не администрировал, но разворачивал сервисы в Docker/Kubernetes»). '
             'Фразу "Готов обсудить этот вопрос на собеседовании" пиши, только если в '
-            'профиле совсем ничего близкого нет. Не выдумывай опыт, сертификаты, числа '
+            'профиле совсем ничего близкого нет. Называй только технологии, которые есть в '
+            'профиле; хобби, личные привычки и опыт, которых там нет, не придумывай. Не выдумывай опыт, сертификаты, числа '
             'и места работы. Не приписывай стаж конкретной технологии («6 лет с '
-            'Kafka»): общий стаж — не опыт с каждой технологией. Про зарплату, город, '
+            'SIEM»): общий стаж — не опыт с каждой технологией. Про зарплату, город, '
             'контакты бери из готовых ответов пользователя; конкретную сумму '
             'зарплаты НЕ называй — это сразу отсев. Вариант «Свой вариант»/«Другое» '
             'выбирай, только если ни один из остальных не подходит, — но тогда '
@@ -1793,7 +2151,8 @@ class AIAssistant:
             f'JSON-массив из {len(questions)} ответов:'
         )
 
-        raw = self._call_llm(prompt, system_prompt)
+        raw = self._call_llm(prompt, system_prompt,
+                             validate=lambda txt: answer_claims_problem(txt, self.profile_summary()))
         if not raw:
             return {}
 
@@ -1872,7 +2231,7 @@ class AIAssistant:
             return "https://github.com (портфолио и пет-проекты указаны в резюме)"
         if asks_about('telegram', 'телеграм', 'тг', 'ник', 'никнейм'):
             tg = (contacts.get('telegram') or '').strip()
-            if tg and tg not in ('@username', 'telegram'):
+            if tg and tg not in ('@security_specialist', '@username', 'telegram'):
                 return tg
             return "Контакты указаны в резюме"
         if asks_about('email', 'почта', 'почту', 'e-mail'):
@@ -1881,12 +2240,11 @@ class AIAssistant:
         if asks_about('телефон', 'phone') or 'номер телефона' in q_lower:
             return profile.get('phone') or contacts.get('phone') or "Телефон указан в резюме"
 
-        # Ожидания по зарплате
-        if any(k in q_lower for k in ['зарплат', 'оклад', 'доход', 'salary', 'ожидания по зп']):
-            # Если поле числовое
-            if 'только цифр' in q_lower or 'в рублях' in q_lower or 'числом' in q_lower:
-                return "180000"
-            return profile.get('expected_salary', 'от 180 000 руб.')
+        # Ожидания по зарплате — без суммы. 29.09 «ожидания по заработной плате
+        # (сумма на руки)» не ловилось по «зарплат», и ИИ отвечал «от 180 000 руб.»
+        # из профиля; тут же был зашит ответ «180000» для числовых полей.
+        if is_salary_question(q_lower):
+            return SALARY_ANSWER
 
         # Город / локация
         if any(k in q_lower for k in ['город проживания', 'где живете', 'где находитесь', 'локация', 'место жительства']):
@@ -1911,7 +2269,7 @@ class AIAssistant:
         # Для открытых вопросов используем LLM
         if self.enabled:
             system_prompt = (
-                "Ты — кандидат на вакансию. Ответь на вопрос работодателя из формы отклика.\n"
+                "Ты — кандидат на вакансию IT/ИБ. Ответь на вопрос работодателя из формы отклика.\n"
                 "Отвечай кратко, честно, строго на основе профиля кандидата.\n"
                 "Длина ответа: 1-2 предложения, без лишней вежливости, прямо по существу."
             )
@@ -1922,7 +2280,7 @@ class AIAssistant:
                 f"Стек: {', '.join(profile.get('skills', []))}\n"
                 f"Город: {profile.get('location')}\n"
                 f"Английский: {profile.get('english_level')}\n"
-                f"Ожидания по зарплате: {profile.get('expected_salary')}\n"
+
                 f"Контакты: {', '.join([f'{k}: {v}' for k, v in contacts.items() if v]) or 'указаны в резюме'}"
             )
             prompt = (
@@ -1931,7 +2289,8 @@ class AIAssistant:
                 f"Вопрос работодателя: {question_clean}\n\n"
                 "Ответ кандидата:"
             )
-            llm_ans = self._call_llm(prompt, system_prompt)
+            llm_ans = self._call_llm(prompt, system_prompt,
+                                     validate=lambda txt: answer_claims_problem(txt, candidate_context))
             if llm_ans and len(llm_ans.strip()) > 0:
                 return llm_ans.strip().strip('"')
 
@@ -2009,9 +2368,9 @@ class AIAssistant:
             combined_skills = profile.get('skills', [])[:4] + [s for s in adaptive if s not in profile.get('skills', [])][:2]
             return f"Основной стек: {', '.join(combined_skills)}."
         if any(k in q_lower for k in ['опыт', 'стаж', 'сколько лет']):
-            return f"Опыт работы по специальности более {profile.get('experience_years', 3)} лет."
+            return f"Опыт в информационной безопасности и разработке более {profile.get('experience_years', 3)} лет."
         if any(k in q_lower for k in ['почему вы', 'почему мы', 'мотивация']):
-            return "Заинтересован в решении сложных прикладных задач и профессиональном развитии в сильной команде."
+            return "Заинтересован в решении сложных прикладных задач безопасности и профессиональном развитии в сильной команде."
         if any(k in q_lower for k in ['удален', 'график', 'формат']):
             return "Предпочитаю удаленный формат работы, также готов рассматривать гибридный график."
 
@@ -2030,7 +2389,16 @@ class AIAssistant:
         desc_lower = vacancy_description.lower()
 
         # Популярный стек для поиска в требованиях
-        tech_keywords = TECH_KEYWORDS
+        tech_keywords = [
+            'python', 'go', 'golang', 'java', 'c++', 'bash', 'powershell',
+            'docker', 'kubernetes', 'k8s', 'ci/cd', 'gitlab', 'github actions',
+            'linux', 'windows', 'active directory', 'ad',
+            'sast', 'dast', 'iast', 'burp suite', 'owasp', 'owasp top 10',
+            'appsec', 'devsecops', 'pentest', 'пентест', 'red team', 'blue team',
+            'siem', 'soc', 'kuma', 'maxpatrol', 'splunk', 'elastic', 'wazuh',
+            'фстэк', 'гост', '152-фз', 'криптопро', 'скзи', 'iso 27001', 'pci dss',
+            'reverse engineering', 'ida pro', 'ghidra', 'malware'
+        ]
 
         required_skills = []
         missing_skills = []
@@ -2103,7 +2471,7 @@ class AIAssistant:
                 "rejection_root_cause": llm_analysis.get('rejection_root_cause', "Недостаточное совпадение по ключевым словам и профилю стека"),
                 "how_to_fix_resume": llm_analysis.get('how_to_fix_resume', [
                     f"Добавить в резюме ключевые термины: {', '.join(missing_skills[:5])}",
-                    "Усилить описание практических проектов",
+                    "Усилить описание практических проектов по AppSec/SecOps",
                     "Адаптировать сопроводительное письмо под конкретные задачи вакансии"
                 ])
             }
@@ -2154,7 +2522,16 @@ class AIAssistant:
         emp_text = " ".join(emp_msgs)
 
         # Выделение недостающих навыков из описания
-        tech_keywords = TECH_KEYWORDS
+        tech_keywords = [
+            'python', 'go', 'golang', 'java', 'c++', 'bash', 'powershell',
+            'docker', 'kubernetes', 'k8s', 'ci/cd', 'gitlab', 'github actions',
+            'linux', 'windows', 'active directory', 'ad',
+            'sast', 'dast', 'iast', 'burp suite', 'owasp', 'owasp top 10',
+            'appsec', 'devsecops', 'pentest', 'пентест', 'red team', 'blue team',
+            'siem', 'soc', 'kuma', 'maxpatrol', 'splunk', 'elastic', 'wazuh',
+            'фстэк', 'гост', '152-фз', 'криптопро', 'скзи', 'iso 27001', 'pci dss',
+            'reverse engineering', 'ida pro', 'ghidra', 'malware'
+        ]
         missing_skills = []
         for kw in tech_keywords:
             if re.search(r'\b' + re.escape(kw) + r'\b', desc_lower):
@@ -2183,7 +2560,7 @@ class AIAssistant:
                 "этот текст человек вставит в РЕЗЮМЕ, и он останется там насовсем. "
                 "Также нельзя выдумывать числовые результаты, сертификаты, "
                 "названия компаний и сроки работы с конкретной технологией, если их нет в профиле "
-                "соискателя. Никаких «сократил расходы на 45%», «провёл 150 проектов», «2 млн "
+                "соискателя. Никаких «сократил уязвимости на 45%», «провёл 150 аудитов», «2 млн "
                 "пользователей» — это письмо человек отправит работодателю и не сможет подтвердить "
                 "на собеседовании. Убедительность строй на реальном опыте из профиля и на том, "
                 "как он применим к задачам вакансии.\n\n"
@@ -2217,7 +2594,11 @@ class AIAssistant:
                 "JSON анализ:"
             )
 
-            response_text = self._call_llm(prompt, system_prompt)
+            exp_years = profile.get('experience_years')
+            response_text = self._call_llm(
+                prompt, system_prompt,
+                validate=lambda txt: analysis_fabrication_problem(
+                    txt, prompt, exp_years, json.dumps(profile, ensure_ascii=False)))
             if response_text:
                 try:
                     match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -2237,10 +2618,12 @@ class AIAssistant:
                 "company_name": company_name,
                 "rejection_root_cause": llm_analysis.get('rejection_root_cause', "Отказ работодателя по результатам рассмотрения"),
                 "cover_letter_critique": llm_analysis.get('cover_letter_critique', "Письмо содержало недостаточно конкретных примеров по стеку вакансии"),
-                "improved_cover_letter": llm_analysis.get('improved_cover_letter', self.generate_cover_letter(vacancy_title, company_name, vacancy_description, list(candidate_skills))),
+                # Запасное письмо — только если модель его не дала. Раньше аргумент
+                # .get() вычислялся всегда: на каждый разбор уходил ещё один запрос к ИИ.
+                "improved_cover_letter": llm_analysis.get('improved_cover_letter') or self.generate_cover_letter(vacancy_title, company_name, vacancy_description, list(candidate_skills)),
                 "missing_skills": new_skills,
                 "about_me_recommendation": llm_analysis.get('about_me_recommendation', f"Добавить подтвержденный опыт работы с {', '.join(missing_skills[:3])}"),
-                "experience_advice": llm_analysis.get('experience_advice', "Сделать акцент на решении конкретных задач и результатах"),
+                "experience_advice": llm_analysis.get('experience_advice', "Сделать акцент на решении конкретных задач ИБ и результатах проверок"),
                 "actionable_takeaway": llm_analysis.get('actionable_takeaway', "Персонализировать отклик под специфику стека компании")
             }
 
@@ -2267,8 +2650,8 @@ class AIAssistant:
             "cover_letter_critique": critique,
             "improved_cover_letter": improved_letter,
             "missing_skills": missing_skills[:8],
-            "about_me_recommendation": f"Добавить упоминание практического опыта с: {', '.join(missing_skills[:4])}" if missing_skills else "Усилить раздел конкретными достижениями",
-            "experience_advice": "Описать релевантные кейсы и используемые инструменты",
+            "about_me_recommendation": f"Добавить упоминание практического опыта с: {', '.join(missing_skills[:4])}" if missing_skills else "Усилить раздел достижениями в AppSec/SecOps",
+            "experience_advice": "Описать релевантные кейсы и используемые инструменты безопасности",
             "actionable_takeaway": "Фокусировать отклик на ключевых требованиях работодателя",
             # ИИ не отработал: всё выше — шаблон, а не разбор. По этой метке
             # отказ откладывается до следующего запуска, а не пишется в базу

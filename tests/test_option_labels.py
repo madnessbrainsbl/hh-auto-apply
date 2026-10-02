@@ -65,7 +65,7 @@ MAGRITTE_FORM = '''<html><head><style>
 
 
 def test_hidden_magritte_choices_get_checked(tmp_path):
-    """25.09: у Magritte input скрыт — бот считал блок пустым и ничего не отмечал."""
+    """25.09 СОГАЗ: у Magritte input скрыт — бот считал блок пустым и ничего не отмечал."""
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from hh_selenium import HHSeleniumBot
@@ -137,7 +137,7 @@ def test_own_variant_gets_its_text_field_filled(tmp_path):
         bot.is_disabled_element = lambda el: False
         bot.click_viewport_coordinates = lambda x, y: driver.execute_script(
             'document.elementFromPoint(arguments[0], arguments[1]).click(); return true;', x, y)
-        bot.get_answer_for_question = lambda q, d=None: 'Работал с Kafka и RabbitMQ'
+        bot.get_answer_for_question = lambda q, d=None: 'Работал с NGFW и VPN-шлюзами'
         block = driver.find_element(By.ID, 'q1')
         bot._batch_answers = {' '.join(block.text.split()): 'Свой вариант'}
         bot._batch_answers_by_block = {}
@@ -146,4 +146,4 @@ def test_own_variant_gets_its_text_field_filled(tmp_path):
     finally:
         driver.quit()
     assert unresolved is None
-    assert text == 'Работал с Kafka и RabbitMQ'
+    assert text == 'Работал с NGFW и VPN-шлюзами'

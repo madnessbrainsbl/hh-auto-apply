@@ -23,13 +23,13 @@ def temp_db():
 def test_record_application_and_stats(temp_db):
     success = temp_db.record_application(
         vacancy_id="123456",
-        title="Backend Developer / Python",
+        title="Pentester / Анализ защищенности",
         company="Банк ТОП-10",
         url="https://hh.ru/vacancy/123456",
         cover_letter="Добрый день! Заинтересовала позиция...",
         questions_count=2,
         ats_score=75,
-        detected_skills=["Django", "PostgreSQL"],
+        detected_skills=["Burp Suite", "OWASP"],
         status="sent"
     )
     assert success is True
@@ -45,7 +45,7 @@ def test_rejection_analysis_and_auto_learning(temp_db):
     # 1. Записываем отклик
     temp_db.record_application(
         vacancy_id="999888",
-        title="Backend Engineer",
+        title="AppSec Engineer",
         company="Fintech Co",
         url="https://hh.ru/vacancy/999888",
         cover_letter="Добрый день...",
@@ -55,7 +55,7 @@ def test_rejection_analysis_and_auto_learning(temp_db):
     # 2. Фиксируем отказ с дефицитом ключевых навыков
     rej_id = temp_db.record_rejection_analysis(
         vacancy_id="999888",
-        title="Backend Engineer",
+        title="AppSec Engineer",
         company="Fintech Co",
         url="https://hh.ru/vacancy/999888",
         rejection_reason="Отказ автоматического скрининга",
@@ -81,7 +81,7 @@ def test_rejection_analysis_and_auto_learning(temp_db):
 
     # 4. Проверяем, что адаптивные навыки выучены
     # Навык кладётся в базу в канонической форме (canonical_skill_name):
-    # иначе «Kubernetes», «kubernetes» и «K8s» живут тремя строками
+    # иначе «AppSec», «appsec» и «Application Security» живут тремя строками
     # с раздробленными счётчиками, а порядок навыков в письмах и резюме
     # отражает раздробленность, а не спрос.
     learned_skills = [s.lower() for s in temp_db.get_adaptive_skills()]
@@ -94,7 +94,7 @@ def test_auto_fix_closed_loop(temp_db):
     # 1. Обучаем базу на отказе, где не хватило навыка 'Kubernetes'
     temp_db.record_rejection_analysis(
         vacancy_id="555444",
-        title="DevOps Engineer",
+        title="DevSecOps Engineer",
         company="Cloud Services",
         rejection_reason="Недостаточный стек",
         ats_score=40,
@@ -107,9 +107,9 @@ def test_auto_fix_closed_loop(temp_db):
 
     # 3. Генерируем письмо для новой вакансии, требующей Kubernetes
     cover_letter = assistant.generate_cover_letter(
-        vacancy_title="Инженер DevOps / Backend",
+        vacancy_title="Инженер DevSecOps / AppSec",
         company_name="MegaCorp",
-        vacancy_description="Ищем эксперта по контейнерам Kubernetes, Docker и CI/CD.",
+        vacancy_description="Ищем эксперта по безопасности контейнеров Kubernetes, Docker и CI/CD.",
         skills_list=["Kubernetes", "Docker", "Python"]
     )
 
@@ -124,27 +124,27 @@ def test_guessed_reason_is_not_counted_as_confirmed(temp_db):
     """«Подтверждено работодателем» = в чате были его реплики, а не текст причины.
 
     Раньше признак выводился из ТЕКСТА причины, и свободная формулировка ИИ
-    («Работодатель ищет специалиста по Kafka») проходила как подтверждённая,
+    («Работодатель ищет специалиста по КИИ») проходила как подтверждённая,
     хотя работодатель не написал ни слова. Теперь признак считается ровно по
     одному правилу: остались ли непустые реплики работодателя.
     """
     # шаблон fallback-ветки — слов работодателя за ним нет
     temp_db.record_rejection_analysis(
-        vacancy_id="1", title="Инженер-программист", company="Альфа",
+        vacancy_id="1", title="Инженер ИБ", company="Альфа",
         rejection_reason="Недостаточный стаж или несоответствие требуемому грейду",
         ats_score=85
     )
     # причина взята из настоящей реплики работодателя — её и передаём
     temp_db.record_rejection_analysis(
-        vacancy_id="2", title="Python-разработчик", company="Бета",
-        rejection_reason="Нам нужен специалист по Kafka и ClickHouse, а не тестировщик",
+        vacancy_id="2", title="Пентестер", company="Бета",
+        rejection_reason="Нам нужен специалист по КИИ и 187-ФЗ, а не пентестер",
         ats_score=70,
-        employer_messages=["Нам нужен специалист по Kafka и ClickHouse, а не тестировщик"]
+        employer_messages=["Нам нужен специалист по КИИ и 187-ФЗ, а не пентестер"]
     )
     # чат открыли, но реплик работодателя в нём не нашлось: правдоподобный
     # текст причины сам по себе подтверждением не является
     temp_db.record_rejection_analysis(
-        vacancy_id="3", title="Backend", company="Гамма",
+        vacancy_id="3", title="AppSec", company="Гамма",
         rejection_reason="Текст из чата без ответа работодателя",
         ats_score=70, employer_messages=[]
     )

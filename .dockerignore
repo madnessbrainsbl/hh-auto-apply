@@ -1,0 +1,17 @@
+*
+!Dockerfile
+!requirements.txt
+!app_paths.py
+!hh.py
+!docker_login.py
+!test.py
+!hh_selenium.py
+!config_manager.py
+!ai_assistant.py
+!db_manager.py
+!email_outreach.py
+!resume_updater.py
+!rejection_analyzer.py
+!template_engine.py
+!terminal_ui.py
+!hh_selenium_config.example.json

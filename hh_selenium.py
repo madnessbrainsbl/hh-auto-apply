@@ -41,8 +41,6 @@ APPLY_CONFIRM_ATTEMPTS = 2
 APPLY_FAILURE_STREAK_LIMIT = 6
 # Маркер сообщения о неподтверждённом отклике (см. confirm_response_submission)
 APPLY_NOT_CONFIRMED_MARKER = 'Статус отклика не изменился'
-LOGIN_WAIT_SECONDS = 180
-LOGIN_POLL_SECONDS = 5
 RESPONSE_STATE_WAIT_SECONDS = 7
 STATUS_SENT = 'sent'
 STATUS_SENT_WRONG_FILTER = 'sent_wrong_filter'
@@ -196,7 +194,10 @@ QUESTION_CONTAINER_SELECTORS = (
 # он ловит посторонние блоки и вакансия пропускалась бы зря.
 QUESTION_CONTAINER_SELECTORS_LOOSE = QUESTION_CONTAINER_SELECTORS + ('[class*="question"]',)
 from config_manager import (  # один список для всех фильтров
-    find_title_keyword, STRICT_TITLE_EXCLUDE_KEYWORDS, title_excludes,
+    SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS,
+    NON_IT_SAFETY_MARKERS, SECURITY_PROTECTION_CONTEXT, security_title_by_meaning,
+    find_title_keyword, STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS,
+    title_excludes,
 )
 
 
@@ -553,17 +554,46 @@ class HHSeleniumBot:
             'max_applications': 200,
             'skip_with_tests': True,
             'skip_applied': True,
+            'allow_technical_fallback': True,
             'keywords_include': preset.get('keywords_include', []), # Вакансии должны содержать эти слова
             'keywords_exclude': preset.get('keywords_exclude', ['стажер', 'intern', 'junior']), # Исключить вакансии с этими словами
             # Регион для браузерного поиска (113 = Россия), совпадает с API-поиском test.py
             'search_area': '113',
             'max_search_pages': 50, # предохранитель глубины пагинации на один запрос
             'max_consecutive_failures': APPLY_FAILURE_STREAK_LIMIT, # стоп при серии провалов (троттлинг)
-            # ЯРУС 3: добор до дневного лимита по дополнительным запросам.
-            # Заголовок уже совпал с запросом, поэтому ключевые слова направления
-            # здесь не требуются — работают только исключения.
-            'topup_enabled': True,
-            'topup_search_queries': [],
+            # ЯРУС 2: добор ИБ-вакансий напрямую с сайта (строгий security-фильтр, без dev-fallback)
+            'security_search_queries': [
+                'информационная безопасность',
+                'кибербезопасность',
+                'специалист по защите информации',
+                'пентест',
+                'penetration tester',
+                'application security',
+                'devsecops',
+                'security engineer',
+                'аналитик soc',
+                'soc',
+                'siem',
+                'red team',
+                'анализ защищенности',
+                'безопасность приложений',
+            ],
+            # ЯРУС 3: добор обычной разработкой/IT до дневного лимита.
+            # Запросы намеренно IT-специфичные, чтобы не цеплять не-IT (технолог/повар и т.п.).
+            'dev_topup_enabled': True,
+            'dev_search_queries': [
+                'python разработчик',
+                'backend разработчик',
+                'java разработчик',
+                'golang разработчик',
+                'c# разработчик',
+                'frontend разработчик',
+                'fullstack разработчик',
+                'devops инженер',
+                'инженер-программист',
+                'программист 1с',
+                'системный администратор',
+            ],
         }
         
         try:
@@ -1539,14 +1569,7 @@ class HHSeleniumBot:
         if not target_words:
             target_words = [target_title_lower]
 
-        # Резюме, с которых откликаться нельзя ни при каком раскладе (другая профессия
-        # на том же аккаунте). Задаются в настройках: disallowed_resume_keywords.
-        try:
-            from config_manager import load_config as _cm_load
-            DISALLOWED_KEYWORDS = [str(k).strip().lower() for k in
-                                   (_cm_load().get('disallowed_resume_keywords') or []) if str(k).strip()]
-        except Exception:
-            DISALLOWED_KEYWORDS = []
+        DISALLOWED_KEYWORDS = ['фотограф', 'видеограф', 'photographer', 'videographer']
         if any(d in target_title_lower for d in DISALLOWED_KEYWORDS):
             DISALLOWED_KEYWORDS = []
 
@@ -1577,7 +1600,7 @@ class HHSeleniumBot:
             is_disallowed = any(d in current_lower for d in DISALLOWED_KEYWORDS) if DISALLOWED_KEYWORDS else False
             is_target = target_title_lower in current_lower or any(t in current_lower for t in target_words)
 
-            # Если текущее резюме уже профильное и не из запрещённых — всё отлично
+            # Если текущее резюме уже профильное и не фотограф — всё отлично
             if is_target and not is_disallowed:
                 return True, None
 
@@ -1676,7 +1699,7 @@ class HHSeleniumBot:
         except Exception:
             pass
 
-        # Гарантируем выбор резюме, заданного в настройках
+        # Гарантируем выбор профильного резюме по ИБ
         resume_ok, resume_err = self.ensure_target_resume_selected(modal)
         if not resume_ok:
             return False, letter_sent, 0, resume_err
@@ -1695,7 +1718,7 @@ class HHSeleniumBot:
 
         # В форме с анкетой поле письма перерисовывается, пока догружаются
         # вопросы: первая попытка ловила «stale element», и отклик уходил без
-        # письма (25.09). После ответов форма уже не меняется.
+        # письма (СОГАЗ, Солар, 25.09). После ответов форма уже не меняется.
         if not letter_sent and cover_letter:
             modal = self.find_response_modal() or modal
             self.open_cover_letter_in_modal(modal)
@@ -1984,6 +2007,112 @@ class HHSeleniumBot:
         except Exception as e:
             logging.debug(f"Письмо после отклика не дописалось: {e}")
             return False
+
+    CHAT_BUTTON = '[data-qa="vacancy-response-link-view-topic"]'
+    CHAT_FRAME = 'iframe[src*="chatik"]'
+    CHAT_INPUT = 'textarea[data-qa="text-input"]'
+    CHAT_ADD_LETTER = '[data-qa="chatik-chat-message-applicant-action"]'
+
+    def send_letter_to_chat(self, cover_letter, vacancy_url):
+        """Отправляет письмо первым сообщением в чат по отклику. True — ушло.
+
+        У вакансий с анкетой hh часто не даёт ни поля письма в форме, ни кнопки
+        «Приложить сопроводительное» после отклика — только «Чат». 29.09 так
+        могут уйти без письма отклики, а в чате останется «Без
+        сопроводительного письма».
+
+        Чат открывается с этой же страницы вакансии, поэтому это чат именно по
+        этому отклику. Ничего не шлём, если письмо уже есть в переписке.
+        """
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        def first_visible(selector, root=None):
+            for el in (root or self.driver).find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+            return None
+
+        def wait_for(selector, seconds):
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                el = first_visible(selector)
+                if el:
+                    return el
+                time.sleep(0.5)
+            return None
+
+        in_frame = False
+        try:
+            if vacancy_url and '/vacancy/' not in (self.driver.current_url or ''):
+                self.driver.get(vacancy_url)
+            button = wait_for(self.CHAT_BUTTON, 8)
+            if not button or not self.click_element_with_mouse(button):
+                logging.debug("Кнопки «Чат» у отклика нет")
+                return False
+            frame = wait_for(self.CHAT_FRAME, 10)
+            if not frame:
+                logging.debug("Окно чата не открылось")
+                return False
+            self.driver.switch_to.frame(frame)
+            in_frame = True
+            field = wait_for(self.CHAT_INPUT, 10)
+            if not field:
+                logging.debug("Поле сообщения в чате не найдено")
+                return False
+
+            def page_text():
+                try:
+                    return ' '.join((self.driver.find_element(By.TAG_NAME, 'body').text or '').split())
+                except Exception:
+                    return ''
+
+            lines = [' '.join(line.split()) for line in str(cover_letter).splitlines()]
+            lines = [line for line in lines if line]
+            if not lines:
+                return False
+            probe = lines[0][:40]
+            if probe and probe in page_text():
+                logging.info(" Письмо уже есть в чате — повторно не отправляю")
+                return True
+
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field)
+            # По полю мышью не кликаем: над ним кнопки-подсказки hh («Добрый день!»),
+            # промах отправил бы работодателю эту фразу. Фокус — скриптом.
+            self.driver.execute_script("arguments[0].focus();", field)
+            time.sleep(0.2)
+            # Enter в чате отправляет сообщение, поэтому строки — через Shift+Enter,
+            # иначе письмо ушло бы по кускам.
+            for i, line in enumerate(lines):
+                if i:
+                    ActionChains(self.driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+                field.send_keys(line)
+            time.sleep(0.5)
+            typed = ' '.join((field.get_attribute('value') or '').split())
+            if probe not in typed:
+                logging.debug("Письмо не набралось в поле чата — ничего не отправлено")
+                field.clear()
+                return False
+            field.send_keys(Keys.ENTER)
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                if not (field.get_attribute('value') or '').strip() and probe in page_text():
+                    logging.info(" Письмо отправлено в чат по отклику")
+                    return True
+                time.sleep(0.5)
+            logging.debug("После Enter письмо осталось в поле чата")
+            return False
+        except Exception as e:
+            logging.debug(f"Письмо в чат не отправилось: {e}")
+            return False
+        finally:
+            if in_frame:
+                try:
+                    self.driver.switch_to.default_content()
+                except Exception:
+                    pass
 
     def build_success_message(self, letter_sent, questions_answered):
         if letter_sent:
@@ -2514,14 +2643,9 @@ class HHSeleniumBot:
 
     def is_logged_in_current_page(self):
         """Проверяет текущую страницу без принудительной навигации."""
-        current_url = self.driver.current_url.lower()
-        if '/account/login' in current_url:
+        from terminal_ui import is_hh_logged_in
+        if not is_hh_logged_in(self.driver):
             return False
-
-        login_buttons = self.driver.find_elements(By.CSS_SELECTOR, '[data-qa="login"]')
-        for login_button in login_buttons:
-            if login_button.is_displayed():
-                return False
 
         logging.info("[OK] Авторизация активна")
         # Все селекторы бота — по русским надписям. На другом языке
@@ -2535,24 +2659,18 @@ class HHSeleniumBot:
 
     def wait_for_login(self):
         """Ждет ручной вход в браузере без чтения stdin."""
-        deadline = time.time() + LOGIN_WAIT_SECONDS
-        while time.time() < deadline:
-            time.sleep(LOGIN_POLL_SECONDS)
-            if self.is_logged_in_current_page():
-                print("[OK] Авторизация успешна!")
-                return True
-
-            remaining = int(deadline - time.time())
-            print(f"Жду авторизацию в браузере... осталось {remaining} сек")
-
-        print("[X] Авторизация не выполнена за отведенное время")
-        return False
+        from terminal_ui import wait_for_hh_login, ensure_russian_interface
+        logged_in = wait_for_hh_login(
+            self.driver,
+            should_stop=lambda: self.stop_requested or self.check_interactive_controls() == 'stop',
+        )
+        if logged_in:
+            ensure_russian_interface(self.driver)
+        return logged_in
     
     def login(self):
         """Ручная авторизация"""
         if self.headless:
-            # В невидимом окне войти физически некуда, а wait_for_login опрашивал
-            # страницу LOGIN_WAIT_SECONDS (180 с), печатая «Жду авторизацию в браузере».
             print("\n" + "="*60)
             print("НЕТ СОХРАНЁННОЙ СЕССИИ HH.RU")
             print("="*60)
@@ -2571,7 +2689,7 @@ class HHSeleniumBot:
         print("3. После входа бот сам продолжит работу")
         print("\n" + "="*60)
         
-        self.driver.get('https://hh.ru/account/login')
+        self.driver.get('https://hh.ru/account/login?role=applicant')
         return self.wait_for_login()
     
     def get_vacancy_id_from_url(self, url):
@@ -2593,7 +2711,7 @@ class HHSeleniumBot:
     def find_keyword(self, text, keywords):
         return find_title_keyword(text, keywords)
 
-    def validate_title(self, title):
+    def validate_security_title(self, title):
         # Отсев по грейду — первым делом. Браузерный ярус имеет собственную копию
         # логики фильтрации и не получал проверку из test.py, поэтому всё ещё мог
         # откликнуться на позицию уровня правления при трёх годах опыта.
@@ -2609,8 +2727,9 @@ class HHSeleniumBot:
             from config_manager import get_active_preset
             preset = get_active_preset()
         except Exception:
-            preset = {}
+            preset = {'id': 'security'}
 
+        preset_id = preset.get('id', 'security')
         excluded_keyword = self.find_keyword(
             title,
             title_excludes(self.config),
@@ -2618,8 +2737,23 @@ class HHSeleniumBot:
         if excluded_keyword:
             return False, f"Исключено по ключевому слову: {excluded_keyword}"
 
-        if self.config.get('topup_mode'):
-            return True, "OK (добор)"
+        if preset_id == 'security':
+            strict_match = self.find_keyword(title, STRICT_TITLE_INCLUDE_KEYWORDS)
+            fallback_match = None
+            if self.config.get('allow_technical_fallback', True):
+                fallback_match = self.find_keyword(title, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS)
+
+            if not strict_match and not fallback_match:
+                # Правило по смыслу: ИБ-вакансии называют как угодно, и список
+                # слов вечно отстаёт («Инженер защиты от сетевых атак»,
+                # «...по сетевой безопасности», опечатка «иформационной»).
+                if security_title_by_meaning(title):
+                    return True, "OK (безопасность по смыслу названия)"
+                return False, "Не security/appsec/pentest/devsecops/soc или technical fallback"
+
+            # Второй проверки по keywords_include из настроек нет: там лежал
+            # снимок того же списка, он отставал и отсеивал «Threat Intelligence».
+            return True, "OK"
 
         include_keywords = tuple(self.config.get('keywords_include', [])) or tuple(preset.get('keywords_include', []))
         if include_keywords:
@@ -2636,7 +2770,7 @@ class HHSeleniumBot:
             return False
 
         if isinstance(history_entry, dict) and history_entry.get('status') == STATUS_SKIPPED_FILTER:
-            suitable, _ = self.validate_title(vacancy_name)
+            suitable, _ = self.validate_security_title(vacancy_name)
             return not suitable
 
         return True
@@ -3044,7 +3178,7 @@ class HHSeleniumBot:
             # У Magritte сами radio/checkbox невидимы — видна их подпись. Фильтр
             # «только видимые» выбрасывал все варианты, блок считался пустым, и
             # анкета уходила с неотмеченными пунктами: hh отвечал «Не заполнены
-            # вопросы работодателя» (25.09).
+            # вопросы работодателя» (СОГАЗ, Солар, 25.09).
             radios = fresh(block.find_elements(By.CSS_SELECTOR, 'input[type="radio"]'), hidden_ok=True)
             checkboxes = fresh(block.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]'), hidden_ok=True)
             selects = fresh(block.find_elements(By.CSS_SELECTOR, 'select'))
@@ -3383,7 +3517,7 @@ class HHSeleniumBot:
 
         # Один свободный вопрос ИИ разберёт и без пакета. Вопрос с вариантами —
         # нет: для флажков иного пути к ИИ нет, и «Какой формат работы вы
-        # рассматриваете? ☐Офис ☐Гибрид ☐Удалённо» оставался без ответа (25.09).
+        # рассматриваете? ☐Офис ☐Гибрид ☐Удалённо» оставался без ответа (вариант с несколькими флажками).
         if not pending or (len(pending) == 1 and not pending[0]['options']):
             return
 
@@ -3405,7 +3539,7 @@ class HHSeleniumBot:
     def yes_policy_question(self, text) -> bool:
         """Вопрос «подходит ли / готовы ли» при включённой политике «да».
 
-        Готовый ответ «Живу в другом городе, рассматриваю удалённо» на «Наш формат 4/1 в
+        Готовый ответ «Рассматриваю удалённую работу» на «Наш формат 4/1 в
         пользу офиса. Подходит?» звучал как отказ (25.09). Такие вопросы отдаём ИИ.
         """
         policy = (self.config or {}).get('answer_policy') or {}
@@ -3420,9 +3554,18 @@ class HHSeleniumBot:
         if not q_clean:
             return None
 
+        # 0. Деньги — всегда готовым ответом без суммы, какой бы длины ни был вопрос:
+        # длинный вопрос уходил к ИИ, и тот называл сумму из профиля (вопрос с подробными условиями).
+        from ai_assistant import is_salary_question, SALARY_ANSWER
+        if is_salary_question(q_clean):
+            for keyword, answer in custom_answers.items():
+                if is_salary_question(keyword) and not any(ch.isdigit() for ch in str(answer)):
+                    return answer
+            return SALARY_ANSWER
+
         # 1. Готовые ответы из конфига — только на короткие вопросы. Ключ ищется
-        # подстрокой, и на длинный вопрос «Опишите случай подключения очереди
-        # сообщений к сервису…» бот отвечал готовой фразой про город (25.09).
+        # подстрокой, и на длинный вопрос «Опишите случай подключения источника
+        # логов к SIEM…» бот отвечал «Рассматриваю удалённую работу» (25.09).
         if is_short_question(q_clean) and not self.yes_policy_question(q_clean):
             for keyword, answer in custom_answers.items():
                 if keyword.lower() in q_lower:
@@ -3447,7 +3590,8 @@ class HHSeleniumBot:
 
         # 3. Нейтральный ответ, если он задан в конфиге.
         #
-        # Анкеты встречаются примерно у 13% вакансий, и пропускать их все — терять заметную часть откликов.
+        # Решение пользователя 2026-09-21: анкеты встречаются примерно у 13%
+        # вакансий по ИБ, и пропускать их все — терять заметную часть откликов.
         # Нейтральная формулировка честна: она не утверждает ничего, чего мы не
         # знаем, и переносит вопрос на собеседование.
         #
@@ -3466,14 +3610,14 @@ class HHSeleniumBot:
         try:
             # Получаем название вакансии
             title_elem = vacancy_element.find_element(By.CSS_SELECTOR, '[data-qa="serp-item__title"]')
-            return self.validate_title(title_elem.text)
+            return self.validate_security_title(title_elem.text)
             
         except Exception as e:
             return False, f"Ошибка проверки: {e}"
 
     def is_api_vacancy_suitable(self, vacancy):
         """Проверяет API-вакансию по строгому title-фильтру."""
-        return self.validate_title(vacancy.get('name', ''))
+        return self.validate_security_title(vacancy.get('name', ''))
 
     def maybe_bump_resume(self):
         """Поднимает резюме, если по расписанию пора. Иначе — ничего не делает."""
@@ -3582,8 +3726,8 @@ class HHSeleniumBot:
         if self.stop_requested:
             return
         known = {str(v.get('id')) for v in cache.get('vacancies', []) if isinstance(v, dict)}
-        # Отсеянные фильтром не исключаем: фильтр меняется, а такие вакансии
-        # задуманы перепроверяемыми.
+        # Отсеянные фильтром не исключаем: фильтр меняется (23.09 он не знал
+        # «ИБ»), а такие вакансии задуманы перепроверяемыми.
         known |= {str(k) for k, v in (self.applied_vacancies or {}).items()
                   if not (isinstance(v, dict) and v.get('status') == STATUS_SKIPPED_FILTER)}
         fresh = [v for v in recs if v['id'] not in known]
@@ -3712,7 +3856,7 @@ class HHSeleniumBot:
                 # «Младшего специалиста», на которого отклика не было.
                 known = self.applied_vacancies.get(str(vacancy_id))
                 if isinstance(known, dict) and known.get('status') == STATUS_SKIPPED_FILTER:
-                    _, why = self.validate_title(vacancy_name)
+                    _, why = self.validate_security_title(vacancy_name)
                     logging.info(f" [ПРОПУСК] Отсеяна фильтром по названию: {why}")
                 else:
                     logging.info(" [ПРОПУСК] Уже откликались")
@@ -4057,11 +4201,13 @@ class HHSeleniumBot:
             # туда: разбор отказов раз за разом называл причиной «откликнулся без
             # письма» (25.09). Выключается в меню «Поведение бота».
             if (ok and 'БЕЗ письма' in message and cover_letter.strip()
-                    and self.config.get('letter_after_response', True)
-                    and self.attach_letter_after_response(cover_letter, vacancy_url)):
+                    and self.config.get('letter_after_response', True)):
                 tail = message.split(';', 1)[1] if ';' in message else ''
-                message = 'Отклик отправлен С сопроводительным письмом (дописано после отклика)' + (
-                    ';' + tail if tail else '')
+                tail = ';' + tail if tail else ''
+                if self.attach_letter_after_response(cover_letter, vacancy_url):
+                    message = 'Отклик отправлен С сопроводительным письмом (дописано после отклика)' + tail
+                elif self.send_letter_to_chat(cover_letter, vacancy_url):
+                    message = 'Отклик отправлен С сопроводительным письмом (отправлено в чат)' + tail
             return ok, message
             
         except ElementClickInterceptedException:
@@ -4148,7 +4294,7 @@ class HHSeleniumBot:
                     continue
 
                 # Title-фильтр; строгость зависит от allow_technical_fallback текущего яруса
-                suitable, reason = self.validate_title(vacancy_name)
+                suitable, reason = self.validate_security_title(vacancy_name)
                 if not suitable:
                     logging.info(f" [ПРОПУСК] Пропуск: {reason}")
                     self.skipped += 1
@@ -4297,7 +4443,7 @@ class HHSeleniumBot:
                 if not self.login():
                     return
 
-            # Активируем выбранное в настройках резюме
+            # Активируем целевое резюме по ИБ как активное по умолчанию
             self.select_primary_resume_on_startup()
             
             print(f"\n{YELLOW}{BOLD}{'='*60}{RESET}")
@@ -4427,11 +4573,11 @@ class HHSeleniumBot:
                 logging.info(f" Достигнут предел страниц ({max_pages}) [{label}]")
                 return
 
-    def run_site_search(self, queries, topup_mode, label):
+    def run_site_search(self, queries, allow_technical_fallback, label):
         """Каскадный браузерный поиск по списку запросов до дневного лимита.
 
-        topup_mode=False → заголовок обязан содержать ключевые слова направления (ярус 2);
-        True → только исключения, без ключевых слов направления (ярус 3, добор).
+        allow_technical_fallback=False → только строгие ИБ-заголовки (ярус 2);
+        True → разрешены dev/IT-заголовки через technical fallback (ярус 3).
         """
         max_applications = self.config.get('max_applications', 50)
         queries = [q for q in (queries or []) if q]
@@ -4448,8 +4594,8 @@ class HHSeleniumBot:
         print(f" Запросов: {len(queries)} | Откликов за 24ч: {self.applied_today}/{max_applications}")
         print("=" * 60)
 
-        previous_mode = self.config.get('topup_mode', False)
-        self.config['topup_mode'] = topup_mode
+        previous_fallback = self.config.get('allow_technical_fallback', True)
+        self.config['allow_technical_fallback'] = allow_technical_fallback
         try:
             for i, query in enumerate(queries, 1):
                 if (self.applied_today >= max_applications
@@ -4462,7 +4608,7 @@ class HHSeleniumBot:
                     label=f"{i}/{len(queries)}: {query}",
                 )
         finally:
-            self.config['topup_mode'] = previous_mode
+            self.config['allow_technical_fallback'] = previous_fallback
 
     def run_api_cache(self):
         """Откликается через браузер на вакансии, найденные API-ботом."""
@@ -4481,13 +4627,17 @@ class HHSeleniumBot:
                     self.run_failed = True
                     return
 
-            # Активируем выбранное в настройках резюме
+            # Активируем целевое резюме по ИБ как активное по умолчанию
             self.select_primary_resume_on_startup()
 
             print(f"\n{YELLOW}{BOLD}{'='*60}{RESET}")
             print(f"{BLUE}{BOLD}УПРАВЛЕНИЕ: [P] Пауза/Продолжить | [S] Стоп | [I] Статус{RESET}")
             print(f"{YELLOW}Паузу, продолжение и остановку можно включать из меню{RESET}")
             print(f"{YELLOW}{BOLD}{'='*60}{RESET}\n")
+
+            # Поднятие — до сбора вакансий: сбор идёт пару минут, и 28.09 бот
+            # поднял бы резюме только на первой вакансии, позже, чем пользователь вручную.
+            self.maybe_bump_resume()
 
             # ЯРУС 0: подходящие вакансии для резюме из веб-поиска — API отдаёт не все.
             try:
@@ -4498,7 +4648,7 @@ class HHSeleniumBot:
                 logging.info("[СТОП] Остановка по запросу пользователя")
                 return
 
-            # ЯРУС 1: вакансии из API-кеша (уже отфильтрованы test.py)
+            # ЯРУС 1: ИБ-вакансии из API-кеша (уже отфильтрованы test.py до приоритетов 1..5)
             vacancies = self.load_api_vacancies()
             if vacancies:
                 self.process_api_vacancies(vacancies)
@@ -4509,30 +4659,36 @@ class HHSeleniumBot:
                 logging.info("[СТОП] Остановка по запросу пользователя")
                 return
 
+            # Направление: для ИБ — ИБ-запросы и добор разработкой, для других —
+            # запросы своего направления и без добора. Раньше ИБ-запросы шли для
+            # любого направления, и поиск впустую перебирал чужие вакансии.
             try:
                 from config_manager import get_active_preset
                 preset = get_active_preset()
             except Exception:
-                preset = {}
+                preset = {'id': 'security'}
+            is_security = preset.get('id', 'security') == 'security'
 
-            # ЯРУС 2: запросы выбранного направления напрямую с сайта hh.ru
+            # ЯРУС 2: добор напрямую с сайта hh.ru (строгий фильтр по названию)
             self.run_site_search(
-                [q.replace('"', '') for q in (preset.get('queries')
-                 or ([preset['custom_query']] if preset.get('custom_query') else []))],
-                topup_mode=False,
-                label=f"ЯРУС 2: вакансии напрямую с сайта hh.ru ({preset.get('name', '')})",
+                self.config.get('security_search_queries', []) if is_security
+                else [q.replace('"', '') for q in (preset.get('queries')
+                      or ([preset['custom_query']] if preset.get('custom_query') else []))],
+                allow_technical_fallback=False,
+                label=('ЯРУС 2: ИБ-вакансии напрямую с сайта hh.ru' if is_security
+                       else f"ЯРУС 2: вакансии напрямую с сайта hh.ru ({preset.get('name', '')})"),
             )
 
             if self.stop_requested:
                 logging.info("[СТОП] Остановка по запросу пользователя")
                 return
 
-            # ЯРУС 3: если направление исчерпано, а до лимита не дотянули — добор
-            if self.config.get('topup_enabled', True):
+            # ЯРУС 3: если вся ИБ исчерпана, а до лимита не дотянули — добор разработкой/IT
+            if is_security and self.config.get('dev_topup_enabled', True):
                 self.run_site_search(
-                    self.config.get('topup_search_queries', []),
-                    topup_mode=True,
-                    label='ЯРУС 3: добор по дополнительным запросам до дневного лимита',
+                    self.config.get('dev_search_queries', []),
+                    allow_technical_fallback=True,
+                    label='ЯРУС 3: добор разработкой/IT до дневного лимита',
                 )
 
             print("\n" + "="*60)

@@ -1,7 +1,7 @@
 """
 Модуль динамического управления конфигурацией, резюме и поисковыми фильтрами HeadHunter.
 Позволяет любому пользователю легко переключать целевое резюме из своего аккаунта hh.ru
-и менять специализацию поиска (Python, DevOps, Системное администрирование, Custom) через меню.
+и менять специализацию поиска (ИБ, Python, DevOps, Системное администрирование, Custom) через меню.
 """
 
 import os
@@ -72,10 +72,103 @@ def log_detail(message: str) -> None:
     ))
 
 
+# Один список ИБ-слов для фильтра test.py и для hh_selenium. Копии
+# расходились: вакансия проходила в одном месте и отсеивалась в другом.
+SECURITY_TITLE_KEYWORDS = (
+    'appsec',
+    'application security',
+    'devsecops',
+    'devsec',
+    'red team',
+    'redteam',
+    'pentest',
+    'пентест',
+    'penetration',
+    'тестированию на проникновение',
+    'тестирование на проникновение',
+    'анализу защищ',
+    'анализ защищ',
+    'security engineer',
+    'web security',
+    'cyber security',
+    'cybersecurity',
+    'кибербезопасност',
+    'информационной безопасност',
+    'инфраструктурной безопасност',
+    'soc',
+    'siem',
+    'уязвимост',
+    # Добавлено 23.09: без них «вакансии для резюме» теряли настоящие ИБ-роли
+    # («Инженер по ИБ», «Методолог ИБ», «технических средств защиты»).
+    'иб',
+    'information security',
+    'security',
+    'кибер',
+    'защите информации',
+    'защиты информации',
+    'защита информации',
+    'средств защиты',
+    'сзи',
+    'скзи',
+    'кии',
+    'dlp',
+    'grc',
+    'ngfw',
+    'waf',
+    'edr',
+    'безопасной разработк',
+    'безопасности приложений',
+    'криптограф',
+    'vulnerability',
+    'реверс',
+    'reverse engineer',
+    'крипто',
+    'cert',
+    'csirt',
+    'iam',
+    'управлению доступом',
+    'управление доступом',
+    'тзи',
+    'pki',
+    # 28.09: «Главный специалист по противодействию иностранным техническим
+    # разведкам» (РОСКОСМОС) отсеивался. ПДИТР — классическая ТЗИ-роль.
+    # «разведк» одно не годится: сидит в «геологоразведке».
+    'пдитр', 'пд итр', 'техническим разведкам', 'технических разведок',
+    'технической разведк', 'технической защиты информации',
+    # Добавлено 24.09 — отсеивались настоящие ИБ-вакансии.
+    'infrasec', 'secops', 'netsec', 'cloudsec', 'offensive', 'blue team', 'purple team',
+    # 29.09: «Эксперт SOAR» (ИНФОРМЗАЩИТА) отсеивался.
+    'soar', 'ueba', 'irp',
+    # «Ведущий инженер-проектировщик (прикладные и хостовые СрЗИ)» (Солар) отсеивался.
+    'срзи',
+    'bug bounty', 'osint', 'threat', 'apt', 'darkweb', 'dark web', 'dfir', 'forensic',
+    'форензик', 'компьютерных инцидент', 'malware', 'вредонос',
+    # 25.09 вечер: «PCI DSS Specialist», «Администратор антивирусной защиты»,
+    # «Руководитель антифрод отдела», «ИТ-аудитор» отсеивались.
+    'pci dss', 'антивирус', 'антифрод', 'anti-fraud', 'antifraud',
+    'ит-аудит', 'it-аудит', 'it audit', 'ит аудит',
+)
+# Безопасность не про ИТ: такие названия правило «по смыслу» не берёт.
+NON_IT_SAFETY_MARKERS = (
+    'пожарн', 'промышленн', 'охран', 'труд', 'экономическ', 'транспортн',
+    'физическ', 'радиацион', 'экологическ', 'дорожн', 'движени', 'пищев',
+    'антитеррор', 'техника безопасности', 'техники безопасности', 'производствен', 'химическ', 'биологическ', 'ядерн',
+    'гражданск', 'релейн', 'электрохим', 'коррози', 'растени', 'потребител',
+    'социальн', 'службы безопасности', 'служба безопасности', 'полетов', 'полётов',
+    'медицинск', 'строительн', 'авиацион', 'продуктов',
+)
+# «защит» считается ИБ только вместе с таким ИТ-контекстом.
+SECURITY_PROTECTION_CONTEXT = (
+    'информац', 'данных', 'атак', 'сет', 'сзи', 'средств защиты', 'инфраструктур',
+    'приложен', 'персональн', 'кибер', 'ddos', 'утеч', 'периметр', 'доступ',
+)
+
+
 STRICT_TITLE_EXCLUDE_KEYWORDS = (
-    # Уровень должности (младший, начальник, руководитель...) не исключаем:
-    # подаёмся массово, отказ по уровню тоже данные для разбора. Отсеиваем
-    # только продажи, HR и учебные работы.
+    # Уровень должности (младший, начальник, руководитель...) не исключаем —
+    # решение 24.09: подаёмся массово, отказ по уровню тоже данные для разбора.
+    # Преподаватель, пресейл, сертификация СЗИ — тоже работа в ИБ (25.09).
+    # «Менеджер по ИБ в инфраструктуре» — работа в ИБ; отсеиваем только продажи.
     'менеджер по продажам',
     'менеджер по работе с клиентами',
     'менеджер по развитию',
@@ -93,9 +186,48 @@ STRICT_TITLE_EXCLUDE_KEYWORDS = (
     'bitrix',
     'битрикс',
     'полиграф',
+    'снк',             # «Системный архитектор SoC (СнК)» — чипы, не SOC
     'хакатон',
     'конкурс',
 )
+TECHNICAL_FALLBACK_INCLUDE_KEYWORDS = (
+    # 29.09: «Девопс-инженер», «Администратор UNIX», «Сетевой администратор»,
+    # «Сетевой архитектор», «Platform & Reliability Engineer» отсеивались, а на
+    # такие роли пользователь откликается (сетевые и DevOps-отказы в разборе).
+    'девопс', 'сетевой администратор', 'сетевого администратора', 'unix',
+    'сетевой архитектор', 'reliability',
+    'python',
+    'backend',
+    'back-end',
+    'devops',
+    'sre',
+    'site reliability',
+    'linux',
+    'system administrator',
+    'системный администратор',
+    'сетевой инженер',
+    'network engineer',
+    'инженер-программист',
+    'программист',
+    'разработчик',
+    'developer',
+    'qa automation',
+    'automation qa',
+    'sdet',
+    'data engineer',
+    # 25.09: «Ведущий специалист по автоматизации инфраструктуры».
+    'инфраструктур',
+    'автоматизац',
+    'систем мониторинга',
+    'system engineer',
+    'системный инженер',
+    'mlops', 'observability', 'виртуализац', 'сети передачи данных', 'ceph',
+    'qa', 'тестировщик', 'test engineer', 'тестированию',
+    'implementation engineer', 'внедрени', 'presale', 'пресейл', 'pre-sale',
+    'системный архитектор', 'infrastructure engineer',
+)
+
+
 _EXCLUDES_CACHE = {}
 
 
@@ -127,8 +259,8 @@ def title_excludes(config=None):
 def find_title_keyword(text, keywords):
     """Первое слово из списка, найденное в названии, или None.
 
-    Короткие слова — только целым словом: «qa» сидит внутри «aqua»,
-    «ит» — внутри «кредит», «hr» — внутри «chrome».
+    Короткие слова — только целым словом: «иб» сидит внутри «гибрид»,
+    «soc» — внутри «associate», «hr» — внутри «threat».
     """
     text = str(text or '').lower().replace('ё', 'е')
     for keyword in keywords:
@@ -143,8 +275,42 @@ def find_title_keyword(text, keywords):
     return None
 
 
+def security_title_by_meaning(title) -> bool:
+    """ИБ по смыслу названия, когда слов из списка нет.
+
+    Названия бывают какие угодно («Инженер защиты от сетевых атак», опечатка
+    «иформационной»). «Защищенность», «угрозы», «проникновение» бывают и
+    про охрану объектов, поэтому тоже только без маркеров не-ИТ безопасности.
+    """
+    low = str(title or '').lower().replace('ё', 'е')
+    if any(m in low for m in NON_IT_SAFETY_MARKERS):
+        return False
+    # «атак»: «Младший инженер по исследованию атак на веб-ресурсы» (25.09).
+    if any(w in low for w in ('безопасн', 'защищенност', 'угроз', 'проникновени', 'атак')):
+        return True
+    return 'защит' in low and any(c in low for c in SECURITY_PROTECTION_CONTEXT)
+
+
 # Пресеты специализаций поиска
 SEARCH_PRESETS = {
+    'security': {
+        'id': 'security',
+        'name': 'Информационная безопасность / Пентест / AppSec',
+        'search_url': 'https://hh.ru/search/vacancy?text=информационная+безопасность+OR+кибербезопасность+OR+пентест+OR+appsec+OR+devsecops&area=113&salary=&ored_clusters=true',
+        'queries': [
+            '"пентестер"', '"pentester"', '"penetration tester"', '"ethical hacker"',
+            '"red team"', '"offensive security"', '"vulnerability researcher"',
+            '"кибербезопасность"', '"cybersecurity"', '"информационная безопасность"',
+            '"security engineer"', '"SOC analyst"', '"SIEM administrator"',
+            '"application security"', '"appsec"', '"devsecops"', '"анализ защищенности"'
+        ],
+        'keywords_include': list(SECURITY_TITLE_KEYWORDS),
+        'keywords_exclude': [
+            # Уровень должности не исключаем (решение 24.09) — только роли.
+            'менеджер по продажам', 'продаж', 'sales manager', 'hr', 'рекрутер', 'охранник',
+            'охрана труда'
+        ]
+    },
     'python': {
         'id': 'python',
         'name': 'Python Developer / Backend',
@@ -333,14 +499,14 @@ def load_config() -> Dict[str, Any]:
     default_config = {
         "resume_id": DEFAULT_RESUME_ID,
         "resume_title": DEFAULT_RESUME_TITLE,
-        "search_preset": "custom",
-        "search_url": SEARCH_PRESETS['custom']['search_url'],
+        "search_preset": "security",
+        "search_url": SEARCH_PRESETS['security']['search_url'],
         "max_applications": 200,
         "skip_with_tests": True,
         "skip_applied": True,
-        "keywords_include": SEARCH_PRESETS['custom']['keywords_include'],
-        "keywords_exclude": SEARCH_PRESETS['custom']['keywords_exclude'],
-        "search_queries": SEARCH_PRESETS['custom']['queries'],
+        "keywords_include": SEARCH_PRESETS['security']['keywords_include'],
+        "keywords_exclude": SEARCH_PRESETS['security']['keywords_exclude'],
+        "security_search_queries": SEARCH_PRESETS['security']['queries'],
     }
     save_config(default_config)
     return default_config
@@ -381,23 +547,25 @@ def set_active_resume(resume_id: str, resume_title: str) -> bool:
 
 
 def search_direction_chosen(cfg: Optional[Dict[str, Any]] = None) -> bool:
-    """Выбрал ли пользователь, что искать. Без выбора бот искал бы по чужому
-    направлению, и новый пользователь откликался бы не на свои вакансии."""
+    """Выбрал ли пользователь, что искать. Без выбора бот по умолчанию искал ИБ —
+    и новый пользователь-разработчик откликался бы на вакансии безопасников."""
     cfg = load_config() if cfg is None else cfg
     return bool(cfg.get('search_preset') or cfg.get('search_url') or cfg.get('search_queries')
-                or cfg.get('custom_search_query'))
+                or cfg.get('security_search_queries') or cfg.get('custom_search_query'))
 
 
 def get_active_preset() -> Dict[str, Any]:
     """Возвращает текущий пресет поиска."""
     cfg = load_config()
-    preset_id = cfg.get('search_preset', 'custom')
-    preset = SEARCH_PRESETS.get(preset_id, SEARCH_PRESETS['custom']).copy()
+    preset_id = cfg.get('search_preset', 'security')
+    preset = SEARCH_PRESETS.get(preset_id, SEARCH_PRESETS['security']).copy()
     
     # Если в конфиге переопределен search_url или queries
     if cfg.get('search_url'):
         preset['search_url'] = cfg['search_url']
-    if cfg.get('search_queries'):
+    if cfg.get('security_search_queries') and preset_id == 'security':
+        preset['queries'] = cfg['security_search_queries']
+    elif cfg.get('search_queries'):
         preset['queries'] = cfg['search_queries']
     if cfg.get('custom_search_query') and preset_id == 'custom':
         preset['custom_query'] = cfg['custom_search_query']
@@ -416,8 +584,8 @@ def get_active_preset() -> Dict[str, Any]:
 
 
 # --- Отсев вакансий, грейд которых заведомо выше профиля кандидата ---------
-# Повод: бот откликнулся на «Заместитель Председателя Правления по IT».
-# В keywords_exclude есть 'директор', 'начальник', 'руководитель',
+# Повод: бот откликнулся на «Заместитель Председателя Правления по информационной
+# безопасности». В keywords_exclude есть 'директор', 'начальник', 'руководитель',
 # 'chief', 'ciso' — но правление банка называется иначе, и не совпало НИ ОДНО слово.
 # Плюс сам список слов ничего не знает про опыт кандидата: он одинаков и для
 # джуна, и для человека с 15 годами стажа.
@@ -479,7 +647,7 @@ def check_title_grade(title: object, experience_years: Optional[int] = None) -> 
     # По умолчанию ВЫКЛЮЧЕН. Отклик на позицию выше грейда ничего не стоит, а отказ
     # по нему — данные для разбора: анализатор сам скажет, что не так. Молча резать
     # вакансии вредно ещё и потому, что цифра стажа в настройках легко устаревает
-    # (и фильтр рубил доступное).
+    # (стояло 3 года при реальных 6 годах 9 месяцах, и фильтр рубил доступное).
     # Включается флагом grade_filter в настройках.
     try:
         if not (load_config().get('grade_filter') or False):
@@ -508,7 +676,7 @@ def check_title_grade(title: object, experience_years: Optional[int] = None) -> 
 def set_active_preset(preset_id: str, custom_query: Optional[str] = None, custom_url: Optional[str] = None) -> bool:
     """Устанавливает пресет поиска и обновляет поисковые фильтры."""
     if preset_id not in SEARCH_PRESETS:
-        preset_id = 'custom'
+        preset_id = 'security'
 
     cfg = load_config()
     current_preset = cfg.get('search_preset')
@@ -532,6 +700,14 @@ def set_active_preset(preset_id: str, custom_query: Optional[str] = None, custom
         cfg['search_queries'] = preset['queries']
         cfg['keywords_include'] = preset['keywords_include']
         cfg['keywords_exclude'] = preset['keywords_exclude']
+        # security_search_queries перезаписываем ТОЛЬКО при реальной смене направления.
+        # Иначе повторный выбор уже активного пункта [1] затирал настроенные вручную
+        # запросы дефолтными — а они в SEARCH_PRESETS взяты в кавычки, что в
+        # build_site_search_url превращается в поиск точной фразы по заголовку
+        # и обрушивает выдачу.
+        if preset_id == 'security' and (current_preset != preset_id
+                                        or not cfg.get('security_search_queries')):
+            cfg['security_search_queries'] = preset['queries']
 
     # Очищаем кеш вакансий только при реальной смене направления, чтобы не смешивать вакансии
     if current_preset != preset_id and os.path.exists(VACANCIES_CACHE_FILE):
@@ -745,26 +921,29 @@ def interactive_search_picker():
     print(f"{CYAN}{BOLD}{'='*60}{RESET}")
     print(f"Текущее направление: {GREEN}{BOLD}{active_preset['name']}{RESET}")
     print(f"{CYAN}{'-'*60}{RESET}")
-    print(f"  {YELLOW}[1]{RESET} Python Developer / Backend (Django, FastAPI, Asyncio)")
-    print(f"  {CYAN}[2]{RESET} DevOps / SRE / Kubernetes / Cloud")
-    print(f"  {BLUE}[3]{RESET} Системный администратор / Сетевой инженер")
-    print(f"  {MAGENTA}[4]{RESET} Свой поисковый запрос (ввести должность/навыки)")
-    print(f"  {WHITE}[5]{RESET} Вставить готовую ссылку с фильтрами с сайта hh.ru")
+    print(f"  {GREEN}[1]{RESET} Информационная безопасность / Пентест / AppSec")
+    print(f"  {YELLOW}[2]{RESET} Python Developer / Backend (Django, FastAPI, Asyncio)")
+    print(f"  {CYAN}[3]{RESET} DevOps / SRE / Kubernetes / Cloud")
+    print(f"  {BLUE}[4]{RESET} Системный администратор / Сетевой инженер")
+    print(f"  {MAGENTA}[5]{RESET} Свой поисковый запрос (ввести должность/навыки)")
+    print(f"  {WHITE}[6]{RESET} Вставить готовую ссылку с фильтрами с сайта hh.ru")
     print(f"  {RED}[0]{RESET} Назад в главное меню")
     print(f"{CYAN}{BOLD}{'='*60}{RESET}")
 
     try:
-        choice = input(f"{BOLD}Выберите вариант [1-5, 0]: {RESET}").strip().lower()
+        choice = input(f"{BOLD}Выберите вариант [1-6, 0]: {RESET}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
 
     if choice == '1':
-        _report_save(set_active_preset('python'), "Выбрано направление: Python Developer / Backend")
+        _report_save(set_active_preset('security'), "Выбрано направление: Информационная безопасность / Пентест")
     elif choice == '2':
-        _report_save(set_active_preset('devops'), "Выбрано направление: DevOps / SRE / Cloud")
+        _report_save(set_active_preset('python'), "Выбрано направление: Python Developer / Backend")
     elif choice == '3':
-        _report_save(set_active_preset('sysadmin'), "Выбрано направление: Системный администратор / Сети")
+        _report_save(set_active_preset('devops'), "Выбрано направление: DevOps / SRE / Cloud")
     elif choice == '4':
+        _report_save(set_active_preset('sysadmin'), "Выбрано направление: Системный администратор / Сети")
+    elif choice == '5':
         try:
             q = input(f"\n{BOLD}Введите поисковый запрос (например, 'frontend react' или 'data engineer'): {RESET}").strip()
             if q:
@@ -772,7 +951,7 @@ def interactive_search_picker():
                              f"Направление поиска установлено на: {q}")
         except (EOFError, KeyboardInterrupt):
             return
-    elif choice == '5':
+    elif choice == '6':
         try:
             url = input(f"\n{BOLD}Вставьте полную ссылку поиска с фильтрами с hh.ru: {RESET}").strip()
             if url.startswith('http'):
@@ -789,7 +968,7 @@ def interactive_search_picker():
 
 
 def default_cover_letter(profile: dict, telegram: str = '') -> str:
-    """Запасной шаблон письма из профиля — для любой профессии."""
+    """Запасной шаблон письма из профиля — для любой профессии, не только ИБ."""
     profile = profile or {}
     spec = str(profile.get('specialization') or '').split(':')[0].strip()
     skills = [str(x) for x in (profile.get('skills') or [])][:4]
@@ -922,6 +1101,9 @@ def interactive_cover_letter_editor():
         time.sleep(1.2)
 
 
+_KEY_PROMPT_CANCEL = ('0', 'q', 'й', 'назад', 'выход', 'exit', 'back')
+
+
 def prompt_gemini_key():
     """Быстрый ввод ключа Google Gemini API с авто-валидацией и подбором модели."""
     cfg = load_config()
@@ -946,6 +1128,14 @@ def prompt_gemini_key():
 
     try:
         new_key = input(f"{BOLD}Вставьте Gemini API ключ (или Enter для отмены): {RESET}").strip()
+        # 25.09 «0» (привычное «назад» в меню) сохранился как ключ и тихо выключил Gemini на 4 дня.
+        if new_key.lower() in _KEY_PROMPT_CANCEL:
+            new_key = ''
+        elif new_key and (not new_key.startswith('AIza') or len(new_key) < 30):
+            print(f"{RED}[X] Это не похоже на ключ Gemini: он начинается с «AIza» и длиннее 30 символов. "
+                  f"Прежний ключ оставлен.{RESET}")
+            time.sleep(2)
+            return
         if new_key:
             print(f"\n[*] Проверяю ключ и подбираю подходящий режим...")
             chosen_model = 'gemini-flash-latest'
@@ -1030,6 +1220,12 @@ def prompt_groq_key():
 
     try:
         new_key = input(f"{BOLD}Вставьте ключ Groq (или Enter для отмены): {RESET}").strip()
+        if new_key.lower() in _KEY_PROMPT_CANCEL:
+            new_key = ''
+        elif new_key and (not new_key.startswith('gsk_') or len(new_key) < 30):
+            print(f"{RED}[X] Это не похоже на ключ Groq: он начинается с «gsk_». Прежний ключ оставлен.{RESET}")
+            time.sleep(2)
+            return
         if not new_key:
             print(f"\n{GRAY}Изменения не внесены.{RESET}\n")
             time.sleep(1.2)
@@ -1098,14 +1294,14 @@ if __name__ == '__main__':
         prompt_gemini_key()
     elif '--selfcheck-grade' in args:
         # Проверка фильтра грейда: ничего не отправляет, только считает.
-        assert not check_title_grade('Заместитель Председателя Правления по IT', 3)[0]
-        assert not check_title_grade('Директор департамента разработки', 3)[0]
-        assert check_title_grade('Заместитель Председателя Правления по IT', 12)[0], 'опыт 12 лет — пропускаем'
-        for ok_title in ('Ведущий специалист по разработке',
-                         'Главный специалист по данным',
-                         'Senior Backend Engineer', 'Lead DevOps Engineer',
-                         'Эксперт по аналитике',
-                         'Специалист по тестированию'):
+        assert not check_title_grade('Заместитель Председателя Правления по информационной безопасности', 3)[0]
+        assert not check_title_grade('Директор департамента информационной безопасности', 3)[0]
+        assert check_title_grade('Заместитель Председателя Правления по ИБ', 12)[0], 'опыт 12 лет — пропускаем'
+        for ok_title in ('Ведущий специалист по информационной безопасности',
+                         'Главный специалист по защите информации',
+                         'Senior Security Engineer', 'Lead DevSecOps Engineer',
+                         'Эксперт по кибербезопасности',
+                         'Специалист по управлению уязвимостями'):
             assert check_title_grade(ok_title, 3)[0], f'ложное срабатывание: {ok_title}'
         assert get_candidate_experience_years({}) == 0, 'нет профиля — считаем опыт нулевым'
         print(c_ok('Фильтр грейда: все проверки пройдены'))
@@ -1172,6 +1368,8 @@ def edit_bot_behavior():
         policy = cfg.get('answer_policy') or {}
         chat = cfg.get('chat_autoreply') or {}
         email = cfg.get('email_outreach') or {}
+        preset = get_active_preset()
+        is_security = preset.get('id', 'security') == 'security' and search_direction_chosen(cfg)
         items = [
             ('limit', f"Откликов в сутки: {BOLD}{cfg.get('max_applications', 200)}{RESET}"),
             ('yes', f"«Да» на вопросы о готовности и условиях (офис, переезд, ИП, график): "
@@ -1184,15 +1382,21 @@ def edit_bot_behavior():
                      f"{_toggle_label(chat.get('enabled', True))}"
                      f", не больше {chat.get('max_per_run', 10)} за прогон"),
             ('resume', f"Самому вносить правки в резюме по разбору отказов: "
-                       f"{_toggle_label(cfg.get('auto_apply_resume', False))}"),
+                       f"{_toggle_label(cfg.get('auto_apply_resume', True))}"),
+            ('hidden', f"Разбор отказов и поднятие резюме в фоне, без окна браузера: "
+                       f"{_toggle_label(cfg.get('analysis_headless', False))}"),
             ('blocked', f"Нежелательные работодатели: {len(cfg.get('blocked_employers') or [])}"),
             ('exclude', f"Слова-исключения в названиях вакансий: "
                         f"{len(cfg.get('keywords_exclude') or []) or 'встроенный список'}"),
             ('email', f"Письма работодателям на почту: {_toggle_label(email.get('enabled', False))}"),
         ]
-        items.append(
-            ('topup', f"Добирать по дополнительным запросам, когда основные вакансии кончились: "
-                      f"{_toggle_label(cfg.get('topup_enabled', True))}"))
+        if is_security:
+            items += [
+                ('fallback', f"Смежные ИТ-вакансии (DevOps, Linux, разработка) вместе с основными: "
+                             f"{_toggle_label(cfg.get('allow_technical_fallback', True))}"),
+                ('topup', f"Добирать разработкой, когда основные вакансии кончились: "
+                          f"{_toggle_label(cfg.get('dev_topup_enabled', True))}"),
+            ]
         print(f"\n{CYAN}{BOLD}{'=' * 62}{RESET}")
         print(f"{CYAN}{BOLD}   ПОВЕДЕНИЕ БОТА{RESET}")
         print(f"{CYAN}{BOLD}{'=' * 62}{RESET}")
@@ -1233,10 +1437,15 @@ def edit_bot_behavior():
                     pass
             cfg['chat_autoreply'] = chat
         elif key == 'resume':
-            cfg['auto_apply_resume'] = not cfg.get('auto_apply_resume', False)
+            cfg['auto_apply_resume'] = not cfg.get('auto_apply_resume', True)
+        elif key == 'hidden':
+            cfg['analysis_headless'] = not cfg.get('analysis_headless', False)
+            if cfg['analysis_headless']:
+                print(f"{YELLOW}[!] В фоне капчу hh решить некому: если она появится, разбор остановится. "
+                      f"Разовый показ окна: флаг --show-browser.{RESET}")
         elif key == 'blocked':
             _edit_word_list(cfg, 'blocked_employers', 'Нежелательные работодатели',
-                            'Название компании или его часть: «Web3 Tech». На них бот не откликается.')
+                            'Название компании или его часть: «Компания-пример». На них бот не откликается.')
             continue
         elif key == 'exclude':
             if not cfg.get('keywords_exclude'):
@@ -1249,8 +1458,10 @@ def edit_bot_behavior():
             if email['enabled'] and not email.get('app_password'):
                 print(f"{YELLOW}[!] Для отправки нужен пароль приложения почты (email_outreach.app_password).{RESET}")
             cfg['email_outreach'] = email
+        elif key == 'fallback':
+            cfg['allow_technical_fallback'] = not cfg.get('allow_technical_fallback', True)
         elif key == 'topup':
-            cfg['topup_enabled'] = not cfg.get('topup_enabled', True)
+            cfg['dev_topup_enabled'] = not cfg.get('dev_topup_enabled', True)
         _report_save(save_config(cfg), 'Сохранено')
 
 

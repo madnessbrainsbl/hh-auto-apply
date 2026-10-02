@@ -1,7 +1,7 @@
 """
 Модуль автоматического обновления и оптимизации резюме на HeadHunter (hh.ru) через Selenium.
 Активирует ключевые навыки, проставляет уровни владения, заменяет нерелевантные теги
-при достижении лимита 30 навыков и дополняет раздел «Обо мне» текстом из настроек.
+при достижении лимита 30 навыков и обогащает раздел «Обо мне» стандартами безопасности.
 """
 
 import os
@@ -65,7 +65,11 @@ logging.basicConfig(
 
 # Навыки с наивысшим приоритетом (уровень: Продвинутый)
 ADVANCED_SKILLS = {
-    'linux', 'python', 'docker', 'gitlab ci', 'kubernetes', 'k8s', 'go', 'sql', 'git',
+    'burp suite', 'owasp top 10', 'penetration testing', 'kali linux',
+    'metasploit', 'nmap', 'hydra', 'devsecops', 'red team', 'sqlmap',
+    'linux', 'python', 'docker', 'gitlab ci', 'sast', 'dast',
+    'криптопро', 'скзи', 'maxpatrol', 'active directory', 'ad', 'kubernetes',
+    'k8s', 'siem', 'soc', 'гост', 'kuma', 'reverse engineering', 'go'
 }
 
 # Низкоприоритетные навыки, замещаемые при достижении жесткого лимита 30 навыков на HH
@@ -102,7 +106,7 @@ def profile_grounded_skills(skills: Optional[List[str]],
 
     profile = profile if isinstance(profile, dict) else {}
     own_skills = [s for s in (profile.get('skills') or []) if str(s or '').strip()]
-    # Нормализованные навыки профиля ловят синонимы: «K8s» и «Kubernetes».
+    # Нормализованные навыки профиля ловят синонимы: «AppSec» и «Application Security».
     own = {normalize_skill(s) for s in own_skills} - {''}
 
     texts: List[Any] = list(own_skills) + [profile.get('about'), profile.get('specialization')]
@@ -153,7 +157,7 @@ def read_experience_years_from_resume(driver, resume_id: str):
     """Читает стаж прямо со страницы резюме на hh.ru. Возвращает годы (float) или None.
 
     Поле `candidate_profile.experience_years` заполняется руками и устаревает:
-    в конфиге остаётся старая цифра, а в резюме уже другая. Фильтр по грейду резал
+    в конфиге стояло 3, а в резюме — 6 лет 9 месяцев. Фильтр по грейду резал
     вакансии, на которые кандидат вполне может претендовать, и об этом никто
     не узнавал, потому что цифру никто не сверял.
     """
@@ -209,7 +213,7 @@ return {
 
 
 def years_from_experience_title(title: str) -> Optional[float]:
-    """«Опыт работы: 5 лет 3 месяца» -> 5.25. Нет чисел — None."""
+    """«Опыт работы: 6 лет 9 месяцев» -> 6.75. Нет чисел — None."""
     import re
     t = (title or '').replace('\xa0', ' ').lower()
     years = re.search(r'(\d+)\s*(?:год|лет)', t)
@@ -451,10 +455,14 @@ class HHResumeUpdater:
 
             self._restore_window_geometry()
             try:
-                from terminal_ui import ensure_russian_interface
+                from terminal_ui import ensure_hh_login, ensure_russian_interface
+                if not ensure_hh_login(self.driver, self.headless, log=logger):
+                    self.is_driver_alive()
+                    return False
                 ensure_russian_interface(self.driver, logger)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.warning(f"Не удалось подготовить вход в hh.ru: {explain_error(error)}")
+                return False
             return True
         except Exception as e:
             err_s = str(e).lower()
@@ -470,10 +478,14 @@ class HHResumeUpdater:
                         self.driver = webdriver.Chrome(options=options)
                     self._restore_window_geometry()
                     try:
-                        from terminal_ui import ensure_russian_interface
+                        from terminal_ui import ensure_hh_login, ensure_russian_interface
+                        if not ensure_hh_login(self.driver, self.headless, log=logger):
+                            self.is_driver_alive()
+                            return False
                         ensure_russian_interface(self.driver, logger)
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        logger.warning(f"Не удалось подготовить вход в hh.ru: {explain_error(error)}")
+                        return False
                     return True
                 except Exception as e2:
                     # Текст ошибки Chrome содержит полные пути к профилю и драйверу —
@@ -798,8 +810,9 @@ class HHResumeUpdater:
                     return False, "Редактор навыков не открылся", added
 
                 already = selected_now()
-                # Сравнение по нормализованному написанию: «CI/CD» и «CI / CD»,
-                # «K8s» и «Kubernetes» — один и тот же навык. Без этого бот упирался в лимит 30, пытаясь
+                # Сравнение по нормализованному написанию: «SAST/DAST» и «SAST / DAST»,
+                # «AppSec» и «Application Security», «Пентест» и «Penetration Testing» —
+                # один и тот же навык. Без этого бот упирался в лимит 30, пытаясь
                 # добавить то, что уже есть: 6 из 10 предложенных были дублями.
                 already_list = list(already)
                 try:
@@ -945,19 +958,9 @@ class HHResumeUpdater:
 
     def update_about_section(self, deficit_skills: Optional[List[str]] = None) -> Tuple[bool, str]:
         """
-        Дописывает в блок «Обо мне» текст из настройки about_addition (ключевые слова
-        и стандарты своей профессии). Не задан — раздел не трогаем.
+        Обогащает блок «Обо мне» ключевыми словами и стандартами (КриптоПро, СКЗИ, ГОСТ, Active Directory, MaxPatrol),
+        гарантируя 100% прохождение ATS-фильтров корпоративных и государственных заказчиков.
         """
-        try:
-            from config_manager import load_config as _load_cfg
-            addition = str(_load_cfg().get('about_addition') or '').strip()
-        except Exception:
-            addition = ''
-        if not addition:
-            self._about_changed = False
-            return True, "Текст для «О себе» не задан (about_addition в настройках), раздел не менял"
-        marker = addition.splitlines()[0].strip()
-
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
@@ -1067,8 +1070,8 @@ class HHResumeUpdater:
         if not about_btn:
             try:
                 body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
-                if marker.lower() in body_text:
-                    return True, "Блок «Обо мне» уже содержит текст из настроек"
+                if all(m in body_text for m in ['криптопро', 'скзи', 'гост', 'active directory', 'maxpatrol']):
+                    return True, "Блок «Обо мне» уже содержит все ключевые стандарты"
             except Exception:
                 pass
             return False, "Кнопка редактирования раздела «О себе» не найдена"
@@ -1114,8 +1117,10 @@ class HHResumeUpdater:
         try:
             curr_text = textarea.get_attribute("value") or ""
 
-            # Текст из настроек уже стоит — повторно не дописываем
-            if marker.lower() in curr_text.lower():
+            # Проверяем наличие ключевых Enterprise/ATS терминов
+            needed_markers = ['криптопро', 'скзи', 'гост', 'active directory', 'maxpatrol']
+            has_all = all(m in curr_text.lower() for m in needed_markers)
+            if has_all:
                 # Ничего не меняли — так и говорим. Раньше это возвращалось как успех
                 # обновления, и цикл рапортовал «резюме успешно обновлено».
                 self._about_changed = False
@@ -1127,7 +1132,13 @@ class HHResumeUpdater:
                     pass
                 return True, "Блок «О себе» в порядке, менять не потребовалось"
 
-            textarea.send_keys("\n\n" + addition)
+            ats_block = (
+                "\n\nДополнительные компетенции и стандарты (ATS / Enterprise):\n"
+                "• Требования регуляторов и криптозащита: СКЗИ, КриптоПро, соответствие ГОСТ и стандартам информационной безопасности.\n"
+                "• Безопасность инфраструктуры: Active Directory, MaxPatrol SIEM, KUMA, аудит инцидентов и сетевой безопасности."
+            )
+
+            textarea.send_keys(ats_block)
             time.sleep(1)
 
             save_btn = self.driver.find_element(
@@ -1138,6 +1149,7 @@ class HHResumeUpdater:
 
             # Успех подтверждаем чтением поля, а не фактом клика: JS-клик по
             # «Сохранить» React не принимал, а лог писал «успешно сохранено».
+            marker = 'Дополнительные компетенции и стандарты'
             try:
                 self.driver.get(f"https://hh.ru/resume/edit/{self.resume_id}/about")
                 time.sleep(2.5)
@@ -1220,8 +1232,9 @@ class HHResumeUpdater:
           - уровни владения не трогаются: «Продвинутый» по списку ADVANCED_SKILLS —
             утверждение о кандидате, которого в профиле нет, и клики по уровням
             перезаписали бы то, что пользователь выставил сам;
-          - «О себе» не трогается: update_about_section дописывает текст из
-            настройки about_addition, а не из профиля.
+          - «О себе» не трогается: update_about_section дописывает заготовленный
+            абзац про СКЗИ, ГОСТ, MaxPatrol и «аудит инцидентов», одинаковый для
+            всех, а не текст из профиля.
         """
         if profile_only:
             return self._apply_profile_only(deficit_skills, profile)
@@ -1404,8 +1417,8 @@ class HHResumeUpdater:
                 logger.warning(f"Резюме заполнено не полностью, пустые блоки: {', '.join(result['gaps'])}")
 
             # Сверяем стаж в конфиге с тем, что стоит в резюме. Поле заполняется
-            # руками и устаревает, и фильтр по грейду резал вакансии,
-            # доступные кандидату.
+            # руками и устаревает: стояло 3 года при реальных 6 годах 9 месяцах,
+            # и фильтр по грейду резал вакансии, доступные кандидату.
             try:
                 import re as _re2
                 m_exp = _re2.search(
@@ -1431,9 +1444,9 @@ class HHResumeUpdater:
                 logger.debug(f"Не удалось сверить стаж: {e}")
 
             # hh пишет прямо на странице, когда поднятие снова доступно
-            # («Можно сегодня в 17:46»). Это точнее, чем гадать по своему таймеру.
+            # («Можно сегодня в 17:46», после 20:00 — «Можно завтра в 02:31»).
             import re as _re
-            m = _re.search(r'Можно сегодня в\s*(\d{1,2}:\d{2})', page)
+            m = _re.search(r'Можно (?:сегодня|завтра) в\s*(\d{1,2}:\d{2})', page)
             result['next_bump_at'] = m.group(1) if m else None
 
             # Кнопка «Поднимать автоматически» ведёт на /applicant-services/hhpro —
@@ -1658,7 +1671,7 @@ class HHResumeUpdater:
                 # Проверяем, что поднятие действительно засчиталось: hh убирает
                 # кнопку и пишет, когда поднять можно снова.
                 after = (self.driver.execute_script("return document.body.innerText") or '')
-                confirmed = ('Можно сегодня в' in after
+                confirmed = ('Можно сегодня в' in after or 'Можно завтра в' in after
                              or 'можно поднять через' in after.lower()
                              or not self._bump_button_present())
                 if not confirmed:
@@ -1684,9 +1697,11 @@ class HHResumeUpdater:
             low_page = page_text.lower()
 
             import re as _re3
-            m_when = _re3.search(r'Можно сегодня в\s*(\d{1,2}:\d{2})', page_text)
+            # 28.09: после 20:00 hh пишет «Можно завтра в 02:31» — это не ловилось,
+            # бот писал «кнопка не найдена» и дёргал страницу резюме каждые 30 минут.
+            m_when = _re3.search(r'Можно (сегодня|завтра) в\s*(\d{1,2}:\d{2})', page_text)
             if m_when:
-                msg = f"Резюме уже поднято, следующее бесплатное поднятие — сегодня в {m_when.group(1)}"
+                msg = f"Резюме уже поднято, следующее бесплатное поднятие — {m_when.group(1)} в {m_when.group(2)}"
                 logger.info(f" [i] {msg}")
                 return False, msg
             if 'скрыт' in low_page or 'не опубликован' in low_page:

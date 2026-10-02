@@ -10,7 +10,7 @@ import pytest
 
 import email_outreach
 
-PASSWORD = 'SeCrEt-app-pass-123'
+PASSWORD = "fixture-password-123"
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +43,7 @@ def make_config(**overrides):
 
 def send(config, vacancy_id='1', text='Пишите на HR@Company.ru'):
     return email_outreach.maybe_send_application_email(
-        config, vacancy_id, 'Python-разработчик', 'ООО Ромашка', text, 'Добрый день! Мой отклик.')
+        config, vacancy_id, 'Пентестер', 'ООО Ромашка', text, 'Добрый день! Мой отклик.')
 
 
 def read_log(tmp_path):
@@ -79,7 +79,7 @@ def test_success_ssl_records_and_builds_message(monkeypatch, sandbox):
     server.login.assert_called_once_with('me@mail.ru', PASSWORD)
     msg = server.send_message.call_args.args[0]
     assert msg['To'] == 'hr@company.ru'
-    assert msg['Subject'] == 'Отклик на вакансию «Python-разработчик»'
+    assert msg['Subject'] == 'Отклик на вакансию «Пентестер»'
     assert 'Иван Иванов' in str(msg['From']) and 'me@mail.ru' in str(msg['From'])
     assert msg.get_content().strip() == 'Добрый день! Мой отклик.'
     log = read_log(sandbox)
@@ -135,7 +135,7 @@ def test_auth_error_hint_without_password(monkeypatch, sandbox):
     logger = MagicMock()
     logger.warning.side_effect = records.append
     status = email_outreach.maybe_send_application_email(
-        make_config(), '1', 'Python-разработчик', 'ООО', 'hr@corp.ru', 'Письмо', logger=logger)
+        make_config(), '1', 'Пентестер', 'ООО', 'hr@corp.ru', 'Письмо', logger=logger)
     assert 'пароль приложения' in status and 'Mail.ru' in status
     assert PASSWORD not in status and all(PASSWORD not in r for r in records)
     assert not (sandbox / email_outreach.LOG_FILE_NAME).exists()
@@ -162,7 +162,7 @@ def test_bot_hook_passes_vacancy_text_and_letter(monkeypatch, tmp_path, caplog):
         'page_text': 'Требования... Резюме присылайте на HR@Company.ru',
     }
     with caplog.at_level(logging.INFO):
-        bot.maybe_email_employer('123', 'Аналитик данных')
+        bot.maybe_email_employer('123', 'Аналитик SOC')
     assert 'hr@company.ru' in caplog.text
     assert 'Пробный режим' in caplog.text
     assert 'secret' not in caplog.text

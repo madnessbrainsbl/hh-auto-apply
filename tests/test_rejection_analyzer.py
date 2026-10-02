@@ -16,9 +16,9 @@ def analyzer(tmp_path):
             "ai_config": {"enabled": False},
             "candidate_profile": {
                 "name": "Иван",
-                "specialization": "Python-разработка",
+                "specialization": "Информационная безопасность",
                 "experience_years": 3,
-                "skills": ["Python", "PostgreSQL", "Django", "Linux"],
+                "skills": ["Python", "OWASP", "Burp Suite", "Linux"],
                 "expected_salary": "180 000 руб."
             }
         }, f)
@@ -80,14 +80,14 @@ def test_analyzer_sample_chats(analyzer):
 
 def test_ai_assistant_analyze_chat_rejection(analyzer):
     res = analyzer.ai_assistant.analyze_chat_rejection(
-        vacancy_title="Backend Engineer",
-        company_name="Tech Corp",
+        vacancy_title="AppSec Engineer",
+        company_name="Security Corp",
         vacancy_description="Требуется опыт работы с Docker, Kubernetes, SAST, DAST, CI/CD",
         chat_history=[
-            {"sender": "Соискатель", "text": "Добрый день! Хочу работать в IT."},
+            {"sender": "Соискатель", "text": "Добрый день! Хочу работать в ИБ."},
             {"sender": "Работодатель", "text": "К сожалению, мы ищем кандидата со стажем в Kubernetes и SAST."}
         ],
-        cover_letter="Добрый день! Хочу работать в IT.",
+        cover_letter="Добрый день! Хочу работать в ИБ.",
         employer_messages=["К сожалению, мы ищем кандидата со стажем в Kubernetes и SAST."]
     )
     assert "rejection_root_cause" in res
@@ -173,13 +173,13 @@ def test_chat_reply_system_prompt_is_a_string():
         enabled = True
         candidate_profile = {'name': 'Иван', 'skills': ['Python']}
 
-        def _call_llm(self, prompt, system_prompt=None):
+        def _call_llm(self, prompt, system_prompt=None, validate=None):
             seen['system_prompt'] = system_prompt
             return 'Здравствуйте! Готов обсудить.'
 
     analyzer = r.RejectionAnalyzer.__new__(r.RejectionAnalyzer)
     analyzer.ai_assistant = StubAI()
-    analyzer.compose_chat_reply('Какой у вас опыт с Kafka?', 'Аналитик данных', 'Тест')
+    analyzer.compose_chat_reply('Какой у вас опыт с SIEM?', 'Аналитик SOC', 'Тест')
     assert isinstance(seen.get('system_prompt'), str)
     assert '\\n' not in seen['system_prompt']  # буквальный «\n» — след той же порчи
 
@@ -189,8 +189,8 @@ def test_browser_failure_is_not_reported_as_no_new_rejections(analyzer, capsys):
     """24.09: браузер не открылся, а бот написал «новых отказов нет» — hh.ru не проверяли."""
     analyzer._init_driver = lambda: False
     analyzer.is_driver_alive = lambda: False
-    analyzer._load_cached_chats = lambda limit=0: [{'vacancy_title': 'Backend', 'company_name': 'X'}]
-    analyzer.seen_rejection_keys = lambda: {'backend_x'}
+    analyzer._load_cached_chats = lambda limit=0: [{'vacancy_title': 'AppSec', 'company_name': 'X'}]
+    analyzer.seen_rejection_keys = lambda: {'appsec_x'}
     res = analyzer.run_chat_analysis(limit=0, use_mock_if_empty=False, fetch_live=True)
     out = capsys.readouterr().out
     assert res == {'status': 'browser_failed'}

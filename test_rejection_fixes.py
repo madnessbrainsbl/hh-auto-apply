@@ -56,6 +56,7 @@ def test_daily_quota_stops_retrying():
     """Суточный лимит не должен уходить в 60 с пауз на каждый отказ."""
     import time as _t
     from ai_assistant import AIAssistant
+    from unittest.mock import patch
 
     ai = AIAssistant.__new__(AIAssistant)
     ai.enabled = True
@@ -63,6 +64,7 @@ def test_daily_quota_stops_retrying():
     ai._quota_exhausted = False
     ai.model_name = 'gemini-flash-latest'
     ai.temperature = 0.3
+    ai.ai_config = {'cli_providers': [], 'openai_compatible': []}
 
     class DailyQuota:
         # **kwargs: в вызов добавлен request_options с таймаутом — без него
@@ -76,12 +78,14 @@ def test_daily_quota_stops_retrying():
     ai._gemini_client = DailyQuota()
     # соседние модели тоже пусты — проверяем именно отказ от 60-секундных пауз
     ai._retry_on_other_gemini_model = lambda _p: None
-    start = _t.time()
-    assert ai._call_llm('тест') is None
-    assert _t.time() - start < 5, 'суточный лимит уходил в backoff'
-    assert ai._quota_exhausted is True
-    # следующий вызов вообще не идет в сеть
-    assert ai._call_llm('тест') is None
+    # Проверяется квота, а восстановление сети проверяется отдельными тестами.
+    with patch('terminal_ui.network_is_up', return_value=True):
+        start = _t.time()
+        assert ai._call_llm('тест') is None
+        assert _t.time() - start < 5, 'суточный лимит уходил в backoff'
+        assert ai._quota_exhausted is True
+        # следующий вызов вообще не идет в сеть
+        assert ai._call_llm('тест') is None
 
 
 def test_cache_is_cleaned_on_load():
@@ -101,16 +105,16 @@ def test_sender_attribution_not_inverted():
     """Отказ работодателя не должен уезжать в реплики кандидата (и наоборот)."""
     an = RejectionAnalyzer.__new__(RejectionAnalyzer)
     an.config = {'candidate_profile': {'name': 'Иван',
-                                       'contacts': {'telegram': '@my_telegram'}}}
+                                       'contacts': {'telegram': '@candidate_example'}}}
     hist = [
-        {'sender': 'Работодатель', 'text': 'Имею опыт в Python и Django.'},
-        {'sender': 'Соискатель', 'text': 'Для оперативной связи: Telegram @my_telegram'},
+        {'sender': 'Работодатель', 'text': 'Имею опыт в AppSec и пентесте.'},
+        {'sender': 'Соискатель', 'text': 'Для оперативной связи: Telegram @candidate_example'},
         {'sender': 'Соискатель', 'text': 'Иван, здравствуйте!'},
         {'sender': 'Соискатель', 'text': 'К сожалению, мы не готовы пригласить вас на этап.'},
     ]
     by_text = {m['text']: m['sender'] for m in an._attribute_senders(hist)}
-    assert by_text['Имею опыт в Python и Django.'] == 'Соискатель'
-    assert by_text['Для оперативной связи: Telegram @my_telegram'] == 'Соискатель'
+    assert by_text['Имею опыт в AppSec и пентесте.'] == 'Соискатель'
+    assert by_text['Для оперативной связи: Telegram @candidate_example'] == 'Соискатель'
     assert by_text['Иван, здравствуйте!'] == 'Работодатель'
     assert by_text['К сожалению, мы не готовы пригласить вас на этап.'] == 'Работодатель'
 
@@ -145,10 +149,10 @@ def test_cache_merge_does_not_wipe():
 
 def test_dialog_key_survives_read():
     """Карточка после прочтения теряет бейдж и время — ключ меняться не должен."""
-    unread = 'Ромашка\nСпециалист по данным\nОтказ\n2\n12:43'
-    read = 'Ромашка\nСпециалист по данным\nОтказ\n14:07'
+    unread = 'ONESEC\nСпециалист по ИБ\nОтказ\n2\n12:43'
+    read = 'ONESEC\nСпециалист по ИБ\nОтказ\n14:07'
     assert dialog_key(unread) == dialog_key(read)
-    assert dialog_key('Банк\nData Analyst\nОтказ') != dialog_key(unread)
+    assert dialog_key('Сбер\nData Analyst\nОтказ') != dialog_key(unread)
 
 
 def test_rejection_reasons_are_grouped():
@@ -162,7 +166,7 @@ def test_rejection_reasons_are_grouped():
         ('Полное отсутствие сопроводительного письма (пустой отклик) при разнице фокусов',
          'application_quality'),
         ('Несоответствие позиционирования кандидата требованиям вакансии: профиль смещен '
-         'в сторону Web/Backend', 'stack_mismatch'),
+         'в сторону Web/AppSec', 'stack_mismatch'),
         ('Недостаточный стаж или несоответствие требуемому грейду', 'experience_grade'),
         ('Высокая конкуренция среди откликов или ручной отсев рекрутером', 'auto_screening'),
         ('Несоответствие формату работы (требуется присутствие в офисе/регионе)', 'location'),
@@ -176,7 +180,7 @@ def test_rejection_reasons_are_grouped():
     # шаблонные причины бот пишет сам — за ними нет ответа работодателя
     assert not is_evidence_based_reason('Автоматический скрининг или отбор более опытного кандидата')
     assert not is_evidence_based_reason('Отказ работодателя.')
-    assert is_evidence_based_reason('Работодатель ищет специалиста по Kafka и ClickHouse, а не тестировщика')
+    assert is_evidence_based_reason('Работодатель ищет специалиста по КИИ и 187-ФЗ, а не пентестера')
 
 
 def test_fix_plan_uses_real_rejections_only():
@@ -185,13 +189,13 @@ def test_fix_plan_uses_real_rejections_only():
     class StubDB:
         def get_recent_rejections(self, limit=10):
             return [
-                {'title': 'Backend', 'company': 'Альфа',
+                {'title': 'AppSec', 'company': 'Альфа',
                  'rejection_reason': 'Кандидат не прикрепил сопроводительное письмо, отправил только имя',
-                 'missing_keywords': ['Backend', 'backend', 'Kubernetes'],
+                 'missing_keywords': ['AppSec', 'appsec', 'Kubernetes'],
                  'remediation_advice': ['В письме не были явно подсвечены ключевые требования вакансии.',
                                         'В «О себе» указать опыт код-ревью',
                                         'В опыте описать внедрение SAST в GitLab CI']},
-                {'title': 'Data', 'company': 'Бета',
+                {'title': 'SOC', 'company': 'Бета',
                  'rejection_reason': 'Автоматический скрининг или отбор более опытного кандидата',
                  'missing_keywords': ['kubernetes'],
                  'remediation_advice': []},
@@ -205,11 +209,11 @@ def test_fix_plan_uses_real_rejections_only():
             'missing_skills': ['НесуществующийНавык'],
             'about_me_recommendation': 'Выдуманное О себе',
             'experience_advice': 'Выдуманный опыт'}
-    real = {'vacancy_title': 'Data-аналитик', 'company_name': 'Гамма',
+    real = {'vacancy_title': 'SOC-аналитик', 'company_name': 'Гамма',
             'rejection_root_cause': 'Ожидания по зарплате выше вилки позиции',
-            'missing_skills': ['Terraform'],
-            'about_me_recommendation': 'В «О себе» добавить разбор продуктовых метрик',
-            'experience_advice': 'Описать дежурства on-call и SLA реагирования'}
+            'missing_skills': ['EDR'],
+            'about_me_recommendation': 'В «О себе» добавить триаж алертов SOC',
+            'experience_advice': 'Описать дежурства в SOC и SLA реагирования'}
 
     plan = an.build_resume_fix_plan([fake, real])
 
@@ -228,14 +232,14 @@ def test_fix_plan_uses_real_rejections_only():
 
     # разные написания одного навыка складываются, а не дробятся
     skills = dict(plan['skills_to_add'])
-    assert skills.get('Backend') == 2, plan['skills_to_add']
+    assert skills.get('AppSec') == 2, plan['skills_to_add']
     assert skills.get('Kubernetes') == 2, plan['skills_to_add']
 
     about = [t for t, _ in plan['about_me']]
     exp = [t for t, _ in plan['experience']]
     assert any('код-ревью' in t for t in about)
     assert any('SAST' in t for t in exp), exp
-    assert any('дежурства on-call' in t for t in exp), 'experience_advice свежего разбора потерян'
+    assert any('дежурства в SOC' in t for t in exp), 'experience_advice свежего разбора потерян'
     # шаблонная критика письма в план правок резюме не идёт
     assert not any('подсвечены ключевые требования' in t for t in about + exp)
     assert plan['systemic']
@@ -432,23 +436,23 @@ def test_remind_button_needs_real_click_and_proof():
 def test_cover_letter_never_borrowed_from_employer():
     """«Письмо кандидата» берётся только из его собственных реплик.
 
-    В живом прогоне в одном из диалогов исходящих сообщений не было,
+    Если в диалоге нет исходящих сообщений,
     сборщик подставил в cover_letter весь текст страницы — вместе с подписью
-    рекрутера и его телеграмом. ИИ выдал вердикт «кандидат оставил чужое имя Мария
-    при реальном имени Иван». Разбор отказа обязан молчать там, где данных нет.
+    рекрутера и его телеграмом. ИИ выдал вердикт «кандидат оставил чужое имя Алексей
+    при имени кандидата Иван». Разбор отказа обязан молчать там, где данных нет.
     """
     an = RejectionAnalyzer.__new__(RejectionAnalyzer)
 
     # 1. Исходящих нет — письма нет, чужой текст не подставляется
     borrowed = ('Здравствуйте! Рассмотрели ваш отклик, к сожалению отказ. '
-                'Мария @recruiter_hr')
+                'Алексей @hr_example')
     c = an.normalize_chat({
-        'vacancy_title': 'Специалист по данным',
-        'company_name': 'ООО Ромашка',
+        'vacancy_title': 'Специалист по ИБ',
+        'company_name': 'Компания-пример',
         'cover_letter': borrowed,
         'chat_history': [
             {'sender': 'Работодатель', 'text': 'Здравствуйте! К сожалению, отказ.'},
-            {'sender': 'Работодатель', 'text': 'Мария'},
+            {'sender': 'Работодатель', 'text': 'Алексей'},
         ],
     })
     assert c is not None, 'диалог с ответом работодателя не должен отбрасываться'
@@ -456,10 +460,10 @@ def test_cover_letter_never_borrowed_from_employer():
         f"подставлен чужой текст вместо письма: {c['cover_letter']!r}")
 
     # 2. Своё письмо есть — оно и попадает в разбор
-    mine = 'Добрый день! Меня заинтересовала вакансия, опыт в Backend 6 лет.'
+    mine = 'Добрый день! Меня заинтересовала вакансия, опыт в AppSec 6 лет.'
     c2 = an.normalize_chat({
-        'vacancy_title': 'Специалист по данным',
-        'company_name': 'ООО Ромашка',
+        'vacancy_title': 'Специалист по ИБ',
+        'company_name': 'Компания-пример',
         'cover_letter': 'мусор со страницы',
         'chat_history': [
             {'sender': 'Соискатель', 'text': mine},
@@ -473,9 +477,9 @@ def test_cover_letter_never_borrowed_from_employer():
 
     # 3. В письмо затесался ответ компании — значит это не письмо
     c3 = an.normalize_chat({
-        'vacancy_title': 'Специалист по данным',
-        'company_name': 'ООО Ромашка',
-        'cover_letter': 'Вакансия Специалист по данным К сожалению, отказ. Мария @recruiter_hr',
+        'vacancy_title': 'Специалист по ИБ',
+        'company_name': 'Компания-пример',
+        'cover_letter': 'Вакансия Специалист по ИБ К сожалению, отказ. Алексей @hr_example',
         'chat_history': [
             {'sender': 'Работодатель', 'text': 'К сожалению, мы вам отказываем.'},
         ],
@@ -485,10 +489,10 @@ def test_cover_letter_never_borrowed_from_employer():
         f"текст страницы принят за письмо: {c3['cover_letter']!r}")
 
     # 4. Обрывки, которые письмом не являются
-    for junk in ('HR Банк', 'Ольга', 'Отклик на вакансию',
-                 'Для оперативной связи: Telegram @my_telegram'):
+    for junk in ('HR Сбер', 'Вера', 'Отклик на вакансию',
+                 'Для оперативной связи: Telegram @candidate_example'):
         c4 = an.normalize_chat({
-            'vacancy_title': 'Специалист по данным',
+            'vacancy_title': 'Специалист по ИБ',
             'company_name': 'Тест',
             'cover_letter': junk,
             'chat_history': [

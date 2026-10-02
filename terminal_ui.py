@@ -147,6 +147,8 @@ _ERROR_HINTS = (
     ('stale element', 'страница обновилась во время работы'),
     ('timeout', 'страница не успела загрузиться'),
     ('429', 'слишком много запросов — сервис попросил подождать'),
+    ('api key not valid', 'ключ недействителен — введите новый в меню'),
+    ('api_key_invalid', 'ключ недействителен — введите новый в меню'),
     ('rate limit', 'слишком много запросов — сервис попросил подождать'),
     ('quota', 'дневной лимит запросов исчерпан'),
     ('401', 'вход на hh.ru истёк'),
@@ -247,6 +249,93 @@ def hide_technical_from_console(handler) -> None:
         handler.addFilter(_TechnicalNoiseFilter())
     except Exception:
         pass
+
+HH_RESUMES_URL = 'https://hh.ru/applicant/resumes'
+HH_LOGIN_POLL_SECONDS = 2
+
+
+def is_hh_logged_in(driver) -> bool:
+    """Подтверждает вход по меню аккаунта, а не отсутствию кнопки входа."""
+    from urllib.parse import urlparse
+    from selenium.webdriver.common.by import By
+
+    url = urlparse(driver.current_url or '')
+    if not url.hostname or not (url.hostname == 'hh.ru' or url.hostname.endswith('.hh.ru')):
+        return False
+    if url.path.startswith(('/account/login', '/account/signup', '/oauth')):
+        return False
+    for button in driver.find_elements(By.CSS_SELECTOR, '[data-qa="login"]'):
+        if button.is_displayed():
+            return False
+    for link in driver.find_elements(
+        By.CSS_SELECTOR,
+        '[data-qa="mainmenu_profile-link"], a[href*="/applicant/resumes"], '
+        'a[href*="/applicant/negotiations"], a[href*="/account/logout"]',
+    ):
+        if not link.is_displayed():
+            continue
+        path = urlparse(link.get_attribute('href') or '').path
+        if path == '/applicant/resumes' or path.startswith(('/applicant/negotiations', '/account/logout')):
+            return True
+        if link.get_attribute('data-qa') == 'mainmenu_profile-link' and path.startswith('/applicant/'):
+            return True
+    return False
+
+
+def wait_for_hh_login(driver, should_stop=None, log=None) -> bool:
+    """Ждёт вход, не обновляя страницу с телефоном, паролем или кодом."""
+    import time
+    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import (
+        InvalidSessionIdException, NoSuchWindowException, WebDriverException,
+    )
+
+    log = log or logging.getLogger(__name__)
+    log.warning('Войдите в аккаунт hh.ru в открытом браузере. Бот дождётся входа.')
+    while True:
+        if should_stop and should_stop():
+            return False
+        try:
+            if is_hh_logged_in(driver):
+                log.info('[OK] Вход в браузере подтверждён')
+                return True
+            # Новая форма hh сначала предлагает выбрать тип аккаунта.
+            applicants = driver.find_elements(By.CSS_SELECTOR, 'input[data-qa^="account-type-card-APPLICANT"]')
+            if applicants:
+                applicant = applicants[0]
+                label = applicant.find_element(By.XPATH, './ancestor::label')
+                if label.is_displayed():
+                    if not applicant.is_selected():
+                        label.click()
+                    for submit in driver.find_elements(By.CSS_SELECTOR, '[data-qa="submit-button"]'):
+                        if submit.is_displayed() and submit.is_enabled():
+                            submit.click()
+                            break
+        except (InvalidSessionIdException, NoSuchWindowException):
+            log.info('Окно входа закрыто. Ожидание завершено.')
+            return False
+        except WebDriverException as error:
+            log.debug(f'Форма входа пока недоступна, продолжаю ждать: {explain_error(error)}')
+        time.sleep(HH_LOGIN_POLL_SECONDS)
+
+
+def ensure_hh_login(driver, headless=False, should_stop=None, log=None) -> bool:
+    """Проверяет защищённую страницу перед операциями с аккаунтом."""
+    from selenium.common.exceptions import WebDriverException
+
+    log = log or logging.getLogger(__name__)
+    try:
+        driver.get(HH_RESUMES_URL)
+        if is_hh_logged_in(driver):
+            return True
+        if headless:
+            log.warning('Нет входа в hh.ru. Запустите бот с окном браузера и войдите в аккаунт.')
+            return False
+        return wait_for_hh_login(driver, should_stop, log)
+    except WebDriverException as error:
+        log.warning(f'Не удалось проверить вход в hh.ru: {explain_error(error)}')
+        return False
+
 
 def ensure_russian_interface(driver, log=None) -> bool:
     """Переключает интерфейс hh на русский, если он на другом языке.

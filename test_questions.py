@@ -3,9 +3,8 @@
 
 Запуск: python test_questions.py
 
-Живьём такие вакансии встречаются нечасто — в выдаче их около 84 из
-нескольких сотен (см. vacancies_with_tests.json). Ждать, пока прогон на них
-наткнётся, дорого, поэтому ветки проверяются на подставном драйвере.
+Ветки отправки и заполнения анкеты проверяются на подставном драйвере,
+без реальных вакансий и переписки.
 """
 import os
 import sys
@@ -27,11 +26,11 @@ def _bot(config=None):
 
 def test_custom_answer_from_config():
     """Ответ из конфига подбирается по ключевому слову в вопросе."""
-    b = _bot({'question_answers': {
+    b = _bot({'answer_policy': {'yes_to_conditions': False}, 'question_answers': {
         'опыт работы': '6 лет',
         'готовы к переезду': 'Нет',
     }})
-    assert b.get_answer_for_question('Какой у вас опыт работы в IT?') == '6 лет'
+    assert b.get_answer_for_question('Какой у вас опыт работы в ИБ?') == '6 лет'
     assert b.get_answer_for_question('Готовы к переезду в Москву?') == 'Нет'
     # регистр вопроса роли не играет
     assert b.get_answer_for_question('ОПЫТ РАБОТЫ?') == '6 лет'
@@ -77,10 +76,10 @@ def test_ai_exception_does_not_break_apply():
 def test_unanswered_questions_reported_to_user():
     """Пропуск по неотвеченным вопросам объясняется человеческим языком."""
     b = _bot()
-    b.unanswered_questions = ['Сколько лет опыта с Kafka?']
+    b.unanswered_questions = ['Сколько лет опыта с SIEM Positive Technologies?']
     msg = b.describe_unanswered_questions()
     assert QUESTIONS_SKIP_MARKER in msg
-    assert 'Kafka' in msg, f'вопрос не показан пользователю: {msg}'
+    assert 'SIEM' in msg, f'вопрос не показан пользователю: {msg}'
 
     b.unanswered_questions = ['Вопрос 1', 'Вопрос 2', 'Вопрос 3']
     msg3 = b.describe_unanswered_questions()
@@ -156,7 +155,7 @@ def test_questionnaire_blocks_apply_when_unanswered():
     clicked = {'yes': False}
 
     def fake_answer(container=None):
-        b.unanswered_questions = ['Сколько лет вы работали с Kafka?']
+        b.unanswered_questions = ['Сколько лет вы работали с КИИ?']
         return 0
     b.answer_employer_questions = fake_answer
 
@@ -169,7 +168,7 @@ def test_questionnaire_blocks_apply_when_unanswered():
 
     assert ok is False, 'отклик ушёл с неотвеченным вопросом'
     assert not clicked['yes'], 'кнопка нажата, хотя вопрос без ответа'
-    assert err and 'Kafka' in err, f'пользователю не показано, что именно осталось без ответа: {err}'
+    assert err and 'КИИ' in err, f'пользователю не показано, что именно осталось без ответа: {err}'
 
 
 def test_neutral_fallback_when_configured():
@@ -184,9 +183,11 @@ def test_neutral_fallback_when_configured():
               'neutral_answer': 'Готов обсудить этот вопрос на собеседовании'})
     ans = b.get_answer_for_question('Какой ваш любимый цвет?')
     assert ans == 'Готов обсудить этот вопрос на собеседовании'
-    # точный ответ из конфига важнее нейтрального
+    # готовый ответ из конфига важнее нейтрального — но про деньги только без суммы
+    b.config['question_answers'] = {'зарплат': 'Готов обсудить, какая вилка у позиции?'}
+    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'Готов обсудить, какая вилка у позиции?'
     b.config['question_answers'] = {'зарплат': 'от 180 000 руб.'}
-    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'от 180 000 руб.'
+    assert not any(ch.isdigit() for ch in b.get_answer_for_question('Ваши зарплатные ожидания?'))
 
 
 def test_big_questionnaire_costs_one_ai_request():
@@ -243,13 +244,13 @@ def test_multi_checkbox_marks_everything_model_named():
     b.click_element_with_mouse = click
 
     q = 'Отметьте инструменты, с которыми работали'
-    blk = Block(q, ['Django', 'Flask', '1С Бухгалтерия', 'FastAPI', 'Photoshop'])
-    b._batch_answers = {q: 'Django | Flask | FastAPI'}
+    blk = Block(q, ['Burp Suite', 'Nmap', '1С Бухгалтерия', 'Metasploit', 'Photoshop'])
+    b._batch_answers = {q: 'Burp Suite | Nmap | Metasploit'}
 
     answered, unresolved = b.answer_single_question(blk, q, {}, set())
     assert unresolved is None, f'вопрос остался без ответа: {unresolved}'
     assert answered == 3, f'отмечено {answered} галочек вместо 3'
-    assert sorted(clicked) == ['Django', 'FastAPI', 'Flask'], clicked
+    assert sorted(clicked) == ['Burp Suite', 'Metasploit', 'Nmap'], clicked
 
 
 if __name__ == '__main__':

@@ -3,7 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from hh_selenium import HHSeleniumBot
 
 
@@ -13,17 +13,10 @@ def bot(monkeypatch):
     # тесты брали его из настроек автора и на новой машине падали.
     import config_manager
     monkeypatch.setattr(config_manager, 'get_active_resume',
-                        lambda: ('test-id', 'Backend Engineer / Backend-инженер'))
+                        lambda: ('test-id', 'Application Security Engineer / AppSec-инженер'))
     bot = HHSeleniumBot(headless=True)
     bot.driver = MagicMock()
     return bot
-
-
-@pytest.fixture
-def disallowed():
-    """Резюме другой профессии на том же аккаунте, с которого откликаться нельзя."""
-    with patch("config_manager.load_config", return_value={"disallowed_resume_keywords": ["дизайнер"]}):
-        yield
 
 
 def test_detect_response_state_success_in_page_text(bot):
@@ -68,7 +61,7 @@ def test_ensure_target_resume_already_selected(bot):
     modal = MagicMock()
     title_elem = MagicMock()
     title_elem.is_displayed.return_value = True
-    title_elem.text = "Backend Engineer / Backend-инженер"
+    title_elem.text = "Application Security Engineer / AppSec-инженер"
     modal.find_elements.return_value = [title_elem]
 
     ok, err = bot.ensure_target_resume_selected(modal)
@@ -76,18 +69,18 @@ def test_ensure_target_resume_already_selected(bot):
     assert err is None
 
 
-def test_ensure_target_resume_switches_from_disallowed(bot, disallowed):
+def test_ensure_target_resume_switches_from_photographer(bot):
     modal = MagicMock()
     # Элемент текущего резюме в модалке
     bad_title = MagicMock()
     bad_title.is_displayed.return_value = True
-    bad_title.text = "Дизайнер интерьеров"
+    bad_title.text = "Фотограф видеограф 1 000 $"
     modal.find_elements.return_value = [bad_title]
 
     # Элементы в выпадающем списке выбора резюме
     target_option = MagicMock()
     target_option.is_displayed.return_value = True
-    target_option.text = "Backend Engineer / Backend-инженер"
+    target_option.text = "Application Security Engineer / AppSec-инженер"
 
     bot.click_element_with_mouse = MagicMock(return_value=True)
     bot.driver.find_elements.return_value = [target_option]
@@ -99,11 +92,11 @@ def test_ensure_target_resume_switches_from_disallowed(bot, disallowed):
     assert bot.click_element_with_mouse.call_count == 2
 
 
-def test_ensure_target_resume_blocks_disallowed_if_not_switched(bot, disallowed):
+def test_ensure_target_resume_blocks_photographer_if_not_switched(bot):
     modal = MagicMock()
     bad_title = MagicMock()
     bad_title.is_displayed.return_value = True
-    bad_title.text = "Дизайнер интерьеров"
+    bad_title.text = "Фотограф видеограф"
     modal.find_elements.return_value = [bad_title]
 
     bot.click_element_with_mouse = MagicMock(return_value=True)
@@ -111,7 +104,7 @@ def test_ensure_target_resume_blocks_disallowed_if_not_switched(bot, disallowed)
 
     ok, err = bot.ensure_target_resume_selected(modal)
     assert ok is False
-    assert "активно нецелевое резюме" in err.lower()
+    assert "активно резюме" in err.lower() or "фотограф" in err.lower()
 
 
 def test_apply_to_vacancy_letter_sent_initialized(bot):
@@ -119,8 +112,8 @@ def test_apply_to_vacancy_letter_sent_initialized(bot):
     bot.driver.get = MagicMock()
     bot.detect_response_state = MagicMock(return_value='ready')
     bot.get_vacancy_page_company = MagicMock(return_value="Test Corp")
-    bot.get_vacancy_page_description = MagicMock(return_value="DevOps engineer needed")
-    bot.get_vacancy_page_skills = MagicMock(return_value=["Python", "Backend"])
+    bot.get_vacancy_page_description = MagicMock(return_value="DevSecOps engineer needed")
+    bot.get_vacancy_page_skills = MagicMock(return_value=["Python", "AppSec"])
     bot.is_response_limit_reached = MagicMock(return_value=False)
     bot.handle_warning_popups = MagicMock(return_value=False)
     bot.click_element_with_mouse = MagicMock(return_value=True)
@@ -134,7 +127,7 @@ def test_apply_to_vacancy_letter_sent_initialized(bot):
     bot.submit_open_response_modal = MagicMock(return_value=(True, True, 0, None))
     bot.confirm_response_submission = MagicMock(return_value=(True, "С письмо"))
 
-    success, message = bot.apply_to_vacancy("https://hh.ru/vacancy/123456", "Backend Engineer")
+    success, message = bot.apply_to_vacancy("https://hh.ru/vacancy/123456", "AppSec Engineer")
     assert success is True
     assert message == "С письмо"
     bot.submit_open_response_modal.assert_called_once()
@@ -227,17 +220,45 @@ def test_hidden_resume_recognized_before_typing_letter(monkeypatch):
 
 
 
-def test_title_filter_whole_word_short_tokens():
-    """Короткие слова-исключения ловятся только целым словом: «hr» не внутри «Chrome»."""
+def test_title_filter_knows_ib_and_whole_word_short_tokens():
+    """Фильтр знает «ИБ» и смежные названия; короткие слова — только целым словом.
+
+    23.09 «вакансии для резюме» теряли «Инженер по ИБ», «Методолог ИБ»,
+    «технических средств защиты». «иб» при этом не должно ловить «гибрид».
+    """
     import hh_selenium as m
     bot = m.HHSeleniumBot.__new__(m.HHSeleniumBot)
-    bot.config = {'keywords_include': ['python', 'django'], 'keywords_exclude': ['hr', 'менеджер']}
-    ok = lambda t: bot.validate_title(t)[0]
-    assert ok('Python-разработчик (Chrome Extensions)')
-    assert ok('Django Developer (гибрид)')
-    assert not ok('HR Python')
-    assert not ok('Менеджер проектов Python')
+    bot.config = {'keywords_include': list(m.STRICT_TITLE_INCLUDE_KEYWORDS),
+                  'keywords_exclude': ['менеджер'],
+                  'allow_technical_fallback': False}
+    ok = lambda t: bot.validate_security_title(t)[0]
+    assert ok('Ведущий инженер по ИБ (DLP/KSC/KEDR/KSMG)')
+    assert ok('Методолог ИБ (SGRC и внутренний контроль)')
+    assert ok('Главный специалист отдела технических средств защиты')
+    assert ok('Специалист по безопасной разработке')
+    assert ok('Kubernetes Security Engineer')
+    assert ok('SOC-аналитик L1')
     assert not ok('Бухгалтер (гибрид)')
+    assert not ok('Associate product designer')
+
+
+def test_title_filter_by_meaning():
+    """ИБ по смыслу названия: «безопасн»/«защит»+ИТ-контекст, но не охрана труда и релейная защита."""
+    import hh_selenium as m
+    bot = m.HHSeleniumBot.__new__(m.HHSeleniumBot)
+    bot.config = {'keywords_include': list(m.STRICT_TITLE_INCLUDE_KEYWORDS),
+                  'keywords_exclude': [], 'allow_technical_fallback': False}
+    ok = lambda t: bot.validate_security_title(t)[0]
+    for title in ('Инженер защиты от сетевых атак', 'Специалист по сетевой безопасности',
+                  'Главный специалист по иформационной безопасности',
+                  'Специалист технической защиты персональных данных',
+                  'Ведущий инженер (информационная безопасность)'):
+        assert ok(title), title
+    for title in ('Инженер релейной защиты и автоматики',
+                  'Специалист по охране труда и промышленной безопасности',
+                  'Инженер по пожарной безопасности', 'Агроном по защите растений',
+                  'Специалист службы экономической безопасности'):
+        assert not ok(title), title
 
 
 def test_all_answered_questionnaire_is_submitted_despite_hint():
@@ -269,3 +290,63 @@ def test_all_answered_questionnaire_is_submitted_despite_hint():
     submitted, _, answered, blocker = bot.submit_open_response_modal('Письмо', False)
     assert submitted is True and blocker is None and answered == 2
     bot.click_response_submit_button.assert_called_once()
+
+
+def _chat_driver(chat_text):
+    """Подставной браузер: страница вакансии с кнопкой «Чат», чат в iframe с полем ввода."""
+    state = {'value': '', 'sent': [], 'chat': chat_text}
+    field = MagicMock()
+    field.is_displayed.return_value = True
+    field.get_attribute.side_effect = lambda name: state['value'] if name == 'value' else None
+
+    def type_text(*keys):
+        from selenium.webdriver.common.keys import Keys
+        if keys == (Keys.ENTER,):
+            state['sent'].append(state['value'])
+            state['chat'] += ' ' + state['value']
+            state['value'] = ''
+        else:
+            state['value'] += ''.join(k for k in keys if isinstance(k, str) and len(k) > 1 or k.isprintable())
+    field.send_keys.side_effect = type_text
+    field.clear.side_effect = lambda: state.update(value='')
+
+    visible = MagicMock()
+    visible.is_displayed.return_value = True
+    driver = MagicMock()
+    driver.current_url = 'https://hh.ru/vacancy/1'
+
+    def find_elements(by, selector):
+        if 'text-input' in selector:
+            return [field]
+        return [visible]
+    driver.find_elements.side_effect = find_elements
+    body = MagicMock()
+    type(body).text = property(lambda self: state['chat'])
+    driver.find_element.return_value = body
+    return driver, state
+
+
+def test_letter_goes_to_chat_when_no_attach_button(bot, monkeypatch):
+    """29.09 Кион и МТС Банк: кнопки «Приложить сопроводительное» нет — письмо уходит в чат одним сообщением."""
+    import hh_selenium
+    driver, state = _chat_driver('Отклик на вакансию Без сопроводительного письма')
+    bot.driver = driver
+    bot.click_element_with_mouse = MagicMock(return_value=True)
+    monkeypatch.setattr(hh_selenium.time, 'sleep', lambda s: None)
+    monkeypatch.setattr('selenium.webdriver.common.action_chains.ActionChains.perform', lambda self: None)
+    letter = 'Здравствуйте! Откликаюсь на позицию DevOps.\n\nОпыт с Kubernetes и GitLab CI.'
+    assert bot.send_letter_to_chat(letter, 'https://hh.ru/vacancy/1') is True
+    assert len(state['sent']) == 1                     # одно сообщение, а не по строкам
+    assert 'Kubernetes' in state['sent'][0]
+    driver.switch_to.default_content.assert_called()   # из iframe вышли
+
+
+def test_letter_not_repeated_if_already_in_chat(bot, monkeypatch):
+    import hh_selenium
+    letter = 'Здравствуйте! Откликаюсь на позицию DevOps.'
+    driver, state = _chat_driver('Отклик на вакансию ' + letter)
+    bot.driver = driver
+    bot.click_element_with_mouse = MagicMock(return_value=True)
+    monkeypatch.setattr(hh_selenium.time, 'sleep', lambda s: None)
+    assert bot.send_letter_to_chat(letter, 'https://hh.ru/vacancy/1') is True
+    assert state['sent'] == []
