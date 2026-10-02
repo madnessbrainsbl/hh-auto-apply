@@ -22,11 +22,11 @@ def test_get_current_resume_status_with_skills_card():
 
     # Заголовок позиции
     title_elem = MagicMock()
-    title_elem.text = "Backend Engineer"
+    title_elem.text = "Application Security Engineer"
 
     # Карточка навыков с уровнями
     card_elem = MagicMock()
-    card_elem.text = "Продвинутый уровень\nGo\nDjango\nСредний уровень\nPython\nDocker\nРедактировать"
+    card_elem.text = "Продвинутый уровень\nRed Team\nBurp Suite\nСредний уровень\nPython\nDocker\nРедактировать"
 
     def mock_find_element(by, selector):
         if "title-position" in selector:
@@ -40,9 +40,9 @@ def test_get_current_resume_status_with_skills_card():
 
     status = updater.get_current_resume_status()
     assert status["success"] is True
-    assert status["position"] == "Backend Engineer"
-    assert "Go" in status["skills"]
-    assert "Django" in status["skills"]
+    assert status["position"] == "Application Security Engineer"
+    assert "Red Team" in status["skills"]
+    assert "Burp Suite" in status["skills"]
     assert "Python" in status["skills"]
     assert "Docker" in status["skills"]
     assert "Продвинутый уровень" not in status["skills"]
@@ -101,7 +101,7 @@ def test_activate_skills_logic():
         return item
 
     # Первому навыку hh подтверждает уровень, второму — нет.
-    items = [make_skill("Django", True), make_skill("API", False)]
+    items = [make_skill("Burp Suite", True), make_skill("API", False)]
     updater.driver.find_elements = MagicMock(return_value=items)
     updater.driver.find_element = MagicMock(return_value=MagicMock())
 
@@ -120,7 +120,7 @@ def test_add_skills_to_resume():
     # Что уже выбрано в редакторе навыков. Код читает это через execute_script
     # по чипам, а не по тексту страницы.
     chips = {"python", "docker"}
-    recommended = ["Kafka", "Redis"]
+    recommended = ["КриптоПро", "SAST"]
 
     def mock_execute_script(script, *args):
         if "chips-trigger-chip-" in script:
@@ -137,17 +137,17 @@ def test_add_skills_to_resume():
             # Успех подтверждается ТЕГАМИ навыков со страницы резюме, а не
             # подстрокой по всему тексту: подстрока засчитывала «Go» словом
             # «договор», а «AD» — словом «Град».
-            return ["Python", "Docker", "Kafka", "Redis"]
+            return ["Python", "Docker", "КриптоПро", "SAST"]
         return None
 
     updater.driver.execute_script = mock_execute_script
     updater.driver.find_element = MagicMock(return_value=MagicMock())
 
-    # Добавляем новые навыки (Python уже есть, добавится только Kafka и Redis)
-    success, msg, added = updater.add_skills_to_resume(["Kafka", "Python", "Redis"])
+    # Добавляем новые навыки (Python уже есть, добавится только КриптоПро и SAST)
+    success, msg, added = updater.add_skills_to_resume(["КриптоПро", "Python", "SAST"])
     assert success is True
-    assert "Kafka" in added
-    assert "Redis" in added
+    assert "КриптоПро" in added
+    assert "SAST" in added
     assert "Python" not in added
 
 
@@ -178,12 +178,14 @@ def test_update_about_section():
     # редактора, а не фактом клика: JS-клик по «Сохранить» hh молча
     # игнорировал, и лог писал «успешно сохранено» на несохранённой правке.
     # Мок возвращает текст с добавленным блоком — правка реально сохранилась.
-    addition = "Дополнительно: PostgreSQL, Kafka, нагрузочное тестирование."
-    saved_about = "Базовый опыт разработки и тестирования.\n\n" + addition
+    saved_about = (
+        "Базовый опыт разработки и тестирования."
+        "\n\nДополнительные компетенции и стандарты (ATS / Enterprise):\n"
+        "СКЗИ, КриптоПро, ГОСТ, Active Directory, MaxPatrol SIEM."
+    )
     updater.driver.execute_script = MagicMock(return_value=saved_about)
 
-    with patch('config_manager.load_config', return_value={'about_addition': addition}):
-        ok, msg = updater.update_about_section()
+    ok, msg = updater.update_about_section(["КриптоПро", "СКЗИ"])
     assert ok is True
     # Слова «успешно» в ответе нет и быть не должно: код сообщает ровно то,
     # что проверил — блок дополнен и сохранение подтверждено чтением.
@@ -191,23 +193,12 @@ def test_update_about_section():
     textarea.send_keys.assert_called_once()
 
 
-def test_update_about_section_skips_without_addition():
-    """Текст для «О себе» не задан — раздел не трогаем и браузер не открываем."""
-    updater = HHResumeUpdater(headless=True)
-    updater.driver = MagicMock()
-    with patch('config_manager.load_config', return_value={}):
-        ok, msg = updater.update_about_section()
-    assert ok is True
-    assert "не задан" in msg
-    updater.driver.get.assert_not_called()
-
-
 def test_apply_full_modernization():
     updater = HHResumeUpdater(headless=True)
     updater.sync_adaptive_skills = MagicMock(return_value=(True, "Обновлено 5 навыков", 30))
     updater.update_about_section = MagicMock(return_value=(True, "Раздел дополнен"))
 
-    res = updater.apply_full_modernization(["Kubernetes", "Kafka"])
+    res = updater.apply_full_modernization(["Kubernetes", "КриптоПро"])
     assert res["skills_updated"] is True
     assert res["about_updated"] is True
     assert res["skills_count"] == 30
@@ -226,3 +217,21 @@ def test_next_bump_schedule():
     # Время уже прошло сегодня — значит, завтра.
     assert at(next_bump_at(False, 'сегодня в 12:46', now)) == '24 12:46'
     assert at(next_bump_at(False, 'Кнопка не найдена', now)) == '23 18:40'
+
+
+def test_bump_reads_tomorrow_cooldown(tmp_path, monkeypatch):
+    """28.09 после 20:00 hh пишет «Можно завтра в 02:31» — это кулдаун, а не «кнопка не найдена»."""
+    import resume_updater as ru
+    from datetime import datetime
+    monkeypatch.setattr(ru, 'SCRIPT_DIR', str(tmp_path))
+    updater = HHResumeUpdater(resume_id='abc', headless=True)
+    updater.driver = MagicMock()
+    updater.driver.find_elements.return_value = []
+    updater.driver.execute_script.return_value = 'Поднятие резюме\nМожно завтра в 02:31\nПоднимать автоматически'
+    updater._init_driver = lambda: True
+    ok, msg = updater.bump_resume()
+    assert ok is False
+    assert 'завтра в 02:31' in msg and 'не найдена' not in msg
+    import json
+    nxt = json.load(open(tmp_path / ru.BUMP_SCHEDULE_FILE, encoding='utf-8'))['next_at']
+    assert datetime.fromtimestamp(nxt).strftime('%H:%M') == '02:31'

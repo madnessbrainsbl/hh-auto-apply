@@ -6,6 +6,7 @@ hh_app_token.json
 hh_token_debug.json
 hh_selenium_config.json
 .env
+.env.*
 
 # Сессия и профиль браузера (содержит cookies и авторизацию)
 chrome_profile/
@@ -17,6 +18,9 @@ docker-data/
 *.db
 *.sqlite
 *.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
 hh_data.db
 vacancies_cache.json
 applied_vacancies.json
@@ -39,7 +43,9 @@ stop.flag
 rejection_analysis_report.md
 rejection_analysis_report.html
 
-# Временные каталоги
+# Временные и персональные каталоги
+autosend-letters-hh-main/
+vzlom/
 scratch/
 
 # Python и окружение
@@ -83,6 +89,7 @@ resume_text.txt
 about_backup_*.txt
 chat_rejection_analysis_report.md
 chat_rejection_analysis_report.html
+habr_article.md
 *.bak*
 resume_dump.json
 vacancies_with_tests.json

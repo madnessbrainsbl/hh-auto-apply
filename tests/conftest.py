@@ -3,7 +3,7 @@
 Тесты гоняют настоящие классы бота, а те по умолчанию открывают файлы в корне
 проекта: hh_data.db, hh_selenium_config.json, applied_vacancies*.json,
 vacancies_cache.json. Это не теория: run_analysis в тестах анализатора уже
-залил в боевую базу выдуманную запись «Fintech Platform / Backend», а
+залил в боевую базу выдуманную запись «Fintech Platform / AppSec», а
 HHSeleniumBot.__init__ на каждом прогоне перезаписывал hh_selenium_config.json
 (load_config всегда вызывает save_config).
 

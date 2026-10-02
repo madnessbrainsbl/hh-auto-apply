@@ -296,33 +296,27 @@ def test_bot_accepts_debugger_address(tmp_path, monkeypatch):
     assert bot.debugger_address == "127.0.0.1:9122"
 
 
-def test_selenium_topup_mode_skips_direction_keywords():
-    """В ярусе добора заголовок уже совпал с запросом: ключевые слова направления не нужны."""
+def test_selenium_filter_accepts_python_fallback_with_strict_include_config():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {
-        "keywords_include": ["django", "fastapi"],
+        "allow_technical_fallback": True,
+        "keywords_include": ["appsec", "pentest"],
         "keywords_exclude": [],
     }
 
-    suitable, _ = bot.validate_title("Senior Python Developer")
-    assert suitable is False
+    suitable, reason = bot.validate_security_title("Senior Python Developer")
 
-    bot.config["topup_mode"] = True
-    suitable, reason = bot.validate_title("Senior Python Developer")
     assert suitable is True
-    assert reason == "OK (добор)"
-
-    # Исключения действуют и в доборе
-    suitable, _ = bot.validate_title("Sales Manager Python")
-    assert suitable is False
+    assert reason == "OK"
 
 
 def test_selenium_history_retries_old_skipped_filter_when_title_now_allowed():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {
-        "keywords_include": ["python"],
+        "allow_technical_fallback": True,
+        "keywords_include": ["appsec", "pentest"],
         "keywords_exclude": [],
     }
     bot.applied_vacancies = {
@@ -332,14 +326,14 @@ def test_selenium_history_retries_old_skipped_filter_when_title_now_allowed():
             "status": "skipped_filter",
         },
         "456": {
-            "name": "Python-разработчик",
+            "name": "Пентестер",
             "date": "2026-06-16 13:01:00",
             "status": "sent",
         },
     }
 
     assert bot.should_skip_known_vacancy("123", "Senior Python Developer") is False
-    assert bot.should_skip_known_vacancy("456", "Python-разработчик") is True
+    assert bot.should_skip_known_vacancy("456", "Пентестер") is True
 
 
 def test_close_driver_does_not_wait_when_pause_disabled(monkeypatch):
@@ -396,63 +390,64 @@ def test_close_driver_waits_when_pause_enabled(monkeypatch):
 def test_api_filter_rejects_project_manager_title():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
-    bot.config = {"keywords_include": ["python", "разработчик"], "keywords_exclude": []}
+    bot.config = {"keywords_include": [], "keywords_exclude": []}
 
     suitable, _ = bot.is_api_vacancy_suitable({"name": "Менеджер проекта"})
 
-    # Нет ключевых слов направления — отсекается.
+    # Не ИБ — отсекается. «Менеджер по ИБ» с 25.09 проходит, поэтому причина
+    # теперь не слово «менеджер», а отсутствие ИБ в названии.
     assert suitable is False
 
 
-def test_api_filter_rejects_sales_title_even_with_it_context():
+def test_api_filter_rejects_sales_title_even_with_security_context():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": []}
 
     suitable, reason = bot.is_api_vacancy_suitable({
-        "name": "Директор по продажам (IT)",
+        "name": "Директор по продажам (Информационная безопасность)",
     })
 
     assert suitable is False
     assert "директор" in reason.lower() or "продаж" in reason.lower()
 
 
-def test_api_filter_accepts_programmer_title():
+def test_api_filter_accepts_pentest_title():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": []}
 
     suitable, reason = bot.is_api_vacancy_suitable({
-        "name": "Инженер-программист / Backend",
+        "name": "Специалист по анализу защищенности / Пентестер",
     })
 
     assert suitable is True
     assert reason == "OK"
 
 
-def test_api_filter_accepts_backend_title():
+def test_api_filter_accepts_appsec_title():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": []}
 
-    suitable, reason = bot.is_api_vacancy_suitable({"name": "Backend-инженер"})
+    suitable, reason = bot.is_api_vacancy_suitable({"name": "AppSec-инженер"})
 
     assert suitable is True
     assert reason == "OK"
 
 
-def test_api_filter_accepts_any_grade_title():
-    """Уровень должности не отсекается: подаёмся массово.
+def test_api_filter_accepts_any_grade_security_title():
+    """Уровень должности не отсекается — решение 24.09: подаёмся массово.
 
-    Раньше «Junior-разработчик» и «Начальник отдела» отсекались. Отказ по
-    уровню — тоже данные для разбора.
+    Раньше «Junior-пентестер», «Начинающий специалист по ИБ» и «Начальник
+    отдела ИБ» отсекались. Отказ по уровню — тоже данные для разбора.
     """
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": []}
-    for title in ("Junior-разработчик",
-                  "Начинающий специалист в области аналитики данных",
-                  "Начальник отдела разработки"):
+    for title in ("Junior-пентестер",
+                  "Начинающий специалист в области информационной безопасности",
+                  "Начальник отдела информационной безопасности"):
         suitable, reason = bot.is_api_vacancy_suitable({"name": title})
         assert suitable is True, (title, reason)
 
@@ -462,7 +457,7 @@ def test_api_filter_user_exclusion_still_works():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": ["junior"]}
-    suitable, reason = bot.is_api_vacancy_suitable({"name": "Junior-разработчик"})
+    suitable, reason = bot.is_api_vacancy_suitable({"name": "Junior-пентестер"})
     assert suitable is False
     assert "junior" in reason.lower()
 
@@ -473,7 +468,7 @@ def test_api_filter_rejects_student_work_author_title():
     bot.config = {"keywords_include": [], "keywords_exclude": []}
 
     suitable, reason = bot.is_api_vacancy_suitable({
-        "name": "Автор студенческих работ по направлению «Программирование»",
+        "name": "Автор студенческих работ по направлению «Кибербезопасность»",
     })
 
     assert suitable is False
@@ -481,13 +476,13 @@ def test_api_filter_rejects_student_work_author_title():
 
 
 def test_api_filter_accepts_certification_title():
-    """Сертификация — тоже работа по специальности, подаёмся массово."""
+    """25.09: сертификация СЗИ — работа в ИБ, подаёмся массово."""
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.config = {"keywords_include": [], "keywords_exclude": []}
 
     suitable, _ = bot.is_api_vacancy_suitable({
-        "name": "Специалист по сертификации (IT)",
+        "name": "Специалист по сертификации (Кибербезопасность)",
     })
 
     assert suitable is True
@@ -504,8 +499,8 @@ def test_save_applied_syncs_shared_history_and_removes_from_cache(tmp_path):
     cache_data = {
         "total_count": 2,
         "vacancies": [
-            {"id": "123", "name": "Python-разработчик"},
-            {"id": "456", "name": "Backend-инженер"},
+            {"id": "123", "name": "Пентестер"},
+            {"id": "456", "name": "AppSec-инженер"},
         ],
     }
     Path(bot.api_cache_file).write_text(
@@ -513,7 +508,7 @@ def test_save_applied_syncs_shared_history_and_removes_from_cache(tmp_path):
         encoding="utf-8",
     )
 
-    bot.save_applied("123", "Python-разработчик", "sent")
+    bot.save_applied("123", "Пентестер", "sent")
 
     selenium_history = json.loads(Path(bot.applied_file).read_text(encoding="utf-8"))
     shared_history = json.loads(Path(bot.shared_applied_file).read_text(encoding="utf-8"))
@@ -539,7 +534,7 @@ def test_save_applied_does_not_sync_already_applied_as_daily_sent(tmp_path):
         encoding="utf-8",
     )
 
-    bot.save_applied("123", "Python-разработчик", "already_applied")
+    bot.save_applied("123", "Пентестер", "already_applied")
 
     shared_history = json.loads(Path(bot.shared_applied_file).read_text(encoding="utf-8"))
     updated_cache = json.loads(Path(bot.api_cache_file).read_text(encoding="utf-8"))
@@ -572,10 +567,8 @@ def test_count_recent_timestamps_uses_rolling_24h_window():
     assert module.count_recent_timestamps([recent, old, None, "bad date"], 24) == 1
 
 
-def test_auto_loader_uses_selenium_history_as_processed_ids(tmp_path, monkeypatch):
+def test_auto_loader_uses_selenium_history_as_processed_ids(tmp_path):
     module = load_auto_module()
-    monkeypatch.setattr(module, "get_active_preset",
-                        lambda: {"id": "python", "keywords_include": ["python"], "keywords_exclude": []})
     bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
     bot.applied_vacancies_file = str(tmp_path / "applied_vacancies.json")
     bot.selenium_applied_vacancies_file = str(tmp_path / "applied_vacancies_selenium.json")
@@ -594,7 +587,7 @@ def test_auto_loader_uses_selenium_history_as_processed_ids(tmp_path, monkeypatc
                     "status": "skipped_filter",
                 },
                 "333": {
-                    "name": "Python-разработчик",
+                    "name": "Пентестер",
                     "date": "2026-06-16 11:30:00",
                     "status": "already_applied",
                 },
@@ -632,7 +625,7 @@ def test_auto_cache_excludes_selenium_processed_ids(tmp_path):
     bot.processed_vacancy_ids = {"222"}
 
     bot.save_vacancies_cache([
-        {"id": "111", "name": "Python-разработчик"},
+        {"id": "111", "name": "Пентестер"},
         {"id": "222", "name": "Уже пройденная фильтром"},
     ])
 
@@ -673,7 +666,7 @@ def test_get_vacancies_keeps_partial_results_after_network_error(tmp_path):
                 "items": [
                     {
                         "id": "123",
-                        "name": "Python-разработчик",
+                        "name": "Пентестер",
                         "has_test": False,
                         "employer": {"name": "HH"},
                     },
@@ -713,13 +706,13 @@ def test_process_api_vacancies_stops_on_hh_response_limit():
     processed = bot.process_api_vacancies([
         {
             "id": "123",
-            "name": "Python-разработчик",
+            "name": "Пентестер",
             "alternate_url": "https://hh.ru/vacancy/123",
             "employer": {"name": "HH"},
         },
         {
             "id": "456",
-            "name": "Data analyst",
+            "name": "SOC analyst",
             "alternate_url": "https://hh.ru/vacancy/456",
             "employer": {"name": "HH"},
         },

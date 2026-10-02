@@ -1,7 +1,7 @@
 """Автоправка резюме после разбора отказов: без вопроса, но только правдой из профиля.
 
 Разбор отказов называет навыки, которых НЕ хватило под вакансию, а ИИ ещё и
-сочинял для «О себе» опыт, которого у кандидата нет (Terraform, Basel III).
+сочинял для «О себе» опыт, которого у кандидата нет (ISO 27005, Basel III).
 Эти тесты держат границу: без вопроса пользователю в резюме уходят только
 навыки, подтверждённые candidate_profile, а «О себе» и уровни не трогаются.
 Браузер нигде не запускается — всё на заглушках.
@@ -16,26 +16,26 @@ from rejection_analyzer import RejectionAnalyzer, auto_apply_resume_enabled
 from resume_updater import HHResumeUpdater, profile_grounded_skills
 
 PROFILE = {
-    "specialization": "Backend-разработчик",
-    "skills": ["CI / CD", "Django", "Kubernetes", "Linux"],
-    "about": "Пишу бэкенд и API.",
-    "certificates": ["Google Cloud Certificate (Google, 2026)"],
+    "specialization": "AppSec-инженер",
+    "skills": ["SAST / DAST", "Burp Suite", "Application Security", "Linux"],
+    "about": "Тестирую веб-приложения и API.",
+    "certificates": ["Google Cybersecurity Certificate (Google, 2026)"],
     "experience_highlights": [
-        {"company": "X", "position": "Backend-разработчик",
-         "what": "Проектировал REST и GraphQL API, писал документацию."},
+        {"company": "X", "position": "Pentester",
+         "what": "Проверял REST и GraphQL API, писал отчёты с PoC."},
     ],
 }
 
 
 def test_grounding_splits_profile_skills_from_advice():
     grounded, advice = profile_grounded_skills(
-        ["CI/CD", "GraphQL", "django", "Go", "Terraform", "Kafka", "Arch Linux", "K8s"],
+        ["SAST", "GraphQL", "burp suite", "Go", "ISO 27005", "PCI-DSS", "Kali Linux", "AppSec"],
         PROFILE)
-    # CI/CD — то же, что «CI / CD», GraphQL — из текста опыта, регистр не важен,
-    # K8s — синоним Kubernetes.
-    assert grounded == ["CI/CD", "GraphQL", "django", "K8s"]
-    # «Go» не засчитывается за счёт «Google», «Arch Linux» — за счёт «Linux».
-    assert advice == ["Go", "Terraform", "Kafka", "Arch Linux"]
+    # SAST — часть «SAST / DAST», GraphQL — из текста опыта, регистр не важен,
+    # AppSec — синоним Application Security.
+    assert grounded == ["SAST", "GraphQL", "burp suite", "AppSec"]
+    # «Go» не засчитывается за счёт «Google», «Kali Linux» — за счёт «Linux».
+    assert advice == ["Go", "ISO 27005", "PCI-DSS", "Kali Linux"]
 
 
 def test_grounding_with_empty_profile_adds_nothing():
@@ -45,7 +45,7 @@ def test_grounding_with_empty_profile_adds_nothing():
 
 def _updater():
     u = HHResumeUpdater(headless=True)
-    u.add_skills_to_resume = MagicMock(return_value=(True, "Добавлено навыков: 2", ["CI/CD", "GraphQL"]))
+    u.add_skills_to_resume = MagicMock(return_value=(True, "Добавлено навыков: 2", ["SAST", "GraphQL"]))
     u.update_about_section = MagicMock()
     u.sync_adaptive_skills = MagicMock()
     u.activate_and_save_all_skills = MagicMock()
@@ -54,27 +54,27 @@ def _updater():
 
 def test_profile_only_writes_only_grounded_skills():
     u = _updater()
-    res = u.apply_full_modernization(["CI/CD", "GraphQL", "Terraform"], profile_only=True, profile=PROFILE)
+    res = u.apply_full_modernization(["SAST", "GraphQL", "ISO 27005"], profile_only=True, profile=PROFILE)
 
-    u.add_skills_to_resume.assert_called_once_with(["CI/CD", "GraphQL"])
+    u.add_skills_to_resume.assert_called_once_with(["SAST", "GraphQL"])
     # «О себе», уровни и база адаптивных навыков в этом режиме не трогаются.
     u.update_about_section.assert_not_called()
     u.activate_and_save_all_skills.assert_not_called()
     u.sync_adaptive_skills.assert_not_called()
-    assert res["skills_added"] == ["CI/CD", "GraphQL"]
+    assert res["skills_added"] == ["SAST", "GraphQL"]
     assert res["skills_added_count"] == 2
-    assert res["recommended_only"] == ["Terraform"]
+    assert res["recommended_only"] == ["ISO 27005"]
     assert res["about_changed"] is False
 
 
 def test_profile_only_without_grounded_skills_does_not_open_editor():
     u = _updater()
-    res = u.apply_full_modernization(["Terraform", "Basel III"], profile_only=True, profile=PROFILE)
+    res = u.apply_full_modernization(["ISO 27005", "Basel III"], profile_only=True, profile=PROFILE)
     # Пустой список не должен проваливаться в базу адаптивных навыков.
     u.add_skills_to_resume.assert_not_called()
     u.sync_adaptive_skills.assert_not_called()
     assert res["skills_added_count"] == 0
-    assert res["recommended_only"] == ["Terraform", "Basel III"]
+    assert res["recommended_only"] == ["ISO 27005", "Basel III"]
 
 
 def test_auto_apply_resume_setting():
@@ -102,19 +102,19 @@ def test_auto_modernize_asks_nothing_and_passes_only_grounded(analyzer, capsys):
     with patch("resume_updater.HHResumeUpdater", return_value=fake), \
          patch("config_manager.get_active_resume", return_value=("rid", "t")), \
          patch("builtins.input", side_effect=AssertionError("вопрос задавать нельзя")):
-        analyzer._modernize_resume(["GraphQL", "Terraform"], auto=True)
+        analyzer._modernize_resume(["GraphQL", "ISO 27005"], auto=True)
 
     fake.apply_full_modernization.assert_called_once_with(["GraphQL"], profile_only=True, profile=PROFILE)
     out = capsys.readouterr().out
     assert "внесено в резюме — GraphQL" in out
-    assert "только рекомендация — Terraform" in out
+    assert "только рекомендация — ISO 27005" in out
 
 
 def test_auto_modernize_skips_browser_when_nothing_grounded(analyzer):
     with patch("resume_updater.HHResumeUpdater") as cls:
-        res = analyzer._modernize_resume(["Terraform"], auto=True)
+        res = analyzer._modernize_resume(["ISO 27005"], auto=True)
     cls.assert_not_called()
-    assert res["recommended_only"] == ["Terraform"]
+    assert res["recommended_only"] == ["ISO 27005"]
 
 
 def test_profile_from_resume_page():

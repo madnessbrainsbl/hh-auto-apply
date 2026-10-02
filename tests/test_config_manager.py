@@ -28,8 +28,8 @@ def test_load_and_save_config(tmp_path):
         assert cfg is not None
         assert "resume_id" in cfg
         assert "resume_title" in cfg
-        # У нового пользователя направление не выбрано: пресет по умолчанию custom.
-        assert cfg.get("search_preset", "custom") in SEARCH_PRESETS
+        # 25.09: у нового пользователя направление не выбрано (раньше молча ИБ).
+        assert cfg.get("search_preset", "security") in SEARCH_PRESETS
         assert not cfg.get("candidate_profile"), "в примере не должно быть чужого профиля"
 
         cfg["resume_title"] = "Test Senior Python Developer"
@@ -87,6 +87,11 @@ def test_validate_apply_title_with_presets(tmp_path):
 
     with patch('config_manager.CONFIG_FILE', temp_config_path), \
          patch('config_manager.VACANCIES_CACHE_FILE', temp_cache_path):
+        # When preset is security:
+        set_active_preset('security')
+        ok_sec, _ = validate_apply_title("Инженер по безопасности приложений (AppSec)")
+        assert ok_sec is True
+
         # When preset is python:
         set_active_preset('python')
         ok_py, _ = validate_apply_title("Senior Python Backend Developer (FastAPI)")

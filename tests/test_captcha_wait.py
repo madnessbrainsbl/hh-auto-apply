@@ -75,7 +75,7 @@ def make_loop_bot(apply_results, solved):
     return bot
 
 
-VACANCY = {'id': '42', 'name': 'Аналитик данных', 'employer': {'id': '1', 'name': 'Фирма'},
+VACANCY = {'id': '42', 'name': 'Аналитик SOC', 'employer': {'id': '1', 'name': 'Фирма'},
            'alternate_url': 'https://hh.ru/vacancy/42'}
 
 
@@ -84,7 +84,7 @@ def test_solved_captcha_retries_once_and_counts_success():
     assert bot.process_api_vacancies([VACANCY]) == 1
     assert bot.apply_to_vacancy.call_count == 2
     assert bot.errors == 0 and bot.skipped == 0
-    bot.save_applied.assert_called_once_with('42', 'Аналитик данных', hh_selenium.STATUS_SENT)
+    bot.save_applied.assert_called_once_with('42', 'Аналитик SOC', hh_selenium.STATUS_SENT)
 
 
 def test_unsolved_captcha_is_skip_not_error_and_not_saved():
