@@ -78,7 +78,6 @@ def test_daily_quota_stops_retrying():
     ai._gemini_client = DailyQuota()
     # соседние модели тоже пусты — проверяем именно отказ от 60-секундных пауз
     ai._retry_on_other_gemini_model = lambda _p: None
-    # Проверяется квота, а восстановление сети проверяется отдельными тестами.
     with patch('terminal_ui.network_is_up', return_value=True):
         start = _t.time()
         assert ai._call_llm('тест') is None

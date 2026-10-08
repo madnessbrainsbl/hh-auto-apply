@@ -8,6 +8,7 @@
 """
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,13 +28,13 @@ def _bot(config=None):
 def test_custom_answer_from_config():
     """Ответ из конфига подбирается по ключевому слову в вопросе."""
     b = _bot({'answer_policy': {'yes_to_conditions': False}, 'question_answers': {
-        'опыт работы': '6 лет',
+        'опыт работы': 'Применял SIEM для мониторинга.',
         'готовы к переезду': 'Нет',
     }})
-    assert b.get_answer_for_question('Какой у вас опыт работы в ИБ?') == '6 лет'
+    assert b.get_answer_for_question('Какой у вас опыт работы в ИБ?') == 'Применял SIEM для мониторинга.'
     assert b.get_answer_for_question('Готовы к переезду в Москву?') == 'Нет'
     # регистр вопроса роли не играет
-    assert b.get_answer_for_question('ОПЫТ РАБОТЫ?') == '6 лет'
+    assert b.get_answer_for_question('ОПЫТ РАБОТЫ?') == 'Применял SIEM для мониторинга.'
 
 
 def test_unknown_question_is_not_guessed():
@@ -183,9 +184,9 @@ def test_neutral_fallback_when_configured():
               'neutral_answer': 'Готов обсудить этот вопрос на собеседовании'})
     ans = b.get_answer_for_question('Какой ваш любимый цвет?')
     assert ans == 'Готов обсудить этот вопрос на собеседовании'
-    # готовый ответ из конфига важнее нейтрального — но про деньги только без суммы
+    # На вопрос о зарплате действует нейтральная политика условий, даже при готовом ответе.
     b.config['question_answers'] = {'зарплат': 'Готов обсудить, какая вилка у позиции?'}
-    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'Готов обсудить, какая вилка у позиции?'
+    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'Готов обсудить условия на следующем этапе.'
     b.config['question_answers'] = {'зарплат': 'от 180 000 руб.'}
     assert not any(ch.isdigit() for ch in b.get_answer_for_question('Ваши зарплатные ожидания?'))
 
@@ -230,6 +231,8 @@ def test_multi_checkbox_marks_everything_model_named():
         def __init__(self, label): self.label = label; self.id = id(self); self.sel = False
         def is_selected(self): return self.sel
         def is_displayed(self): return True
+        def get_attribute(self, key):
+            return {'id': str(self.id), 'type': 'checkbox', 'value': self.label}.get(key, '')
 
     class Block:
         def __init__(self, text, boxes): self.text = text; self._c = [El(x) for x in boxes]
@@ -237,6 +240,7 @@ def test_multi_checkbox_marks_everything_model_named():
             return self._c if 'checkbox' in sel else []
 
     b = _bot({'question_answers': {}})
+    b.driver = SimpleNamespace(execute_script=lambda *args: None)
     b.get_option_label = lambda el: el.label
     clicked = []
     def click(el):

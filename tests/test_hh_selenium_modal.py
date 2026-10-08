@@ -82,7 +82,12 @@ def test_ensure_target_resume_switches_from_photographer(bot):
     target_option.is_displayed.return_value = True
     target_option.text = "Application Security Engineer / AppSec-инженер"
 
-    bot.click_element_with_mouse = MagicMock(return_value=True)
+    def click(element):
+        if element is target_option:
+            bad_title.text = target_option.text
+        return True
+    bot.click_element_with_mouse = MagicMock(side_effect=click)
+    bot.find_response_modal = lambda **_kwargs: modal
     bot.driver.find_elements.return_value = [target_option]
 
     ok, err = bot.ensure_target_resume_selected(modal)
@@ -350,3 +355,32 @@ def test_letter_not_repeated_if_already_in_chat(bot, monkeypatch):
     monkeypatch.setattr(hh_selenium.time, 'sleep', lambda s: None)
     assert bot.send_letter_to_chat(letter, 'https://hh.ru/vacancy/1') is True
     assert state['sent'] == []
+
+
+def test_captcha_in_background_opens_window_and_delay_comes_from_settings():
+    """07.10: в фоне капча — перезапуск браузера с окном на той же странице; пауза 20–60 с из настроек."""
+    from unittest.mock import MagicMock
+    from hh_selenium import HHSeleniumBot
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.headless = True
+    bot.pause_before_close = True
+    bot.driver = MagicMock(current_url='https://hh.ru/vacancy/1')
+    old_driver = bot.driver
+    bot.close_driver = MagicMock()
+    new_driver = MagicMock()
+
+    def init():
+        bot.driver = new_driver
+        return True
+    bot.init_driver = init
+    assert bot.show_browser_for_captcha() is True
+    assert bot.headless is False and bot.pause_before_close is True
+    bot.close_driver.assert_called_once()
+    new_driver.get.assert_called_once_with('https://hh.ru/vacancy/1')
+    assert old_driver is not new_driver
+
+    bot.delay_between_vacancies = (1, 2)
+    bot.config = {'apply_delay_seconds': [20, 60]}
+    assert bot.apply_delay() == (20.0, 60.0)
+    bot.config = {'apply_delay_seconds': 'abc'}
+    assert bot.apply_delay() == (1, 2)

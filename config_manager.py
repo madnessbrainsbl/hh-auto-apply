@@ -167,7 +167,7 @@ SECURITY_PROTECTION_CONTEXT = (
 STRICT_TITLE_EXCLUDE_KEYWORDS = (
     # Уровень должности (младший, начальник, руководитель...) не исключаем —
     # решение 24.09: подаёмся массово, отказ по уровню тоже данные для разбора.
-    # Преподаватель, пресейл, сертификация СЗИ — тоже работа в ИБ (25.09).
+    # Преподаватель и сертификация СЗИ — тоже работа в ИБ.
     # «Менеджер по ИБ в инфраструктуре» — работа в ИБ; отсеиваем только продажи.
     'менеджер по продажам',
     'менеджер по работе с клиентами',
@@ -223,7 +223,7 @@ TECHNICAL_FALLBACK_INCLUDE_KEYWORDS = (
     'системный инженер',
     'mlops', 'observability', 'виртуализац', 'сети передачи данных', 'ceph',
     'qa', 'тестировщик', 'test engineer', 'тестированию',
-    'implementation engineer', 'внедрени', 'presale', 'пресейл', 'pre-sale',
+    'implementation engineer', 'внедрени',
     'системный архитектор', 'infrastructure engineer',
 )
 
@@ -273,6 +273,20 @@ def find_title_keyword(text, keywords):
         elif word in text:
             return keyword
     return None
+
+
+_COMMERCIAL_TITLE_RE = re.compile(
+    r'(?<!\w)(?:пре\s*сейл\w*|продаж\w*|pre\s*sales?|sales|'
+    r'account\s+(?:manager|executive)|business\s+development|'
+    r'territory\s+(?:enterprise\s+)?manager|vendor\s+manager|'
+    r'менеджер\s+по\s+работе\s+с\s+вендор\w*)(?!\w)', re.IGNORECASE)
+
+
+def commercial_title_keyword(title):
+    """Коммерческие роли не становятся техническими из-за слов ИБ или DevOps."""
+    normalized = re.sub(r'[\s\u2010-\u2015\u2212-]+', ' ', str(title or ''))
+    match = _COMMERCIAL_TITLE_RE.search(normalized)
+    return match.group(0) if match else None
 
 
 def security_title_by_meaning(title) -> bool:
@@ -450,6 +464,14 @@ def choose_account_profile():
         return
     subprocess.run([sys.executable, os.path.join(CODE_DIR, 'hh.py'), '--profile-id', name, 'menu'])
     print(f'Возврат в аккаунт {PROFILE_ID}')
+
+
+def local_application_limit(config: Dict[str, Any]):
+    """Необязательный пользовательский предел; 200 по умолчанию не доказывают лимит HH."""
+    limit = max(1, int(config.get('max_applications', 200)))
+    if config.get('stop_at_local_limit', limit != 200):
+        return limit
+    return None
 
 
 def load_config() -> Dict[str, Any]:
@@ -737,6 +759,9 @@ def fetch_account_resumes(headless: bool = True) -> List[Dict[str, Any]]:
         options.binary_location = os.environ['CHROME_BINARY']
     if headless:
         options.add_argument('--headless=new')
+        # Без этого driver.get() в фоне ждёт load-событие вечно: 05.10 страница hh
+        # застряла в readyState=interactive и разбор отказов молча завис.
+        options.page_load_strategy = 'eager'
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     # Тут браузер запускался без единой настройки тишины, и служебные строки
@@ -972,15 +997,15 @@ def default_cover_letter(profile: dict, telegram: str = '') -> str:
     profile = profile or {}
     spec = str(profile.get('specialization') or '').split(':')[0].strip()
     skills = [str(x) for x in (profile.get('skills') or [])][:4]
-    years = profile.get('experience_years')
     parts = ["Добрый день! Заинтересован в данной позиции."]
     if spec:
-        parts.append(f"Моя специализация — {spec}" + (f", опыт около {round(float(years))} лет." if years else "."))
+        parts.append(f"Моя специализация — {spec}.")
     if skills:
         parts.append(f"Основные инструменты и навыки: {', '.join(skills)}.")
     parts.append("Буду рад обсудить задачи компании.")
     text = ' '.join(parts)
-    return text + (f"\n\nДля оперативной связи: Telegram {telegram}" if telegram else '')
+    from ai_assistant import clean_public_text
+    return clean_public_text(text + (f"\n\nДля оперативной связи: Telegram {telegram}" if telegram else ''), profile)
 
 
 def interactive_cover_letter_editor():
@@ -1371,20 +1396,27 @@ def edit_bot_behavior():
         preset = get_active_preset()
         is_security = preset.get('id', 'security') == 'security' and search_direction_chosen(cfg)
         items = [
-            ('limit', f"Откликов в сутки: {BOLD}{cfg.get('max_applications', 200)}{RESET}"),
+            ('limit', (f"Локальный предел за 24 часа: {BOLD}{local_application_limit(cfg)}{RESET}"
+                       if local_application_limit(cfg) is not None
+                       else "Остановка по лимиту HH, без локального ограничения")),
             ('yes', f"«Да» на вопросы о готовности и условиях (офис, переезд, ИП, график): "
                     f"{_toggle_label(policy.get('yes_to_conditions', True))}"),
             ('detailed', f"Развёрнутые ответы ИИ на вопросы про опыт: "
                          f"{_toggle_label(policy.get('detailed_answers', True))}"),
             ('letter_chat', f"Дописывать письмо в чат, если в форме отклика нет поля: "
                             f"{_toggle_label(cfg.get('letter_after_response', True))}"),
-            ('chat', f"Отвечать ботам-ассистентам работодателя в чате: "
+            ('chat', f"Ответы работодателям и запрос причины отказа в чате: "
                      f"{_toggle_label(chat.get('enabled', True))}"
-                     f", не больше {chat.get('max_per_run', 10)} за прогон"),
+                     + (f", не больше {chat['max_per_run']} за прогон"
+                        if chat.get('max_per_run') else ", без локального ограничения")),
+            ('chat_salary', f"Ответ на прямой вопрос о зарплате в чате: "
+                            f"{BOLD}{chat.get('salary_answer') or 'без суммы'}{RESET}"),
+            ('chat_tenure', f"Стаж цифрой, если в чате повторно спрашивают про стаж: "
+                            f"{BOLD}{(str(chat.get('tenure_years')) + ' лет') if chat.get('tenure_years') else 'не называть'}{RESET}"),
+            ('chat_exp', f"Шаблон «Да, есть опыт» на вопрос «есть ли опыт с X?» в чате: "
+                         f"{_toggle_label(chat.get('experience_yes_template', False))}"),
             ('resume', f"Самому вносить правки в резюме по разбору отказов: "
                        f"{_toggle_label(cfg.get('auto_apply_resume', True))}"),
-            ('hidden', f"Разбор отказов и поднятие резюме в фоне, без окна браузера: "
-                       f"{_toggle_label(cfg.get('analysis_headless', False))}"),
             ('blocked', f"Нежелательные работодатели: {len(cfg.get('blocked_employers') or [])}"),
             ('exclude', f"Слова-исключения в названиях вакансий: "
                         f"{len(cfg.get('keywords_exclude') or []) or 'встроенный список'}"),
@@ -1415,11 +1447,13 @@ def edit_bot_behavior():
         key = items[int(choice) - 1][0]
         if key == 'limit':
             try:
-                n = int(input("Сколько откликов в сутки (1-500): ").strip())
+                n = int(input("Локальный предел (1-500; 0 — только по сообщению HH): ").strip())
             except (ValueError, EOFError, KeyboardInterrupt):
                 print(f"{YELLOW}[!] Нужно число{RESET}")
                 continue
-            cfg['max_applications'] = max(1, min(500, n))
+            cfg['stop_at_local_limit'] = n > 0
+            if n > 0:
+                cfg['max_applications'] = min(500, n)
         elif key in ('yes', 'detailed'):
             field = 'yes_to_conditions' if key == 'yes' else 'detailed_answers'
             policy[field] = not policy.get(field, True)
@@ -1430,19 +1464,38 @@ def edit_bot_behavior():
             chat['enabled'] = not chat.get('enabled', True)
             if chat['enabled']:
                 try:
-                    raw = input(f"Сколько ответов за прогон (сейчас {chat.get('max_per_run', 10)}, Enter — оставить): ").strip()
+                    raw = input(f"Сколько сообщений за прогон (0 — без ограничения; сейчас {chat.get('max_per_run', 0)}, Enter — оставить): ").strip()
                     if raw:
-                        chat['max_per_run'] = max(1, min(50, int(raw)))
+                        chat['max_per_run'] = max(0, int(raw))
                 except (ValueError, EOFError, KeyboardInterrupt):
                     pass
             cfg['chat_autoreply'] = chat
+        elif key == 'chat_salary':
+            try:
+                raw = input("Текст ответа, например «Мои ожидания — от … руб.» "
+                            "(пусто — без суммы): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if raw:
+                chat['salary_answer'] = raw
+            else:
+                chat.pop('salary_answer', None)
+            cfg['chat_autoreply'] = chat
+        elif key == 'chat_tenure':
+            try:
+                raw = input("Сколько лет называть на повторный вопрос о стаже (пусто — не называть): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if raw.isdigit():
+                chat['tenure_years'] = int(raw)
+            else:
+                chat.pop('tenure_years', None)
+            cfg['chat_autoreply'] = chat
+        elif key == 'chat_exp':
+            chat['experience_yes_template'] = not chat.get('experience_yes_template', False)
+            cfg['chat_autoreply'] = chat
         elif key == 'resume':
             cfg['auto_apply_resume'] = not cfg.get('auto_apply_resume', True)
-        elif key == 'hidden':
-            cfg['analysis_headless'] = not cfg.get('analysis_headless', False)
-            if cfg['analysis_headless']:
-                print(f"{YELLOW}[!] В фоне капчу hh решить некому: если она появится, разбор остановится. "
-                      f"Разовый показ окна: флаг --show-browser.{RESET}")
         elif key == 'blocked':
             _edit_word_list(cfg, 'blocked_employers', 'Нежелательные работодатели',
                             'Название компании или его часть: «Компания-пример». На них бот не откликается.')
@@ -1612,4 +1665,3 @@ def _same_answer_family(key_a: str, key_b: str) -> bool:
         if any(m in a for m in family) and any(m in b for m in family):
             return True
     return a == b
-

@@ -235,3 +235,38 @@ def test_bump_reads_tomorrow_cooldown(tmp_path, monkeypatch):
     import json
     nxt = json.load(open(tmp_path / ru.BUMP_SCHEDULE_FILE, encoding='utf-8'))['next_at']
     assert datetime.fromtimestamp(nxt).strftime('%H:%M') == '02:31'
+
+
+@pytest.mark.parametrize('method', ['promote_resume', 'bump_resume'])
+def test_resume_load_timeout_keeps_ready_page(monkeypatch, method):
+    from selenium.common.exceptions import TimeoutException
+    updater = HHResumeUpdater(resume_id='abc', headless=True)
+    updater.driver = MagicMock()
+    updater.driver.current_url = 'https://krasnoyarsk.hh.ru/resume/abc'
+    updater.driver.get.side_effect = TimeoutException('subresource timeout')
+    title = MagicMock()
+    title.text = 'AppSec'
+    updater.driver.find_elements.side_effect = lambda by, selector: (
+        [title] if selector == '[data-qa="resume-block-title-position"]' else [])
+    updater.driver.execute_script.return_value = 'Можно завтра в 02:31'
+    updater.is_driver_alive = lambda: True
+    updater._init_driver = lambda: True
+    updater.read_about_section = MagicMock(return_value=None)
+    monkeypatch.setattr('resume_updater.time.sleep', lambda _: None)
+    result = getattr(updater, method)()
+    msg = result['bump_message'] if method == 'promote_resume' else result[1]
+    assert 'завтра в 02:31' in msg
+
+
+@pytest.mark.parametrize('url', ['https://hh.ru.evil.test/resume/abc',
+                              'https://hh.ru/resume/other', 'https://hh.ru/login'])
+def test_timed_out_resume_load_never_clicks_wrong_page(monkeypatch, url):
+    from selenium.common.exceptions import TimeoutException
+    updater = HHResumeUpdater(resume_id='abc', headless=True)
+    updater.driver = MagicMock()
+    updater.driver.current_url = url
+    updater.driver.get.side_effect = TimeoutException('subresource timeout')
+    updater._init_driver = lambda: True
+    monkeypatch.setattr('resume_updater.time.sleep', lambda _: None)
+    assert not updater.bump_resume()[0]
+    updater.driver.find_elements.assert_not_called()

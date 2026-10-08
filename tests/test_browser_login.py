@@ -58,6 +58,29 @@ def test_login_requires_account_controls():
     assert terminal_ui.is_hh_logged_in(driver) is False
 
 
+@pytest.mark.parametrize('url,shown,expected', [
+    ('https://hh.ru/applicant/profile/me', {'name', 'edit'}, True),
+    ('https://krasnoyarsk.hh.ru/applicant/profile/me', {'name', 'edit'}, True),
+    ('https://hh.ru/applicant/profile/me', {'name'}, False),
+    ('https://hh.ru/applicant/profile/me', {'edit'}, False),
+    ('https://hh.ru/applicant/profile/me', set(), False),
+    ('https://hh.ru/account/login', {'name', 'edit'}, False),
+    ('https://example.com/applicant/profile/me', {'name', 'edit'}, False),
+])
+def test_new_own_profile_requires_visible_name_and_edit_controls(url, shown, expected):
+    driver = LoginDriver(url)
+    name, edit = Mock(), Mock()
+    name.is_displayed.return_value = 'name' in shown
+    edit.is_displayed.return_value = 'edit' in shown
+    original = driver.find_elements
+    driver.find_elements = lambda by, selector: (
+        [name] if selector == '[data-qa="applicant-profile-common-name"]' else
+        [edit] if selector == '[data-qa="applicant-profile-common-edit"]' else original(by, selector))
+    assert terminal_ui.is_hh_logged_in(driver) is expected
+    driver.login_buttons = [Mock()]
+    assert terminal_ui.is_hh_logged_in(driver) is False
+
+
 def test_login_waits_past_three_minutes_without_reloading(monkeypatch):
     driver = LoginDriver()
     clock = {'elapsed': 0}

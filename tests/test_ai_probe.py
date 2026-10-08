@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Проверка ИИ при запуске: живые ответы, а не давняя статистика."""
 from ai_assistant import AIAssistant, ai_menu_lines
+from types import SimpleNamespace
+from unittest.mock import Mock
+import time
 
 
 def _assistant():
@@ -80,6 +83,46 @@ def test_closed_service_is_named_and_not_probed(monkeypatch):
     a._probe_one = lambda step: asked.append(step) or (step, True, 1.0)
     report = a.probe_report()
     assert report.startswith('Antigravity не запущен — похоже, его забыли включить. '
-                             'Перехожу на доступный ИИ: Gemini')
+                             'Перехожу к следующему ИИ: Gemini')
     assert asked == []
     assert 'Antigravity' in a._compat_rest     # во время работы пропускается сразу
+
+
+def test_probe_has_room_for_reasoning_before_final_answer(monkeypatch):
+    a = AIAssistant.__new__(AIAssistant)
+    provider = {'name': 'Synthetic', 'base_url': 'https://synthetic.invalid/v1',
+                'models': ['reasoning-model']}
+    a._compat_providers = lambda: [provider]
+
+    def reply(**kwargs):
+        enough = kwargs['max_tokens'] >= 256
+        choice = SimpleNamespace(
+            message=SimpleNamespace(content='готов' if enough else 'We need to obey the instructions.'),
+            finish_reason='stop' if enough else 'length')
+        return SimpleNamespace(choices=[choice])
+
+    create = Mock(side_effect=reply)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr('openai.OpenAI', lambda **_kwargs: client)
+    assert a._probe_one('compat:reasoning-model')[1] is True
+    assert create.call_count == 1
+
+
+def test_probe_rejects_truncated_reasoning_even_with_russian_words(monkeypatch):
+    a = AIAssistant.__new__(AIAssistant)
+    a._compat_providers = lambda: [{
+        'name': 'Synthetic', 'base_url': 'https://synthetic.invalid/v1', 'models': ['reasoning-model']}]
+    choice = SimpleNamespace(message=SimpleNamespace(content='Пользователь просит ответить готов'),
+                             finish_reason='length')
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=Mock(return_value=SimpleNamespace(choices=[choice])))))
+    monkeypatch.setattr('openai.OpenAI', lambda **_kwargs: client)
+    assert a._probe_one('compat:reasoning-model')[1] is False
+
+
+def test_old_probe_cache_is_refreshed_after_probe_upgrade():
+    a = _assistant()
+    a._ai_stats = {'_probed_at': time.time(), '_probe_version': 0,
+                   '_down': ['compat:fast']}
+    assert a.probe_providers()
+    assert 'compat:fast' not in a._ai_stats['_down']

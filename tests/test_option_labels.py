@@ -147,3 +147,49 @@ def test_own_variant_gets_its_text_field_filled(tmp_path):
         driver.quit()
     assert unresolved is None
     assert text == 'Работал с NGFW и VPN-шлюзами'
+
+
+def test_questionnaire_heading_validation_and_limit_in_chrome(tmp_path):
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from hh_selenium import HHSeleniumBot
+    page = tmp_path / 'questionnaire.html'
+    page.write_text('''<html><meta charset="utf-8"><body>
+      <h2>Ответьте на вопросы работодателя</h2>
+      <div data-qa="vacancy-response-popup">
+        <textarea id="answer">Тестовый ответ</textarea>
+        <div data-qa="field-error" id="error" hidden>Ответьте на вопросы работодателя</div>
+        <button data-qa="vacancy-response-submit-popup"
+          onclick="this.textContent = 'Отклик отправлен'">Откликнуться</button>
+      </div>
+      <div id="limit" hidden>В течение 24 часов можно совершить не более 200 откликов.</div>
+    </body></html>''', encoding='utf-8')
+    opts = webdriver.ChromeOptions()
+    opts.add_argument('--headless=new')
+    opts.add_argument(f'--user-data-dir={tmp_path / "profile"}')
+    try:
+        driver = webdriver.Chrome(options=opts)
+    except Exception as e:
+        pytest.skip(f'Chrome недоступен: {e}')
+    try:
+        driver.get(page.as_uri())
+        bot = HHSeleniumBot.__new__(HHSeleniumBot)
+        bot.driver = driver
+        bot.letter_skip_reason = 'synthetic form'
+        assert bot.get_response_blocker_message() is None
+
+        driver.execute_script("document.getElementById('error').hidden = false")
+        assert bot.get_response_blocker_message() == 'Не заполнены вопросы работодателя'
+        driver.execute_script("document.getElementById('error').hidden = true")
+        driver.find_element(By.CSS_SELECTOR, 'button').click()
+        assert bot.get_response_blocker_message() is None
+        success, _ = bot.confirm_response_submission('', False, 1, modal_submitted=True)
+        assert success
+
+        driver.execute_script("document.getElementById('limit').hidden = false")
+        bot.applied_today = 184
+        assert bot.get_response_blocker_message() == 'Лимит откликов'
+        assert bot.detect_response_state() == 'limit'
+        assert bot.confirm_response_submission('', False, 1, modal_submitted=True) == (False, 'Лимит откликов')
+    finally:
+        driver.quit()

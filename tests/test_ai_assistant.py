@@ -65,6 +65,26 @@ def test_answer_question_github(assistant):
     assert "github.com" in str(ans)
 
 
+@pytest.mark.parametrize('batch', [False, True])
+def test_answers_allow_positive_experience_outside_profile_without_fallback(assistant, monkeypatch, batch):
+    from unittest.mock import Mock
+    import json
+    assistant.enabled = True
+    assistant.candidate_profile = {'skills': ['Python']}
+    question = 'Есть ли опыт работы с Terraform и Azure DevOps?'
+    reply = 'Да, использовал Terraform для описания инфраструктуры и Azure DevOps для запуска plan/apply через CI/CD.'
+    monkeypatch.setattr(assistant, 'ai_order', lambda: ['fast', 'fallback'])
+    call = Mock(return_value=json.dumps([reply]) if batch else reply)
+    monkeypatch.setattr(assistant, '_call_step', call)
+    monkeypatch.setattr(assistant, '_record', Mock())
+    if batch:
+        assert assistant.answer_questions_batch([question]) == {question: reply}
+    else:
+        assert assistant.answer_question(question) == reply
+    call.assert_called_once()
+    assert 'отвечай утвердительно' in call.call_args.args[2]
+
+
 def test_answer_question_telegram():
     """Ник берётся из профиля и НЕ выдумывается, когда профиль пуст.
 
@@ -88,7 +108,8 @@ def test_answer_question_telegram():
 def test_answer_question_salary(assistant):
     # Сумму не называем: «кто назвал число первым, тот поставил потолок» (решение 25.09).
     ans = assistant.answer_question("Ваши зарплатные ожидания")
-    assert not any(ch.isdigit() for ch in str(ans)) and "вилка" in str(ans)
+    from ai_assistant import SALARY_ANSWER
+    assert ans == SALARY_ANSWER
 
 
 def test_answer_question_radio_negative(assistant):
@@ -108,7 +129,7 @@ def test_answer_question_radio_positive(assistant):
 def test_answer_question_radio_experience(assistant):
     options = ["Менее года", "1-3 года", "3-6 лет", "Более 6 лет"]
     idx = assistant.answer_question("Какой у вас опыт в сфере информационной безопасности?", question_type="radio", options=options)
-    assert idx in (1, 2)  # 1-3 года или 3-6 лет для кандидата с 3 годами опыта
+    assert idx is None  # Не раскрываем длительность опыта.
 
 
 def test_analyze_rejection_ats(assistant):
@@ -510,6 +531,33 @@ def test_compat_short_rate_limit_rests_model_not_whole_run():
     assert a._compat_model_rest[('LLM7', 'm1')] > 0
 
 
+def test_compat_logs_actual_response_and_endpoint_without_url_secrets(caplog):
+    a, _, _ = _compat_assistant({'requested-model': None},
+                               base_url='http://private:secret@127.0.0.1:8080/v1?token=secret')
+    from types import SimpleNamespace
+    a._compat_clients['LLM7'].chat.completions.create = lambda **kwargs: SimpleNamespace(
+        model='returned-model', choices=[SimpleNamespace(message=SimpleNamespace(content='Здравствуйте! Готов ответить.'))])
+    with caplog.at_level('INFO'):
+        assert a._call_compat_providers('p', None)
+    assert 'Ответ получен' in caplog.text
+    assert '127.0.0.1:8080' in caplog.text
+    assert 'returned-model' in caplog.text
+    assert 'secret' not in caplog.text
+
+
+def test_compat_minute_quota_is_not_treated_as_daily():
+    import httpx, openai
+    a, calls, req = _compat_assistant({'m1': None, 'm2': None})
+    a._compat_clients['LLM7'].chat.completions.create = (
+        lambda model, **_kwargs: (_ for _ in ()).throw(openai.RateLimitError(
+            'Requests quota per minute exceeded. Retry after 1 seconds.',
+            response=httpx.Response(429, request=req), body=None)) if model == 'm1'
+        else type('R', (), {'choices': [type('C', (), {'message': type('M', (), {'content': 'Письмо'})})]}))
+    assert a._call_step('compat:m1', 'p', None) is None
+    assert ('LLM7', 'm1') not in a._compat_dead_models
+    assert a._call_step('compat:m2', 'p', None) == 'Письмо'
+
+
 def test_compat_forbidden_is_not_reported_as_not_running(caplog):
     """403 от удалённого сервиса — «отказал в доступе», а не «забыли включить»."""
     import httpx, openai
@@ -696,14 +744,186 @@ def test_analysis_headless_choice():
     assert analysis_headless_enabled({}, ['--headless']) is True
 
 
-def test_ask_browser_mode():
-    """Перед полным циклом спрашиваем режим браузера; Enter — настройка, флаг — без вопроса."""
-    from rejection_analyzer import ask_browser_mode
-    assert ask_browser_mode({}, [], ask=lambda _: '') == '--show-browser'
-    assert ask_browser_mode({'analysis_headless': True}, [], ask=lambda _: '') == '--headless'
-    assert ask_browser_mode({'analysis_headless': True}, [], ask=lambda _: '1') == '--show-browser'
-    assert ask_browser_mode({}, [], ask=lambda _: '2') == '--headless'
-    assert ask_browser_mode({}, ['--headless'], ask=lambda _: 1 / 0) is None
+
+def test_kill_profile_chrome_ends_real_process(tmp_path):
+    """Осиротевший Chrome на профиле бота мешал следующему запуску (05.10)."""
+    import subprocess, time, os, pytest
+    chrome = r'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    if not os.path.exists(chrome):
+        pytest.skip('Chrome не установлен')
+    from terminal_ui import kill_profile_chrome
+    profile = str(tmp_path / 'prof')
+    proc = subprocess.Popen([chrome, '--headless=new', f'--user-data-dir={profile}', '--no-first-run', 'about:blank'])
+    time.sleep(4)
+    assert proc.poll() is None
+    assert kill_profile_chrome(profile) >= 1
+    assert proc.poll() is not None
+
+
+def test_template_letter_stack_grounded_deduped_and_vacancy_aware():
+    """05.10: «(стек: OWASP Top 10, Bash, OWASP Top 10)», «Ansible, Terraform» не из профиля,
+    ИБ-письмо на SRE-вакансию из-за слова «мониторинг»."""
+    a = AIAssistant.__new__(AIAssistant)
+    a.candidate_profile = {'specialization': 'Application Security Engineer', 'about': 'AppSec-инженер',
+                           'skills': ['OWASP Top 10', 'Bash', 'Python', 'Docker', 'SAST'], 'contacts': {}}
+    a.config = {}
+    a.db = None
+    letter = a._heuristic_cover_letter('SRE engineer', 'Сбер', 'мониторинг, инциденты, Terraform, Ansible, Docker', [])
+    assert 'Terraform' not in letter and 'Ansible' not in letter
+    assert 'SIEM' not in letter and 'информационной безопасности' not in letter
+    assert 'Docker' in letter
+    appsec = a._heuristic_cover_letter('AppSec инженер', 'Банк', 'DevSecOps, SAST, OWASP, owasp, Terraform', [])
+    stack = appsec.split('стек:')[1].split(')')[0] if 'стек:' in appsec else ''
+    names = [x.strip().lower() for x in stack.split(',') if x.strip()]
+    assert len(names) == len(set(names)) and 'terraform' not in stack.lower()
+
+
+def test_primary_ai_can_pin_whole_service_by_name():
+    """«Antigravity всегда первым»: закреплён сервис целиком, даже при плохой статистике."""
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'primary_ai': 'Antigravity', 'auto_explore': 0, 'cli_providers': ['claude'],
+                   'openai_compatible': [
+                       {'name': 'Antigravity', 'base_url': 'http://127.0.0.1:1/v1', 'models': ['m-a', 'm-b']},
+                       {'name': 'LLM7', 'base_url': 'http://127.0.0.1:2/v1', 'models': ['m-c']}]}
+    a._compat_providers = lambda: a.ai_config['openai_compatible']
+    a._load_stats = lambda: {'compat:m-a': {'avg': 9, 'success': 0.0002, 'n': 900},
+                             'compat:m-b': {'avg': 8, 'success': 0.5, 'n': 10},
+                             'claude': {'avg': 3, 'success': 0.99, 'n': 50}, '_down': ['compat:m-a', 'compat:m-b']}
+    order = a.ai_order()
+    assert order[:2] == ['compat:m-a', 'compat:m-b']   # порядок из настроек, не из статистики
+    assert order.index('claude') > 1
+
+
+def test_rank_service_models_picks_best_and_follows_new_releases():
+    from ai_assistant import rank_service_models
+    ids = ['gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-3.7-flash', 'gemini-3.1-pro', 'gemini-3.1-pro-low',
+           'claude-opus-4-6', 'claude-opus-5-5', 'claude-opus-5-5-high', 'claude-sonnet-4-6', 'claude-sonnet-5-5',
+           'claude-opus-4-*', 'gpt-oss-120b-medium', 'gemini-3.1-flash-image']
+    assert rank_service_models(ids) == ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.1-pro',
+                                        'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium']
+    newer = ids + ['gemini-3.9-flash', 'claude-opus-5-6']
+    assert rank_service_models(newer)[:2] == ['gemini-3.9-flash', 'gemini-3.8-flash']
+    assert 'claude-opus-5-6' in rank_service_models(newer) and 'claude-opus-5-5' not in rank_service_models(newer)
+
+
+def test_employer_contact_request_gets_answer_with_telegram():
+    """Работодатель пишет «хотим связаться» без вопроса — бот соглашается и даёт Telegram из профиля."""
+    from chat_workflow import wants_contact, contact_reply
+    assert wants_contact('Иван, здравствуйте! Хотим с вами связаться, давайте созвонимся.')
+    assert wants_contact('Предлагаем обсудить детали в телеграм')
+    assert not wants_contact('Рассмотрим ваше резюме. Если навыки и опыт подойдут, мы свяжемся с вами.')
+    assert not wants_contact('К сожалению, мы не готовы пригласить вас на следующий этап.')
+    reply = contact_reply({'contacts': {'telegram': 'candidate_example'}})
+    assert '@candidate_example' in reply and 'готов обсудить' in reply
+    assert 'Telegram' not in contact_reply({'contacts': {}})
+
+
+def test_probe_does_not_wait_for_a_hung_model():
+    """06.10: запуск висел минутами, потому что проверка ждала самую медленную модель."""
+    import time as _time
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'cli_providers': [], 'openai_compatible': [
+        {'name': 'S', 'base_url': 'http://127.0.0.1:1/v1', 'models': ['fast', 'hung']}]}
+    a._compat_providers = lambda: a.ai_config['openai_compatible']
+    a._ai_stats = {}
+    a._save_stats = lambda: None
+    a.PROBE_DEADLINE = 1
+
+    def fake(step):
+        if step.endswith('hung'):
+            _time.sleep(8)
+        return step, True, 0.1
+    a._probe_one = fake
+    started = _time.time()
+    results = {s: ok for s, ok, _ in a.probe_providers(force=True)}
+    assert _time.time() - started < 4
+    assert results['compat:fast'] is True and results['compat:hung'] is False
+
+
+def test_chat_templates_salary_only_on_direct_question_and_experience_yes():
+    """06.10: «есть ли опыт с X?» — всегда «Да»; сумма — только на прямой вопрос о деньгах."""
+    from chat_workflow import split_salary, experience_yes_no, salary_line, EXPERIENCE_YES_REPLY
+    rest, asked = split_salary('Подскажите, какие у вас финансовые ожидания?')
+    assert asked and rest == ''
+    rest, asked = split_salary('Вакансия: зарплата обсуждается по итогам собеседования. Когда вам удобно созвониться?')
+    assert not asked and 'созвониться' in rest
+    rest, asked = split_salary('Расскажите про опыт с Kubernetes. Какие у вас зарплатные ожидания?')
+    assert asked and rest.startswith('Расскажите')
+    assert experience_yes_no('Иван, подскажите, пожалуйста, есть ли у вас опыт работы с VMware, Hyper-V или zVirt?')
+    assert not experience_yes_no('Расскажите подробнее, есть ли у вас опыт работы с Kubernetes?')
+    assert not experience_yes_no('Есть ли опыт с Docker? А с Kubernetes? Работали ли с Helm?')
+    from ai_assistant import SALARY_ANSWER
+    assert salary_line({}) == SALARY_ANSWER and not any(ch.isdigit() for ch in salary_line({}))
+    assert salary_line({'salary_answer': 'От 350 000 руб.'}) == 'От 350 000 руб.'
+    assert EXPERIENCE_YES_REPLY.startswith('Да')
+
+
+def test_followup_question_right_after_our_reply_is_answered():
+    """07.10 EKONIKA: бот рекрутера задал следующий вопрос сразу после нашего ответа."""
+    from unittest.mock import MagicMock
+    from chat_workflow import ChatWorkflowMixin
+    bot = ChatWorkflowMixin.__new__(ChatWorkflowMixin)
+    bot.FOLLOWUP_WAIT_SECONDS = 4
+    bot._read_open_chat = lambda: {'messages': [
+        {'text': 'Опишите опыт', 'isOut': False}, {'text': 'Ответ', 'isOut': True},
+        {'text': 'Расскажите, с каким вендором NGFW вы внедряли правила?', 'isOut': False}]}
+    bot._handle_chat = MagicMock(return_value=None)
+    bot._answer_followup({'company_name': 'EKONIKA'}, 'Опишите опыт', 0)
+    args = bot._handle_chat.call_args.args
+    assert 'NGFW' in args[0]['messages'][-1]['text'] and args[2] == 1
+
+
+def test_invitation_with_request_is_answered_by_agent_not_contact_template():
+    """07.10 СЕЙВИНФОРМ: «Сориентируйте, где вы находитесь» — это вопрос, ответ пишет агент (город), а не шаблон."""
+    from rejection_analyzer import RejectionAnalyzer
+    from chat_workflow import OPEN_QUESTION
+    msg = ('Иван, здравствуйте. Готовы пригласить Вас на собеседование. Сориентируйте, пожалуйста, '
+           'где территориально Вы находитесь и определим формат, дату и время встречи.')
+    assert RejectionAnalyzer.looks_like_question_card(msg)
+    assert OPEN_QUESTION.search('С какими технологиями вам интереснее всего работать и почему?')
+    assert not OPEN_QUESTION.search('Готовы ли вы работать из офиса?')
+
+
+def test_tenure_first_time_general_second_time_concrete():
+    """07.10: на первый вопрос о стаже — обобщённо, на повторный — «6 лет»."""
+    from chat_workflow import tenure_asked_again, tenure_line, allowed_tail_lines
+    first = {'messages': [{'text': 'Здравствуйте', 'isOut': True},
+                          {'text': 'Какой у вас общий стаж работы в сфере управления рисками?', 'isOut': False}]}
+    assert not tenure_asked_again(first, first['messages'][-1]['text'])
+    again = {'messages': first['messages'] + [{'text': 'Да, такой опыт есть…', 'isOut': True},
+                                              {'text': 'А сколько лет именно?', 'isOut': False}]}
+    assert tenure_asked_again(again, 'А сколько лет именно?')
+    assert tenure_line({'tenure_years': 6}) == 'Общий опыт работы — 6 лет.'
+    assert tenure_line({'tenure_years': 2}) == 'Общий опыт работы — 2 года.'
+    assert tenure_line({}) is None
+    assert 'Общий опыт работы — 6 лет.' in allowed_tail_lines({'tenure_years': 6})
+
+
+def test_recently_answered_chats_are_revisited_when_employer_wrote_again():
+    """07.10 EKONIKA: новый вопрос пришёл, пока бот был в чате; чат стал прочитанным и выпадал из обхода."""
+    from datetime import datetime, timedelta
+    from unittest.mock import MagicMock
+    from chat_workflow import ChatWorkflowMixin
+    bot = ChatWorkflowMixin.__new__(ChatWorkflowMixin)
+    now = datetime.now()
+    bot._load_chat_actions = lambda: {
+        'a': {'kind': 'answer', 'status': 'sent', 'chat_url': 'https://hh.ru/chat/1', 'identity': 'id1',
+              'updated_at': now.isoformat()},
+        'b': {'kind': 'answer', 'status': 'sent', 'chat_url': 'https://hh.ru/chat/2', 'identity': 'id2',
+              'updated_at': (now - timedelta(days=10)).isoformat()},
+        'c': {'kind': 'answer', 'status': 'composer_disabled', 'chat_url': 'https://hh.ru/chat/3', 'identity': 'id3',
+              'updated_at': now.isoformat()}}
+    assert bot._recently_answered_chats() == [('id1', 'https://hh.ru/chat/1')]
+    assert bot._recently_answered_chats(seen={'id1'}) == []
+    bot.driver = MagicMock()
+    bot.goto = MagicMock()
+    bot._read_open_chat = lambda: {'messages_loaded': True, 'messages': [
+        {'text': 'Наш ответ', 'isOut': True}, {'text': 'С каким вендором NGFW?', 'isOut': False}]}
+    bot._handle_chat = MagicMock(return_value=None)
+    summary = {'viewed': 0}
+    bot._revisit_answered_chats(set(), summary)
+    bot._handle_chat.assert_called_once()
+    assert summary['viewed'] == 1
 
 
 def test_default_candidate_profile_has_no_personal_data_or_assumed_skills():

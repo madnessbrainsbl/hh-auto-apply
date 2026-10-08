@@ -151,10 +151,10 @@ _ERROR_HINTS = (
     ('api_key_invalid', 'ключ недействителен — введите новый в меню'),
     ('rate limit', 'слишком много запросов — сервис попросил подождать'),
     ('quota', 'дневной лимит запросов исчерпан'),
-    ('401', 'вход на hh.ru истёк'),
-    ('403', 'hh.ru не разрешил это действие'),
-    ('404', 'страница на hh.ru не найдена'),
-    ('5 0 2', 'сайт hh.ru ответил ошибкой'),
+    ('401', 'сервис требует повторной авторизации'),
+    ('403', 'сервис отказал в доступе'),
+    ('404', 'запрошенная страница или модель не найдена'),
+    ('5 0 2', 'сервис ответил ошибкой'),
     ('permission denied', 'нет доступа к файлу'),
     ('no such file', 'файл не найден'),
     ('json', 'файл повреждён'),
@@ -183,6 +183,47 @@ def explain_error(error) -> str:
     # Обещание «записаны в журнал» раньше не выполнялось: текст ошибки терялся.
     logging.getLogger('terminal_ui').debug(f'Сбой без объяснения: {text[:1000]}')
     return 'неизвестный сбой, подробности записаны в журнал'
+
+def kill_profile_chrome(profile_dir: str, attempts: int = 4) -> int:
+    """Завершает все процессы Chrome, держащие профиль, и ждёт, пока они исчезнут.
+
+    05.10 одиночный проход оставлял главный процесс осиротевшего Chrome живым:
+    новый запуск отдавал профиль ему и сразу «падал» (DevToolsActivePort не
+    создан), в консоли — «закройте все окна Chrome». Возвращает число
+    процессов, которые удалось завершить.
+    """
+    import subprocess
+    import time as _time
+    try:
+        import psutil
+    except Exception:
+        return 0
+    wanted = f'--user-data-dir={profile_dir}'.lower()
+    killed = 0
+    for _ in range(attempts):
+        found = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if 'chrome' not in (proc.info.get('name') or '').lower():
+                    continue
+                if any(str(a).lower().strip(chr(34)) == wanted for a in (proc.info.get('cmdline') or [])):
+                    found.append(proc)
+            except Exception:
+                continue
+        if not found:
+            break
+        for proc in found:
+            try:
+                proc.kill()
+                killed += 1
+            except Exception:
+                # taskkill /T добивает и дерево процессов, если psutil не справился
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        psutil.wait_procs(found, timeout=3)
+        _time.sleep(0.5)
+    return killed
+
 
 def chrome_service(log_dir: str = ''):
     """Service для chromedriver: без консоли и со служебным выводом в файл.
@@ -267,6 +308,11 @@ def is_hh_logged_in(driver) -> bool:
     for button in driver.find_elements(By.CSS_SELECTOR, '[data-qa="login"]'):
         if button.is_displayed():
             return False
+    if url.path.rstrip('/') == '/applicant/profile/me':
+        markers = ('applicant-profile-common-name', 'applicant-profile-common-edit')
+        if all(any(element.is_displayed() for element in driver.find_elements(
+                By.CSS_SELECTOR, f'[data-qa="{marker}"]')) for marker in markers):
+            return True
     for link in driver.find_elements(
         By.CSS_SELECTOR,
         '[data-qa="mainmenu_profile-link"], a[href*="/applicant/resumes"], '

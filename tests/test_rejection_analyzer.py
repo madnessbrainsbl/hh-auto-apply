@@ -141,7 +141,7 @@ def test_analyzer_run_chat_analysis_mock(analyzer, tmp_path):
         assert "Разбор чатов и отказов HeadHunter" in html
 
 
-def test_template_analysis_is_deferred_not_recorded(analyzer):
+def test_template_analysis_is_deferred_not_recorded(analyzer, capsys):
     """Без ИИ отказ не «разбирается» шаблоном, а откладывается.
 
     Раньше шаблонная причина («без письма при высокой конкуренции») выводилась
@@ -156,6 +156,9 @@ def test_template_analysis_is_deferred_not_recorded(analyzer):
     summary = analyzer.run_chat_analysis(limit=2, use_mock_if_empty=True,
                                          fetch_live=False, auto_apply=False)
     assert summary["total_analyzed"] == 0
+    assert summary['total_deferred'] == 2
+    assert summary['status'] == 'deferred'
+    assert '[OK] РАЗБОР ПЕРЕПИСКИ ЗАВЕРШЁН' not in capsys.readouterr().out
     assert recorded == []
 
 

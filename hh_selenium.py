@@ -12,6 +12,7 @@ import logging
 import subprocess
 import sys
 from datetime import datetime, timedelta
+from application_history import count_recent_applications
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -46,6 +47,7 @@ STATUS_SENT = 'sent'
 STATUS_SENT_WRONG_FILTER = 'sent_wrong_filter'
 STATUS_ALREADY_APPLIED = 'already_applied'
 STATUS_DENIED = 'denied'
+STATUS_PENDING_CONFIRMATION = 'pending_confirmation'
 STATUS_SKIPPED_NO_SAFE_URL = 'skipped_no_safe_url'
 STATUS_SKIPPED_TEST = 'skipped_test'
 STATUS_SKIPPED_FILTER = 'skipped_filter'
@@ -136,9 +138,9 @@ RESPONSE_SUBMIT_SELECTORS = (
     '[role="dialog"] button[class*="primary"]',
 )
 RESPONSE_BLOCKER_TEXTS = (
+    # Только фраза самой проверки hh. Слова «captcha»/«капча» по всей странице давали ложную капчу:
+    # 07.10 VillaCarte (веб-безопасность) упоминает CAPTCHA в описании вакансии, бот ждал по 3 мин.
     ('подтвердите, что вы не робот', 'Требуется капча'),
-    ('captcha', 'Требуется капча'),
-    ('капча', 'Требуется капча'),
     ('ответьте на вопрос', 'Не заполнены вопросы работодателя'),
     ('ответьте на вопросы', 'Не заполнены вопросы работодателя'),
     ('поменяйте видимость резюме', 'hh временно скрыл резюме от откликов'),
@@ -197,7 +199,7 @@ from config_manager import (  # один список для всех фильт
     SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS,
     NON_IT_SAFETY_MARKERS, SECURITY_PROTECTION_CONTEXT, security_title_by_meaning,
     find_title_keyword, STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS,
-    title_excludes,
+    title_excludes, commercial_title_keyword,
 )
 
 
@@ -391,7 +393,7 @@ from app_paths import CODE_DIR, DATA_DIR, PROFILE_ID
 SCRIPT_DIR = DATA_DIR
 if CODE_DIR not in sys.path:
     sys.path.insert(0, CODE_DIR)
-from ai_assistant import AIAssistant
+from ai_assistant import AIAssistant, clean_public_text, is_restricted_question, SALARY_ANSWER
 from db_manager import DatabaseManager
 from template_engine import render_template
 from terminal_ui import (
@@ -463,6 +465,7 @@ class HHSeleniumBot:
 
         # Счетчики
         self.applied_today = self.count_sent_today()
+        self.sent_this_run = 0
         self.skipped = 0
         self.errors = 0
         self.response_limit_reached = False
@@ -629,20 +632,23 @@ class HHSeleniumBot:
         return {}
 
     def count_sent_today(self):
-        cutoff = datetime.now() - timedelta(hours=APPLICATION_LIMIT_WINDOW_HOURS)
-        count = 0
-        for entry in self.applied_vacancies.values():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get('status') not in SHARED_APPLIED_STATUSES:
-                continue
+        shared_history = {}
+        shared_file = getattr(self, 'shared_applied_file', '')
+        if shared_file and os.path.exists(shared_file):
             try:
-                applied_at = datetime.strptime(str(entry.get('date', '')), '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                continue
-            if applied_at >= cutoff:
-                count += 1
-        return count
+                with open(shared_file, 'r', encoding='utf-8') as f:
+                    shared_history = json.load(f)
+                if not isinstance(shared_history, dict):
+                    raise ValueError('Неверный формат общей истории откликов')
+            except (OSError, ValueError) as e:
+                logging.warning(f"Не удалось учесть общую историю откликов: {explain_error(e)}")
+        return count_recent_applications(shared_history, self.applied_vacancies,
+                                         APPLICATION_LIMIT_WINDOW_HOURS)
+
+    def local_application_limit_reached(self):
+        from config_manager import local_application_limit
+        limit = local_application_limit(self.config)
+        return limit is not None and self.applied_today >= limit
     
     def remove_from_api_cache(self, vacancy_id):
         """Удаляет обработанную вакансию из API-кеша."""
@@ -702,6 +708,8 @@ class HHSeleniumBot:
         try:
             write_json_atomic(self.applied_file, self.applied_vacancies)
             self.save_shared_applied(vacancy_id, timestamp, status)
+            if status in SHARED_APPLIED_STATUSES:
+                self.applied_today = self.count_sent_today()
             self.remove_from_api_cache(vacancy_id)
 
             # Сохранение в базу данных SQLite
@@ -723,7 +731,8 @@ class HHSeleniumBot:
                     questions_count=eff_questions,
                     ats_score=eff_ats_score,
                     detected_skills=eff_skills,
-                    status=status
+                    status=status,
+                    resume_id=os.environ.get('HH_RESUME_ID') or self.config.get('resume_id', '')
                 )
         except Exception as e:
             logging.error(f"Ошибка сохранения отклика: {explain_error(e)}")
@@ -798,6 +807,14 @@ class HHSeleniumBot:
             if message == 'Вакансия в архиве':
                 continue
             if text in page_text:
+                if message == 'Не заполнены вопросы работодателя':
+                    # Заголовок анкеты остаётся и после заполнения всех полей.
+                    validation_error = self.get_modal_validation_error(self.driver)
+                    if not validation_error or not any(
+                            marker in validation_error.lower()
+                            for marker, reason in RESPONSE_BLOCKER_TEXTS
+                            if reason == message):
+                        continue
                 return message
 
         if self.page_says_archived():
@@ -824,7 +841,8 @@ class HHSeleniumBot:
         if has_text:
             return True
         return any(el.is_displayed() for el in self.driver.find_elements(
-            By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"]'))
+            By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"], img[data-qa="account-captcha-picture"], '
+                             'iframe[src*="captcha"], [data-qa*="captcha"]'))
 
     def wait_for_human_captcha(self, timeout_seconds=180):
         """Ждёт, пока человек сам решит капчу в окне браузера.
@@ -835,8 +853,10 @@ class HHSeleniumBot:
         """
         if self.try_vision_captcha():
             return True
-        if self.headless:
-            # Окна нет — решить капчу некому. Подсказку даём один раз за
+        if self.headless and self.show_browser_for_captcha():
+            pass  # окно открыто — ниже обычное ожидание, как в видимом режиме
+        elif self.headless:
+            # Окно открыть не вышло — решить капчу некому. Подсказку даём один раз за
             # прогон, а не на каждую вакансию, чтобы не засорять лог.
             if not getattr(self, '_captcha_headless_hint_shown', False):
                 self._captcha_headless_hint_shown = True
@@ -886,6 +906,50 @@ class HHSeleniumBot:
         logging.info(f" [~] Капчу не решили за {minutes} мин. — иду дальше")
         return False
 
+    def show_browser_for_captcha(self) -> bool:
+        """Фоновый браузер не показать, поэтому перезапускаем его с окном на той же странице.
+
+        Вход сохраняется в профиле Chrome. До конца прогона браузер остаётся видимым:
+        если hh спросил капчу один раз, скорее всего спросит снова.
+        """
+        try:
+            url = self.driver.current_url if self.driver else ''
+        except Exception:
+            url = ''
+        logging.info(" [~] hh просит капчу — открываю окно браузера, чтобы вы её решили")
+        pause = getattr(self, 'pause_before_close', False)
+        self.pause_before_close = False
+        try:
+            self.close_driver()
+        finally:
+            self.pause_before_close = pause
+        self.driver = None
+        self.headless = False
+        try:
+            if not self.init_driver():
+                return False
+            if url and is_allowed_hh_url(url):
+                self.driver.get(url)
+                time.sleep(2)
+            return True
+        except Exception as e:
+            logging.debug(f"Окно для капчи не открылось: {explain_error(e)}")
+            return False
+
+    def apply_delay(self):
+        """Пауза между откликами: из настроек apply_delay_seconds [мин, макс], иначе прежняя.
+
+        Длинная случайная пауза (например, 20–60 с) реже вызывает капчу hh.
+        """
+        raw = (getattr(self, 'config', {}) or {}).get('apply_delay_seconds')
+        try:
+            low, high = float(raw[0]), float(raw[1])
+            if 0 <= low <= high:
+                return low, high
+        except (TypeError, ValueError, IndexError, KeyError):
+            pass
+        return self.delay_between_vacancies
+
     def try_vision_captcha(self):
         settings = (getattr(self, 'config', {}) or {}).get('captcha') or {}
         if not settings.get('enabled'):
@@ -928,12 +992,14 @@ class HHSeleniumBot:
         deadline = time.time() + max(0, wait_seconds)
         while True:
             try:
-                for modal in self.driver.find_elements(By.CSS_SELECTOR, RESPONSE_MODAL_SELECTOR):
-                    try:
-                        if modal.is_displayed():
-                            return modal
-                    except Exception:
-                        continue
+                # Общий CSS-список сортируется по DOM, а не по приоритету селекторов.
+                for selector in ('[data-qa="vacancy-response-popup"]', RESPONSE_MODAL_SELECTOR):
+                    for modal in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                        try:
+                            if modal.is_displayed():
+                                return modal
+                        except Exception:
+                            continue
             except Exception as e:
                 logging.debug(f"Не удалось найти модалку отклика: {e}")
 
@@ -942,6 +1008,52 @@ class HHSeleniumBot:
             time.sleep(0.3)
 
         return None
+
+    def application_ui_problem(self, code, detail):
+        counts = getattr(self, '_application_ui_errors', {})
+        counts[code] = counts.get(code, 0) + 1
+        self._application_ui_errors = counts
+        message = (f'[{code}] {detail}. Финальная отправка ботом остановлена; '
+                   'успех не подтверждён, история отправок не изменена.')
+        try:
+            directory = os.path.join(SCRIPT_DIR, '.apply_diagnostics')
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-' + code)
+            dom = self.driver.execute_script("""
+                const visible = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+                const modals = [...document.querySelectorAll(arguments[0])].filter(visible);
+                const root = modals.find(el => el.getAttribute('data-qa') === 'vacancy-response-popup')
+                    || modals[0] || document;
+                const nodes = [...root.querySelectorAll(
+                    '[data-qa], [role="dialog"], input, textarea, button, [contenteditable]')].filter(visible);
+                return {host: location.hostname, ready_state: document.readyState,
+                    page_kind: location.pathname.split('/')[1],
+                    modals: modals.slice(0, 20).map(el => ({tag: el.tagName, qa: el.getAttribute('data-qa'),
+                        role: el.getAttribute('role'), controls: el.querySelectorAll('input,textarea,button').length})),
+                    loading: [...document.querySelectorAll('[role="progressbar"], [data-qa*="loading"], [data-qa*="spinner"]')].some(visible),
+                    nodes: nodes.slice(0, 150).map(el => ({tag: el.tagName, qa: el.getAttribute('data-qa'),
+                        role: el.getAttribute('role'), class: typeof el.className === 'string' ? el.className : '',
+                        text_length: (el.innerText || '').trim().length, disabled: !!el.disabled}))};
+            """, RESPONSE_MODAL_SELECTOR)
+            screenshot = None
+            # ponytail: три снимка на тип ошибки за запуск; структура сохраняется для каждого случая.
+            if counts[code] <= 3:
+                try:
+                    if self.driver.save_screenshot(path + '.png'):
+                        screenshot = os.path.basename(path + '.png')
+                except Exception:
+                    logging.warning('[%s] Снимок недоступен; сохраняю структурную диагностику.', code)
+            meta = getattr(self, 'last_application_meta', {}) or {}
+            vacancy_id = self.get_vacancy_id_from_url(meta.get('url', ''))
+            if not str(vacancy_id or '').isdigit():
+                vacancy_id = None
+            with open(path + '.json', 'w', encoding='utf-8') as stream:
+                json.dump({'code': code, 'vacancy_id': vacancy_id,
+                           'dom': dom, 'screenshot': screenshot}, stream, ensure_ascii=False, indent=2)
+            return message + f' Диагностика: {path}.json'
+        except Exception:
+            logging.warning('[%s] Не удалось сохранить диагностику; история не изменена.', code)
+            return message + ' Диагностику не удалось сохранить; проверьте окно браузера.'
 
     def handle_warning_popups(self):
         """
@@ -1267,6 +1379,22 @@ class HHSeleniumBot:
         input виден — сначала его. Успех — только когда input реально выбран.
         """
         targets = []
+        identity = [option.get_attribute(key) for key in ('id', 'name', 'type', 'value')]
+
+        def selected(_driver):
+            try:
+                return option.is_selected()
+            except StaleElementReferenceException:
+                # React мог заменить input. Не считаем исчезновение успехом и
+                # не нажимаем повторно: читаем единственный тот же вариант.
+                replacement = self.driver.execute_script("""
+                    const [id, name, type, value] = arguments[0];
+                    if (id) return document.getElementById(id);
+                    const matches = Array.from(document.querySelectorAll('input'))
+                      .filter(el => el.name === (name || '') && el.type === type && el.value === value);
+                    return matches.length === 1 ? matches[0] : null;
+                """, identity)
+                return bool(replacement and replacement.is_selected())
         try:
             if option.is_displayed():
                 targets.append(option)
@@ -1283,10 +1411,10 @@ class HHSeleniumBot:
             if not self.click_element_with_mouse(target):
                 continue
             try:
-                if option.is_selected():
-                    return True
-            except Exception:
-                return True
+                return bool(WebDriverWait(self.driver, 1.5, poll_frequency=0.1,
+                                          ignored_exceptions=(StaleElementReferenceException,)).until(selected))
+            except TimeoutException:
+                return False
         return False
 
     def get_element_context_text(self, element):
@@ -1565,48 +1693,69 @@ class HHSeleniumBot:
             active_resume_title = ""
 
         target_title_lower = active_resume_title.lower()
-        target_words = [w for w in re.split(r'[\s/,\-_()]+', target_title_lower) if len(w) > 2]
-        if not target_words:
-            target_words = [target_title_lower]
+        if not active_resume_id and not active_resume_title:
+            return False, 'Не задано целевое резюме — отправка отменена'
 
         DISALLOWED_KEYWORDS = ['фотограф', 'видеограф', 'photographer', 'videographer']
         if any(d in target_title_lower for d in DISALLOWED_KEYWORDS):
             DISALLOWED_KEYWORDS = []
 
         try:
-            # 1. Считываем заголовок текущего выбранного резюме в модальном окне
-            current_title_elem = None
-            title_selectors = [
-                '[data-qa="resume-title"]',
-                '[data-qa*="resume-title"]',
-                '[class*="resume-title"]',
-                '[data-qa="cell-text-content"]',
-            ]
-            for sel in title_selectors:
+            def matches_target(element):
+                resume_id = element.get_attribute('data-resume-id')
+                if isinstance(resume_id, str) and resume_id:
+                    return resume_id == active_resume_id
+                title = re.sub(r'\s*/\s*', '/', ' '.join((element.text or '').lower().split()))
+                target = re.sub(r'\s*/\s*', '/', ' '.join(target_title_lower.split()))
+                return bool(target and (title == target or title.startswith(target + '/')))
+
+            def current_title(root):
+                selectors = (
+                    '[data-qa="resume-title"]', '[data-qa*="resume-title"]',
+                    '[class*="resume-title"]',
+                    '[data-qa*="resume"] [data-qa="cell-text-content"]',
+                    '[data-qa="cell"]:has(img) [data-qa="cell-text-content"]',
+                )
+                for selector in selectors:
+                    for element in root.find_elements(By.CSS_SELECTOR, selector):
+                        if element.is_displayed() and element.text.strip():
+                            return element
+                return None
+
+            def read_current_title(_driver):
+                nonlocal modal
                 try:
-                    elems = modal.find_elements(By.CSS_SELECTOR, sel)
-                    for el in elems:
-                        if el.is_displayed() and el.text.strip():
-                            current_title_elem = el
-                            break
-                    if current_title_elem:
-                        break
-                except Exception:
-                    continue
+                    if modal is None or not modal.is_displayed():
+                        modal = self.find_response_modal()
+                    return current_title(modal) if modal is not None else False
+                except StaleElementReferenceException:
+                    modal = self.find_response_modal()
+                    return False
+
+            # 1. Считываем заголовок текущего выбранного резюме в модальном окне
+            try:
+                current_title_elem = WebDriverWait(
+                    self.driver, 3, poll_frequency=0.1,
+                    ignored_exceptions=(StaleElementReferenceException,),
+                ).until(read_current_title)
+            except TimeoutException:
+                return False, self.application_ui_problem(
+                    'resume_not_confirmed',
+                    'За 3 с не удалось прочитать выбранное резюме в форме HH. '
+                    'Это не означает, что резюме не выбрано: его состояние не подтверждено')
 
             current_text = current_title_elem.text.strip() if current_title_elem else ""
             current_lower = current_text.lower()
 
             is_disallowed = any(d in current_lower for d in DISALLOWED_KEYWORDS) if DISALLOWED_KEYWORDS else False
-            is_target = target_title_lower in current_lower or any(t in current_lower for t in target_words)
+            is_target = current_title_elem is not None and matches_target(current_title_elem)
 
             # Если текущее резюме уже профильное и не фотограф — всё отлично
             if is_target and not is_disallowed:
                 return True, None
 
-            # Если резюме вообще не отображается в модальном окне (например, одно резюме на аккаунте)
-            if not current_text and not is_disallowed:
-                return True, None
+            if not current_text:
+                return False, 'Не удалось подтвердить выбранное резюме — отправка отменена'
 
             logging.warning(f" [!] В модалке активно другое резюме: «{current_text}». Переключаю на целевое: «{active_resume_title}»...")
 
@@ -1618,9 +1767,9 @@ class HHSeleniumBot:
                 except Exception:
                     pass
 
-            if click_target:
-                self.click_element_with_mouse(click_target)
-                time.sleep(1.0)
+            if not click_target or not self.click_element_with_mouse(click_target):
+                return False, 'Список резюме не открылся — отправка отменена'
+            time.sleep(0.3)
 
             # 3. Ищем список опций в появившемся bottom sheet / dropdown
             option_selectors = [
@@ -1631,38 +1780,26 @@ class HHSeleniumBot:
                 '[data-qa="resume-title"]',
                 '[data-qa*="option"]'
             ]
-            options = []
-            for o_sel in option_selectors:
-                try:
-                    found = self.driver.find_elements(By.CSS_SELECTOR, o_sel)
-                    visible = [f for f in found if f.is_displayed()]
-                    if visible:
-                        options = visible
-                        break
-                except Exception:
-                    continue
+            def find_target(_driver):
+                for selector in option_selectors:
+                    for option in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                        if option.is_displayed() and matches_target(option):
+                            return option
+                return False
 
-            target_option = None
-            for opt in options:
-                opt_txt = opt.text.strip().lower()
-                if target_title_lower in opt_txt or (active_resume_id and active_resume_id in opt.get_attribute('outerHTML')):
-                    target_option = opt
-                    break
+            try:
+                target_option = WebDriverWait(self.driver, 2, poll_frequency=0.1,
+                                             ignored_exceptions=(StaleElementReferenceException,)).until(find_target)
+            except TimeoutException:
+                target_option = None
 
-            if not target_option:
-                best_score = 0
-                for opt in options:
-                    opt_txt = opt.text.strip().lower()
-                    if DISALLOWED_KEYWORDS and any(d in opt_txt for d in DISALLOWED_KEYWORDS):
-                        continue
-                    score = sum(1 for w in target_words if w in opt_txt)
-                    if score > best_score:
-                        best_score = score
-                        target_option = opt
+            if target_option and self.click_element_with_mouse(target_option):
+                def switched(_driver):
+                    title = read_current_title(_driver)
+                    return bool(title) and matches_target(title)
 
-            if target_option:
-                self.click_element_with_mouse(target_option)
-                time.sleep(1.0)
+                WebDriverWait(self.driver, 3, poll_frequency=0.1,
+                              ignored_exceptions=(StaleElementReferenceException,)).until(switched)
                 logging.info(f" [OK] Резюме успешно переключено на: {active_resume_title}")
                 return True, None
 
@@ -1672,10 +1809,10 @@ class HHSeleniumBot:
                 logging.error(f" [X] {err}")
                 return False, err
 
-            return True, None
+            return False, f'Целевое резюме не выбрано: сейчас «{current_text}»'
         except Exception as e:
             logging.error(f" [!] Ошибка при проверке/переключении резюме: {explain_error(e)}")
-            return True, None
+            return False, 'Выбор целевого резюме не подтверждён — отправка отменена'
 
     def submit_open_response_modal(self, cover_letter, letter_sent):
         modal = self.find_response_modal(wait_seconds=2)
@@ -1704,6 +1841,7 @@ class HHSeleniumBot:
         if not resume_ok:
             return False, letter_sent, 0, resume_err
 
+        modal = self.find_response_modal() or modal
         if not letter_sent:
             self.open_cover_letter_in_modal(modal)
             letter_sent = self.fill_cover_letter(cover_letter, wait_seconds=4)
@@ -1729,13 +1867,13 @@ class HHSeleniumBot:
 
         blocker_message = self.get_response_blocker_message()
 
-        # hh сам подсказывает, что анкета пуста, ещё до отправки. Если мы при этом
-        # не нашли ни одного вопроса — значит форма дорисовалась позже нас. Это
-        # надёжный сигнал попробовать ещё раз, а не поводов пропускать вакансию.
-        if (blocker_message and 'вопрос' in blocker_message.lower()
+        # Заголовок не ошибка, но без найденных полей надо дождаться анкеты.
+        question_hint = 'ответьте на вопрос' in (modal.text or '').lower()
+        if ((question_hint or (blocker_message and 'вопрос' in blocker_message.lower()))
                 and questions_answered == 0 and not self.unanswered_questions):
-            logging.info(" hh сообщает о незаполненной анкете — ищу вопросы повторно")
+            logging.info(" В форме есть анкета — ищу вопросы повторно")
             time.sleep(1.5)
+            modal = self.find_response_modal() or modal
             questions_answered = self.answer_employer_questions(modal)
             if self.unanswered_questions:
                 return False, letter_sent, questions_answered, self.describe_unanswered_questions()
@@ -1752,7 +1890,8 @@ class HHSeleniumBot:
         # стоит в форме и до отправки. Отправляем — если что-то не так, hh
         # покажет ошибку, и бот её прочтёт ниже. Где стояла фраза — в журнал.
         if (blocker_message == 'Не заполнены вопросы работодателя'
-                and questions_answered > 0 and not self.unanswered_questions):
+                and questions_answered > 0 and not self.unanswered_questions
+                and not self.get_modal_validation_error(modal)):
             try:
                 page = self.get_visible_page_text()
                 i = page.find('ответьте на вопрос')
@@ -1775,6 +1914,13 @@ class HHSeleniumBot:
             val_error = self.get_modal_validation_error(modal)
             if val_error:
                 return False, letter_sent, questions_answered, val_error
+            return True, letter_sent, questions_answered, None
+
+        # Кнопка в окне отклика уехала за экран (длинное письмо или анкета растянули
+        # окно, 06.10 ALVILS, SkillStaff: «y=1107 сверху: ничего (за экраном)»), и
+        # клик по координатам не попадает. Крутим окно до низа и жмём Enter на самой
+        # кнопке; успех — только если окно отклика закрылось.
+        if self.submit_popup_by_keyboard():
             return True, letter_sent, questions_answered, None
 
         blocker_message = self.get_response_blocker_message()
@@ -1806,6 +1952,36 @@ class HHSeleniumBot:
         except Exception:
             pass
         return False, letter_sent, questions_answered, blocker_message or "Кнопка отправки отклика недоступна"
+
+    SUBMIT_POPUP = '[data-qa="vacancy-response-submit-popup"]'
+
+    def submit_popup_by_keyboard(self) -> bool:
+        """Последняя попытка отправить отклик: прокрутка окна до низа и Enter на кнопке."""
+        try:
+            buttons = [b for b in self.driver.find_elements(By.CSS_SELECTOR, self.SUBMIT_POPUP)
+                       if b.is_displayed()]
+            if not buttons or self.is_disabled_element(buttons[0]):
+                return False
+            button = buttons[0]
+            self.driver.execute_script(
+                "let el = arguments[0];"
+                "while (el) { if (el.scrollHeight > el.clientHeight + 1) el.scrollTop = el.scrollHeight;"
+                " el = el.parentElement; }", button)
+            time.sleep(0.4)
+            button.send_keys(Keys.ENTER)
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                time.sleep(0.5)
+                try:
+                    if not any(b.is_displayed() for b in self.driver.find_elements(By.CSS_SELECTOR, self.SUBMIT_POPUP)):
+                        logging.info(" Кнопка отправки нажата клавишей Enter; ожидаю подтверждение HH")
+                        return True
+                except StaleElementReferenceException:
+                    continue
+            return False
+        except Exception as e:
+            logging.debug(f"Отправка клавишей не удалась: {e}")
+            return False
 
     def get_modal_validation_error(self, modal):
         """Проверяет наличие подсвеченных ошибок валидации полей в модальном окне."""
@@ -2046,7 +2222,10 @@ class HHSeleniumBot:
 
         in_frame = False
         try:
-            if vacancy_url and '/vacancy/' not in (self.driver.current_url or ''):
+            # Страницу открываем заново всегда: после отклика с анкетой поверх неё
+            # остаётся окно-оверлей, и кнопка «Чат» под ним не кликалась
+            # («element click intercepted: modal-overlay», 06.10 Датаджайл, Syberry).
+            if vacancy_url:
                 self.driver.get(vacancy_url)
             button = wait_for(self.CHAT_BUTTON, 8)
             if not button or not self.click_element_with_mouse(button):
@@ -2155,7 +2334,7 @@ class HHSeleniumBot:
                 return False, blocker_message
 
             modal = self.find_response_modal()
-            if modal:
+            if modal and not modal_submitted:
                 submitted, letter_sent, answered_now, blocker_message = self.submit_open_response_modal(
                     cover_letter,
                     letter_sent,
@@ -2200,8 +2379,10 @@ class HHSeleniumBot:
         # Внутренний код состояния (ready/unknown) пользователю ничего не
         # говорит — он уходит в журнал, а на экран идёт человеческая фраза.
         logging.debug(f"Состояние отклика после попыток: {last_state}")
-        return False, ("hh не принял отклик — кнопка осталась на месте. "
-                       "Обычно это временное ограничение темпа, повторите позже")
+        if modal_submitted:
+            return False, (f"{APPLY_NOT_CONFIRMED_MARKER} ({last_state}). "
+                           "Отправка не подтверждена; не повторяю автоматически. Проверьте отклики на HH.")
+        return False, 'Кнопка отправки недоступна — отклик не отправлен'
 
     def collect_question_field_ids(self):
         """id всех полей, которые принадлежат вопросам работодателя.
@@ -2304,6 +2485,7 @@ class HHSeleniumBot:
 
     def fill_cover_letter(self, cover_letter, wait_seconds=0):
         """Заполняет поле письма. Причину неудачи кладёт в self.letter_skip_reason."""
+        cover_letter = clean_public_text(cover_letter, (getattr(self, 'config', None) or {}).get('candidate_profile') or {})
         if not cover_letter.strip():
             self.letter_skip_reason = (
                 'текст письма пуст (ИИ не сгенерировал письмо и шаблон cover_letter в конфиге не задан)'
@@ -2490,10 +2672,12 @@ class HHSeleniumBot:
 
     def print_interactive_status(self):
         """Выводит оперативную сводку текущего состояния бота."""
-        max_app = self.config.get('max_applications', 200)
+        from config_manager import local_application_limit
+        max_app = local_application_limit(self.config)
         print(f"\n{CYAN}{BOLD}{'-' * 50}{RESET}")
         print(f"{CYAN}{BOLD}СТАТУС В РЕАЛЬНОМ ВРЕМЕНИ:{RESET}")
-        print(f" Откликов за 24ч: {GREEN}{self.applied_today}{RESET} / {max_app}")
+        suffix = f" / {max_app} (локальный предел)" if max_app is not None else " (до сообщения о лимите HH)"
+        print(f" Известных откликов за 24ч: {GREEN}{self.applied_today}{RESET}{suffix}")
         print(f" Пропущено: {YELLOW}{self.skipped}{RESET}")
         print(f" Ошибок: {RED}{self.errors}{RESET}")
         state_str = f"{YELLOW}{BOLD}[ПАУЗА]{RESET}" if self.is_paused else f"{GREEN}{BOLD}[РАБОТАЕТ]{RESET}"
@@ -2511,21 +2695,8 @@ class HHSeleniumBot:
     
     def _cleanup_profile_processes(self, profile_dir):
         """Завершает зависшие процессы Chrome, блокирующие chrome_profile."""
-        try:
-            import psutil
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    name = proc.info.get('name') or ''
-                    if 'chrome' in name.lower():
-                        cmdline = ' '.join(proc.info.get('cmdline') or [])
-                        if any(arg.lower().strip(chr(34)) == f'--user-data-dir={profile_dir}'.lower()
-                               for arg in (proc.info.get('cmdline') or [])):
-                            proc.kill()
-                except Exception:
-                    pass
-            time.sleep(1.0)
-        except Exception:
-            pass
+        from terminal_ui import kill_profile_chrome
+        kill_profile_chrome(profile_dir)
 
     def init_driver(self):
         """Инициализация браузера"""
@@ -2537,6 +2708,7 @@ class HHSeleniumBot:
             options.debugger_address = self.debugger_address
             try:
                 self.driver = webdriver.Chrome(options=options)
+                self.driver.set_page_load_timeout(90)
                 self.wait = WebDriverWait(self.driver, 10)
                 logging.info(f"[OK] Подключен к Chrome debugger: {self.debugger_address}")
                 return True
@@ -2544,8 +2716,15 @@ class HHSeleniumBot:
                 logging.error(f"[X] Ошибка подключения к Chrome debugger {self.debugger_address}: {explain_error(e)}")
                 return False
         
+
+        # eager: не ждать load-событие сторонних скриптов hh. Без него driver.get() в фоне висел вечно (05.10),
+        # а в окне страница выдачи грузилась ~35 с вместо ~7 с (06.10: 12 страниц = 6 минут «тишины»).
+        options.page_load_strategy = 'eager'
         if self.headless:
             options.add_argument('--headless=new')
+            # Без этого driver.get() в фоне ждёт load-событие вечно: 05.10 страница hh
+            # застряла в readyState=interactive и разбор отказов молча завис.
+            options.page_load_strategy = 'eager'
             # Без явного размера headless-Chrome стартует в 800x600, hh отдает узкий
             # мобильный лейаут, и селекторы с координатными кликами, отлаженные на
             # видимом режиме [2], начинают промахиваться. Блок геометрии ниже стоит
@@ -2597,8 +2776,10 @@ class HHSeleniumBot:
         try:
             if service:
                 self.driver = webdriver.Chrome(service=service, options=options)
+                self.driver.set_page_load_timeout(90)
             else:
                 self.driver = webdriver.Chrome(options=options)
+                self.driver.set_page_load_timeout(90)
         except Exception as e:
             err_s = str(e).lower()
             if any(k in err_s for k in ('instance exited', 'session not created', 'crashed', 'devtoolsactiveport')):
@@ -2609,8 +2790,10 @@ class HHSeleniumBot:
                 try:
                     if service:
                         self.driver = webdriver.Chrome(service=service, options=options)
+                        self.driver.set_page_load_timeout(90)
                     else:
                         self.driver = webdriver.Chrome(options=options)
+                        self.driver.set_page_load_timeout(90)
                 except Exception as e2:
                     logging.error(f"[X] Ошибка запуска браузера после очистки: {e2}")
                     return False
@@ -2730,6 +2913,10 @@ class HHSeleniumBot:
             preset = {'id': 'security'}
 
         preset_id = preset.get('id', 'security')
+        if preset_id == 'security':
+            commercial_role = commercial_title_keyword(title)
+            if commercial_role:
+                return False, f"Продажи/пресейл не входят в направление ИБ: {commercial_role}"
         excluded_keyword = self.find_keyword(
             title,
             title_excludes(self.config),
@@ -3049,12 +3236,13 @@ class HHSeleniumBot:
         by_block = getattr(self, '_batch_answers_by_block', None) or {}
         block_id = getattr(self, '_current_block_id', None)
         if block_id and block_id in by_block:
-            return by_block[block_id]
+            return clean_public_text(by_block[block_id], self.config.get('candidate_profile') or {}) or None
 
         batch = getattr(self, '_batch_answers', None) or {}
         if not batch:
             return None
-        return batch.get(' '.join((question_text or '').split()))
+        answer = batch.get(' '.join((question_text or '').split()))
+        return clean_public_text(answer, self.config.get('candidate_profile') or {}) or None
 
     def batch_choices_for(self, question_text):
         """Варианты, которые модель назвала для этого вопроса в пакетном разборе.
@@ -3075,6 +3263,11 @@ class HHSeleniumBot:
         """
         q_lower = (question_text or '').lower()
         lowered = [(lbl or '').lower().strip() for lbl in labels]
+        profile = self.config.get('candidate_profile') or {}
+        if is_restricted_question(question_text):
+            return None
+        if any(clean_public_text(label, profile) != str(label or '').strip() for label in labels):
+            return None
 
         # 1. Явно заданный ответ из конфига question_answers
         for keyword, answer in (self.config.get('question_answers') or {}).items():
@@ -3248,16 +3441,18 @@ class HHSeleniumBot:
         # а согласиями их не закрыть.
         if checkboxes:
             wanted = self.batch_choices_for(question_text)
-            if wanted:
+            labels_all = [self.get_option_label(cb) for cb in checkboxes]
+            chosen = {idx for w in wanted
+                      if (idx := self.match_option_index(w, labels_all)) is not None}
+            if not chosen:
+                idx = self.choose_option_index(question_text, labels_all)
+                if idx is not None:
+                    chosen.add(idx)
+                    wanted = [labels_all[idx]]
+            if chosen:
                 checked_any = False
-                labels_all = [self.get_option_label(cb) for cb in checkboxes]
-                chosen = set()
-                for w in wanted:
-                    idx = self.match_option_index(w, labels_all)
-                    if idx is not None:
-                        chosen.add(idx)
                 for pos, cb in enumerate(checkboxes):
-                    label = self.get_option_label(cb).lower().strip()
+                    label = labels_all[pos].lower().strip()
                     if not label:
                         continue
                     if pos in chosen:
@@ -3269,7 +3464,7 @@ class HHSeleniumBot:
                             elif self.click_choice(cb):
                                 answered += 1
                                 checked_any = True
-                                logging.info(f" Вопрос: «{short_q}» -> отмечено «{self.get_option_label(cb)}»")
+                                logging.info(f" Вопрос: «{short_q}» -> отмечено «{labels_all[pos]}»")
                         except Exception as e:
                             logging.debug(f"Не удалось отметить чекбокс: {e}")
                     handled.add(cb.id)
@@ -3303,8 +3498,8 @@ class HHSeleniumBot:
                     return True
                 return bool(re.search(r'(?<!\w)да(?!\w)', text))
 
-            checked_any = False
-            for cb in checkboxes:
+            checked_any = bool(chosen)
+            for cb in (() if chosen else checkboxes):
                 label = self.get_option_label(cb).lower()
                 if looks_like_consent(label) or (len(checkboxes) == 1 and not label):
                     try:
@@ -3554,13 +3749,8 @@ class HHSeleniumBot:
         if not q_clean:
             return None
 
-        # 0. Деньги — всегда готовым ответом без суммы, какой бы длины ни был вопрос:
-        # длинный вопрос уходил к ИИ, и тот называл сумму из профиля (вопрос с подробными условиями).
-        from ai_assistant import is_salary_question, SALARY_ANSWER
-        if is_salary_question(q_clean):
-            for keyword, answer in custom_answers.items():
-                if is_salary_question(keyword) and not any(ch.isdigit() for ch in str(answer)):
-                    return answer
+        profile = self.config.get('candidate_profile') or {}
+        if is_restricted_question(q_clean):
             return SALARY_ANSWER
 
         # 1. Готовые ответы из конфига — только на короткие вопросы. Ключ ищется
@@ -3569,12 +3759,12 @@ class HHSeleniumBot:
         if is_short_question(q_clean) and not self.yes_policy_question(q_clean):
             for keyword, answer in custom_answers.items():
                 if keyword.lower() in q_lower:
-                    return answer
+                    return clean_public_text(answer, profile) or None
 
         # 2. Ответ из пакетного разбора анкеты (один запрос на всю форму)
         cached = self.batch_answer_for(q_clean)
         if cached and not any(m in cached.lower() for m in GENERIC_ANSWER_MARKERS):
-            return cached
+            return clean_public_text(cached, profile) or None
 
         # 3. ИИ-ассистент на основе профиля кандидата
         if hasattr(self, 'ai_assistant') and self.ai_assistant:
@@ -3586,7 +3776,7 @@ class HHSeleniumBot:
             ans = str(ans).strip() if ans else ''
             # Дежурная отписка ai_assistant = ответа нет
             if ans and not any(m in ans.lower() for m in GENERIC_ANSWER_MARKERS):
-                return ans
+                return clean_public_text(ans, profile) or None
 
         # 3. Нейтральный ответ, если он задан в конфиге.
         #
@@ -3599,7 +3789,7 @@ class HHSeleniumBot:
         # neutral_answer из hh_selenium_config.json.
         neutral = str(self.config.get('neutral_answer') or '').strip()
         if neutral:
-            return neutral
+            return clean_public_text(neutral, profile) or None
 
         # 4. Ответа нет — вакансия пропускается. Выдумывать работодателю нельзя.
         return None
@@ -3810,15 +4000,13 @@ class HHSeleniumBot:
     def process_api_vacancies(self, vacancies):
         """Откликается через браузер на вакансии из API-кеша."""
         vacancies_processed = 0
-        max_applications = self.config.get('max_applications', 50)
-
         for index, vacancy in enumerate(vacancies, 1):
             if self.check_interactive_controls() == 'stop' or self.stop_requested:
                 logging.info("[СТОП] Остановка по запросу пользователя")
                 break
 
-            if self.applied_today >= max_applications:
-                logging.info("[СТОП] Достигнут лимит откликов за 24 часа")
+            if self.local_application_limit_reached():
+                logging.info("[СТОП] Достигнут пользовательский локальный предел откликов")
                 break
 
             vacancy_id = str(vacancy.get('id') or '')
@@ -3851,11 +4039,14 @@ class HHSeleniumBot:
                         details='работодатель в списке нежелательных')
                 continue
 
-            if self.config.get('skip_applied', True) and self.should_skip_known_vacancy(vacancy_id, vacancy_name):
+            known = self.applied_vacancies.get(str(vacancy_id))
+            pending = isinstance(known, dict) and known.get('status') == STATUS_PENDING_CONFIRMATION
+            if (self.config.get('skip_applied', True) or pending) and self.should_skip_known_vacancy(vacancy_id, vacancy_name):
                 # Отсеянная фильтром — не «уже откликались»: так лог врал про
                 # «Младшего специалиста», на которого отклика не было.
-                known = self.applied_vacancies.get(str(vacancy_id))
-                if isinstance(known, dict) and known.get('status') == STATUS_SKIPPED_FILTER:
+                if pending:
+                    logging.info(' [ПРОПУСК] Прошлая отправка не подтверждена; проверьте отклики на HH. Не повторяю.')
+                elif isinstance(known, dict) and known.get('status') == STATUS_SKIPPED_FILTER:
                     _, why = self.validate_security_title(vacancy_name)
                     logging.info(f" [ПРОПУСК] Отсеяна фильтром по названию: {why}")
                 else:
@@ -3946,7 +4137,9 @@ class HHSeleniumBot:
                 if hasattr(self, 'db') and self.db:
                     self.db.record_skipped_vacancy(vacancy_id, vacancy_name, employer, vacancy_url, reason='denied')
             elif message == "Лимит откликов":
-                logging.info(" [СТОП] Лимит откликов HH исчерпан")
+                logging.info(" [СТОП] HH показал лимит откликов. "
+                             f"В локальной истории за 24 часа: {self.applied_today}. "
+                             "Счётчик HH может учитывать отклики вне бота; новые отправки прекращены.")
                 self.response_limit_reached = True
                 break
             elif str(message).startswith(QUESTIONS_SKIP_MARKER):
@@ -3963,10 +4156,12 @@ class HHSeleniumBot:
                     break
                 logging.info(f" [X] {message}")
                 self.errors += 1
+                if APPLY_NOT_CONFIRMED_MARKER in str(message):
+                    self.save_applied(vacancy_id, vacancy_name, STATUS_PENDING_CONFIRMATION)
                 if self.register_apply_failure(message):
                     break
 
-            self.random_delay(self.delay_between_vacancies)
+            self.random_delay(self.apply_delay())
 
         return vacancies_processed
 
@@ -4132,8 +4327,9 @@ class HHSeleniumBot:
                     pass
 
             if not apply_btn:
-                logging.warning("[!] Кнопка отклика не найдена")
-                return False, "Кнопка не найдена"
+                return False, self.application_ui_problem(
+                    'apply_button_missing',
+                    'Не найдена видимая доступная кнопка отклика после ожидания 1.5 с')
             
             # Проверяем текст кнопки
             btn_text = apply_btn.text.lower()
@@ -4279,15 +4475,19 @@ class HHSeleniumBot:
                     logging.info("[СТОП] Остановка обработки страницы поиска пользователем")
                     return vacancies_processed
 
-                if self.applied_today >= self.config.get('max_applications', 50):
-                    logging.info("[СТОП] Достигнут лимит откликов за 24 часа")
+                if self.local_application_limit_reached():
+                    logging.info("[СТОП] Достигнут пользовательский локальный предел откликов")
                     return vacancies_processed
 
                 vacancy_id = self.get_vacancy_id_from_url(vacancy_url)
                 logging.info(f"\n[{i+1}/{len(collected)}] {vacancy_name}")
 
                 if vacancy_id and self.should_skip_known_vacancy(vacancy_id, vacancy_name):
-                    logging.info(" [ПРОПУСК] Уже откликались")
+                    known = self.applied_vacancies.get(str(vacancy_id))
+                    if isinstance(known, dict) and known.get('status') == STATUS_PENDING_CONFIRMATION:
+                        logging.info(' [ПРОПУСК] Прошлая отправка не подтверждена; проверьте отклики на HH. Не повторяю.')
+                    else:
+                        logging.info(" [ПРОПУСК] Уже откликались")
                     self.skipped += 1
                     if hasattr(self, 'db') and self.db:
                         self.db.record_skipped_vacancy(vacancy_id, vacancy_name, '', vacancy_url, reason='already_applied')
@@ -4340,7 +4540,9 @@ class HHSeleniumBot:
                     logging.info(" [ПРОПУСК] Капча не решена — вакансия останется в очереди")
                     self.skipped += 1
                 elif message == "Лимит откликов":
-                    logging.info(" [СТОП] Лимит откликов HH исчерпан")
+                    logging.info(" [СТОП] HH показал лимит откликов. "
+                                 f"В локальной истории за 24 часа: {self.applied_today}. "
+                                 "Счётчик HH может учитывать отклики вне бота; новые отправки прекращены.")
                     self.response_limit_reached = True
                     return vacancies_processed
                 elif message == HIDDEN_RESUME_MESSAGE:
@@ -4385,10 +4587,12 @@ class HHSeleniumBot:
                         return vacancies_processed
                     logging.info(f" [X] {message}")
                     self.errors += 1
+                    if vacancy_id and APPLY_NOT_CONFIRMED_MARKER in str(message):
+                        self.save_applied(vacancy_id, vacancy_name, STATUS_PENDING_CONFIRMATION)
                     if self.register_apply_failure(message):
                         return vacancies_processed
 
-                self.random_delay(self.delay_between_vacancies)
+                self.random_delay(self.apply_delay())
 
         except Exception as e:
             logging.error(f"Ошибка обработки страницы: {explain_error(e)}")
@@ -4454,14 +4658,7 @@ class HHSeleniumBot:
             # Обрабатываем страницы поиска из конфига (search_url)
             self.process_search_url(self.config.get('search_url'), label='search_url')
 
-            # Итоги
-            print("\n" + "="*60)
-            print("ИТОГИ")
-            print("="*60)
-            print(f"[OK] Откликов за последние 24 часа: {self.applied_today}")
-            print(f"[ПРОПУСК] Пропущено: {self.skipped}")
-            print(f"[X] Ошибок: {self.errors}")
-            print("="*60)
+            self.print_run_summary()
             
         except KeyboardInterrupt:
             print("\n\n[СТОП] Остановлено пользователем")
@@ -4472,6 +4669,23 @@ class HHSeleniumBot:
                 logging.error(f"Критическая ошибка: {explain_error(e)}")
         finally:
             self.close_driver()
+
+    def print_run_summary(self):
+        self.applied_today = self.count_sent_today()
+        print("\n" + "="*60)
+        print("ИТОГИ")
+        print("="*60)
+        print(f"[OK] Новых откликов за этот запуск: {getattr(self, 'sent_this_run', 0)}")
+        print(f"[OK] Известных откликов за последние 24 часа: {self.applied_today}")
+        print(f"[ПРОПУСК] Пропущено: {self.skipped}")
+        print(f"[X] Ошибок: {self.errors}")
+        for code, count in getattr(self, '_application_ui_errors', {}).items():
+            label = {'resume_not_confirmed': 'Выбранное резюме не прочитано',
+                     'apply_button_missing': 'Кнопка отклика недоступна'}.get(code, code)
+            print(f"  [{code}] {label}: {count}")
+        if getattr(self, '_application_ui_errors', {}):
+            print(f"  Диагностика ошибок интерфейса: {os.path.join(SCRIPT_DIR, '.apply_diagnostics')}")
+        print("="*60)
 
     def wait_out_hidden_resume(self):
         """Пережидает, пока hh снова разрешит откликаться этим резюме.
@@ -4492,6 +4706,7 @@ class HHSeleniumBot:
 
     def note_apply_success(self):
         """Сбрасывает серию провалов после удачного отклика."""
+        self.sent_this_run = getattr(self, 'sent_this_run', 0) + 1
         self.consecutive_apply_failures = 0
         self.hidden_resume_streak = 0
 
@@ -4537,12 +4752,11 @@ class HHSeleniumBot:
 
     def process_search_url(self, search_url, label=''):
         """Листает все страницы одного запроса через &page=N и откликается до лимита."""
-        max_applications = self.config.get('max_applications', 50)
         max_pages = self.config.get('max_search_pages', 50)
         logging.info(f"\nПоиск [{label}]: {search_url}")
 
         page = 0
-        while (self.applied_today < max_applications
+        while (not self.local_application_limit_reached()
                and not self.response_limit_reached
                and not self.throttled_stop
                and not self.stop_requested):
@@ -4551,7 +4765,7 @@ class HHSeleniumBot:
             self.driver.get(page_url)
             self.random_delay(self.delay_between_actions)
 
-            processed = self.process_search_page()
+            self.process_search_page()
 
             if self.stop_requested:
                 logging.info("[СТОП] Остановка поиска по запросу пользователя")
@@ -4564,10 +4778,6 @@ class HHSeleniumBot:
             if self.last_search_page_count == 0:
                 logging.info(f" Конец выдачи по запросу [{label}]")
                 return
-            if processed == 0 and self.errors > 5:
-                logging.warning("[!] Слишком много ошибок, останавливаемся")
-                return
-
             page += 1
             if page >= max_pages:
                 logging.info(f" Достигнут предел страниц ({max_pages}) [{label}]")
@@ -4579,11 +4789,10 @@ class HHSeleniumBot:
         allow_technical_fallback=False → только строгие ИБ-заголовки (ярус 2);
         True → разрешены dev/IT-заголовки через technical fallback (ярус 3).
         """
-        max_applications = self.config.get('max_applications', 50)
         queries = [q for q in (queries or []) if q]
         if not queries:
             return
-        if (self.applied_today >= max_applications
+        if (self.local_application_limit_reached()
                 or self.response_limit_reached
                 or self.throttled_stop
                 or self.stop_requested):
@@ -4591,14 +4800,14 @@ class HHSeleniumBot:
 
         print("\n" + "=" * 60)
         print(f"{label}")
-        print(f" Запросов: {len(queries)} | Откликов за 24ч: {self.applied_today}/{max_applications}")
+        print(f" Запросов: {len(queries)} | Известных откликов за 24ч: {self.applied_today}")
         print("=" * 60)
 
         previous_fallback = self.config.get('allow_technical_fallback', True)
         self.config['allow_technical_fallback'] = allow_technical_fallback
         try:
             for i, query in enumerate(queries, 1):
-                if (self.applied_today >= max_applications
+                if (self.local_application_limit_reached()
                         or self.response_limit_reached
                         or self.throttled_stop
                         or self.stop_requested):
@@ -4691,13 +4900,7 @@ class HHSeleniumBot:
                     label='ЯРУС 3: добор разработкой/IT до дневного лимита',
                 )
 
-            print("\n" + "="*60)
-            print("ИТОГИ")
-            print("="*60)
-            print(f"[OK] Откликов за последние 24 часа: {self.applied_today}")
-            print(f"[ПРОПУСК] Пропущено: {self.skipped}")
-            print(f"[X] Ошибок: {self.errors}")
-            print("="*60)
+            self.print_run_summary()
 
         except KeyboardInterrupt:
             print("\n\n[СТОП] Остановлено пользователем")
@@ -4759,9 +4962,13 @@ def main():
                 return
             try:
                 bot.config['max_applications'] = max(1, int(args[limit_index]))
+                bot.config['stop_at_local_limit'] = True
             except ValueError:
                 print("[X] Значение --limit должно быть числом")
                 return
+
+        if '--until-hh-limit' in args:
+            bot.config['stop_at_local_limit'] = False
 
         bot.run_api_cache()
         return

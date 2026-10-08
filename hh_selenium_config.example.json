@@ -5,6 +5,7 @@
   "api_cache_file": "vacancies_cache.json",
   "cover_letter": "Добрый день! Заинтересован в данной позиции. Буду рад обсудить задачи компании.",
   "max_applications": 200,
+  "stop_at_local_limit": false,
   "skip_with_tests": true,
   "skip_applied": true,
   "allow_technical_fallback": true,
@@ -19,7 +20,12 @@
     "model": "gemini-flash-latest",
     "api_key": "",
     "timeout_seconds": 15,
-    "temperature": 0.3
+    "temperature": 0.3,
+    "cli_providers": [
+      "claude",
+      "codex"
+    ],
+    "primary_ai": "auto"
   },
   "candidate_profile": {},
   "answer_policy": {
@@ -27,6 +33,15 @@
     "detailed_answers": true
   },
   "letter_after_response": true,
+  "chat_autoreply": {
+    "enabled": true,
+    "max_per_run": 0,
+    "ask_rejection_reason": true,
+    "open_external_interviews": true,
+    "salary_answer": "",
+    "tenure_years": null,
+    "experience_yes_template": false
+  },
   "neutral_answer": "Готов обсудить этот вопрос на собеседовании",
   "ai_filter": {
     "mode": "off",
@@ -37,5 +52,10 @@
     "max_attempts": 2,
     "timeout_seconds": 20,
     "model": ""
-  }
+  },
+  "auto_ai_filter_after_resume_edit": false,
+  "apply_delay_seconds": [
+    1,
+    2
+  ]
 }

@@ -23,7 +23,9 @@ def no_sleep(monkeypatch):
 
 
 def test_headless_returns_false_and_hints_once(monkeypatch, caplog):
+    # Окно для капчи открыть не удалось (07.10: сначала бот пробует открыть окно).
     bot = make_bot(headless=True)
+    bot.show_browser_for_captcha = MagicMock(return_value=False)
     caplog.set_level('INFO')
     assert bot.wait_for_human_captcha() is False
     assert bot.wait_for_human_captcha() is False
@@ -33,14 +35,14 @@ def test_headless_returns_false_and_hints_once(monkeypatch, caplog):
 
 def test_returns_true_when_captcha_gone(monkeypatch):
     no_sleep(monkeypatch)
-    bot = make_bot(pages=['подтвердите, что вы не робот', 'капча', 'вакансия'])
+    bot = make_bot(pages=['подтвердите, что вы не робот', 'подтвердите, что вы не робот', 'вакансия'])
     assert bot.wait_for_human_captcha() is True
     assert bot.get_visible_page_text.call_count == 3
 
 
 def test_stop_request_aborts_wait(monkeypatch):
     no_sleep(monkeypatch)
-    bot = make_bot(pages=['captcha'] * 10)
+    bot = make_bot(pages=['подтвердите, что вы не робот'] * 10)
     bot.check_interactive_controls.side_effect = [None, 'stop']
     assert bot.wait_for_human_captcha() is False
 
@@ -49,7 +51,7 @@ def test_timeout_returns_false(monkeypatch):
     clock = iter(range(0, 1000, 100))
     monkeypatch.setattr(hh_selenium.time, 'monotonic', lambda: next(clock))
     no_sleep(monkeypatch)
-    bot = make_bot(pages=['captcha'] * 10)
+    bot = make_bot(pages=['подтвердите, что вы не робот'] * 10)
     assert bot.wait_for_human_captcha(timeout_seconds=180) is False
 
 
@@ -102,3 +104,25 @@ def test_captcha_again_after_retry_does_not_loop():
     assert bot.wait_for_human_captcha.call_count == 1
     assert bot.skipped == 1 and bot.errors == 0
     bot.save_applied.assert_not_called()
+
+
+def test_headless_opens_window_and_waits_for_human(monkeypatch):
+    """07.10: в фоне капча — бот открывает окно и ждёт, пока человек решит."""
+    no_sleep(monkeypatch)
+    bot = make_bot(headless=True, pages=['подтвердите, что вы не робот', 'вакансия'])
+    bot.config = {}
+
+    def show():
+        bot.headless = False
+        return True
+    bot.show_browser_for_captcha = show
+    assert bot.wait_for_human_captcha() is True
+
+
+def test_word_captcha_in_vacancy_text_is_not_a_captcha():
+    """07.10 VillaCarte: «CAPTCHA» в описании вакансии принималось за проверку hh."""
+    bot = make_bot(pages=['senior information security engineer: защита сайтов, recaptcha, captcha, waf'])
+    bot.driver.find_elements.return_value = []
+    assert bot.page_has_captcha() is False
+    bot = make_bot(pages=['подтвердите, что вы не робот'])
+    assert bot.page_has_captcha() is True
