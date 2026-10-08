@@ -567,6 +567,58 @@ def test_count_recent_timestamps_uses_rolling_24h_window():
     assert module.count_recent_timestamps([recent, old, None, "bad date"], 24) == 1
 
 
+def test_api_already_applied_does_not_invent_a_fresh_timestamp(tmp_path):
+    module = load_auto_module()
+    bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
+    old = (module.datetime.now() - module.timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
+    bot.applied_vacancies = {"old": old}
+    bot.processed_vacancy_ids = set()
+    bot.applied_today = 0
+    bot.applied_vacancies_file = str(tmp_path / "history.json")
+    removed = []
+    bot.remove_from_cache = lambda vacancy_id: removed.append(vacancy_id)
+
+    bot.save_applied_vacancy("old", count_as_new=False)
+    bot.save_applied_vacancy("unknown-date", count_as_new=False)
+
+    history = json.loads(Path(bot.applied_vacancies_file).read_text(encoding="utf-8"))
+    assert history["old"] == old
+    assert history["unknown-date"] is None
+    assert module.count_recent_timestamps(list(history.values()), 24) == 0
+    assert bot.applied_today == 0
+    assert bot.processed_vacancy_ids == {"old", "unknown-date"}
+    assert removed == ["old", "unknown-date"]
+
+
+def test_default_launcher_uses_hh_limit_not_local_count(monkeypatch, capsys):
+    from types import SimpleNamespace
+    module = load_auto_module()
+    bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
+    bot.applied_vacancies = {}
+    bot.selenium_headless = True
+    commands = []
+    monkeypatch.setattr(module, 'load_config', lambda: {'max_applications': 200})
+    monkeypatch.setattr(module.subprocess, 'run', lambda command, **_kwargs:
+                        commands.append(command) or SimpleNamespace(returncode=0))
+    bot.run_selenium_api_cache()
+    assert '--until-hh-limit' in commands[0]
+    assert '--limit' not in commands[0]
+    assert 'осталось' not in capsys.readouterr().out
+
+
+def test_launcher_preserves_explicit_cap(monkeypatch):
+    from types import SimpleNamespace
+    module = load_auto_module()
+    bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
+    bot.applied_vacancies = {}
+    commands = []
+    monkeypatch.setattr(module, 'load_config', lambda: {'max_applications': 200})
+    monkeypatch.setattr(module.subprocess, 'run', lambda command, **_kwargs:
+                        commands.append(command) or SimpleNamespace(returncode=0))
+    bot.run_selenium_api_cache(20)
+    assert commands[0][-2:] == ['--limit', '20']
+
+
 def test_auto_loader_uses_selenium_history_as_processed_ids(tmp_path):
     module = load_auto_module()
     bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)

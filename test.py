@@ -13,6 +13,7 @@ import subprocess
 from typing import Optional
 
 from db_manager import human_status
+from application_history import count_recent_applications
 
 # Получаем путь к директории скрипта
 from app_paths import CODE_DIR, DATA_DIR, PROFILE_ID
@@ -62,8 +63,8 @@ from terminal_ui import (
     CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE, BOLD, RESET, WHITE, DIM
 )
 from config_manager import (
-    SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS, search_direction_chosen,
-    security_title_by_meaning,
+    SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS, search_direction_chosen, local_application_limit,
+    security_title_by_meaning, commercial_title_keyword,
     find_title_keyword,
     STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS, title_excludes,
     get_active_resume,
@@ -238,6 +239,10 @@ def validate_apply_title(title: object, allow_technical_fallback: bool = True) -
         return False, grade_reason
 
     preset_id = preset.get('id', 'security')
+    if preset_id == 'security':
+        commercial_role = commercial_title_keyword(title)
+        if commercial_role:
+            return False, f"Продажи/пресейл не входят в направление ИБ: {commercial_role}"
     # Список из настроек (правится в меню «Поведение бота»), как и в hh_selenium.
     custom_excludes = title_excludes()
 
@@ -280,17 +285,7 @@ def parse_saved_timestamp(value: object) -> Optional[datetime]:
 
 
 def count_recent_timestamps(timestamps: list[object], window_hours: int) -> int:
-    cutoff = datetime.now() - timedelta(hours=window_hours)
-    count = 0
-
-    for timestamp in timestamps:
-        parsed_timestamp = parse_saved_timestamp(timestamp)
-        if parsed_timestamp is None:
-            continue
-        if parsed_timestamp >= cutoff:
-            count += 1
-
-    return count
+    return count_recent_applications(dict(enumerate(timestamps)), {}, window_hours)
 
 
 def next_slot_free_at(timestamps: list[object], window_hours: int):
@@ -341,6 +336,13 @@ def write_json_atomic(path: str, data: object) -> None:
     with open(temp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(temp_path, path)
+
+
+def selenium_limit_args(limit=DEFAULT_SELENIUM_APPLY_LIMIT):
+    if limit != DEFAULT_SELENIUM_APPLY_LIMIT:
+        return ['--limit', str(limit)]
+    local_limit = local_application_limit(load_config())
+    return ['--limit', str(local_limit)] if local_limit is not None else ['--until-hh-limit']
 
 
 class HHAutoApplicant:
@@ -401,10 +403,7 @@ class HHAutoApplicant:
         selenium_processed_ids = self.load_selenium_processed_vacancy_ids()
         self.processed_vacancy_ids.update(selenium_processed_ids)
         
-        self.applied_today = count_recent_timestamps(
-            list(self.applied_vacancies.values()),
-            APPLICATION_LIMIT_WINDOW_HOURS,
-        )
+        self.refresh_application_count()
         
         print(f"Загружено {len(self.applied_vacancies)} отправленных вакансий из общей истории")
         if selenium_processed_ids:
@@ -412,20 +411,41 @@ class HHAutoApplicant:
         print(f"[-] Всего исключается из поиска: {len(self.processed_vacancy_ids)} вакансий")
         print(f"Откликов за последние 24 часа: {self.applied_today}")
 
-    def load_selenium_processed_vacancy_ids(self):
-        """Возвращает ID вакансий, которые Selenium уже проходил любым конечным статусом."""
+    def load_selenium_history(self):
+        if not getattr(self, 'selenium_applied_vacancies_file', ''):
+            return {}
         try:
             with open(self.selenium_applied_vacancies_file, 'r', encoding='utf-8') as f:
                 selenium_history = json.load(f)
         except FileNotFoundError:
-            return set()
-        except json.JSONDecodeError as e:
+            return {}
+        except (OSError, ValueError) as e:
             log_problem("Не удалось прочитать историю откликов из браузера", e)
-            return set()
+            return {}
 
         if not isinstance(selenium_history, dict):
-            logging.error("История откликов из браузера повреждена — она будет собрана заново")
-            return set()
+            logging.error("История откликов из браузера повреждена — файл оставлен без изменений")
+            return {}
+        return selenium_history
+
+    def refresh_application_count(self):
+        path = getattr(self, 'applied_vacancies_file', '')
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding='utf-8') as stream:
+                    history = json.load(stream)
+                if not isinstance(history, dict):
+                    raise ValueError('Неверный формат общей истории откликов')
+                self.applied_vacancies = history
+            except (OSError, ValueError) as exc:
+                log_problem('Не удалось обновить счётчик из общей истории', exc)
+        self.applied_today = count_recent_applications(
+            self.applied_vacancies, self.load_selenium_history(), APPLICATION_LIMIT_WINDOW_HOURS)
+        return self.applied_today
+
+    def load_selenium_processed_vacancy_ids(self):
+        """Возвращает ID вакансий, которые Selenium уже проходил любым конечным статусом."""
+        selenium_history = self.load_selenium_history()
 
         processed_ids = set()
         for vacancy_id, entry in selenium_history.items():
@@ -451,11 +471,14 @@ class HHAutoApplicant:
         Раньше они тоже увеличивали счётчик откликов за сутки, и дневная норма
         в 200 упиралась заметно раньше реальной.
         """
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.applied_vacancies[str(vacancy_id)] = timestamp
-        self.processed_vacancy_ids.add(str(vacancy_id))
+        vacancy_id = str(vacancy_id)
         if count_as_new:
+            self.applied_vacancies[vacancy_id] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.applied_today += 1
+        else:
+            # Дата старого отклика неизвестна: помним ID, не выдумываем отправку сегодня.
+            self.applied_vacancies.setdefault(vacancy_id, None)
+        self.processed_vacancy_ids.add(vacancy_id)
         
         try:
             write_json_atomic(self.applied_vacancies_file, self.applied_vacancies)
@@ -1819,33 +1842,31 @@ class HHAutoApplicant:
             sys.executable,
             selenium_script,
             '--api-cache',
-            '--limit',
-            str(limit),
         ]
+        limit_args = selenium_limit_args(limit)
+        command.extend(limit_args)
         if getattr(self, 'selenium_headless', False):
             command.append('--headless')
 
-        # Показываем не голый лимит, а остаток и когда освободится место:
-        # иначе непонятно, сколько ещё можно отправить и чего ждать.
-        sent_24h = count_recent_timestamps(
-            list(self.applied_vacancies.values()), APPLICATION_LIMIT_WINDOW_HOURS)
-        left = max(0, limit - sent_24h)
-        free_at = next_slot_free_at(
-            list(self.applied_vacancies.values()), APPLICATION_LIMIT_WINDOW_HOURS)
+        sent_24h = self.refresh_application_count()
 
         print(f"\n{CYAN}{'='*70}{RESET}")
         print(f"{CYAN}{BOLD}Прямая отправка закрыта. Отправляю отклики через браузер.{RESET}")
-        print(f"   За последние сутки отправлено: {GREEN}{sent_24h}{RESET} из {GREEN}{limit}{RESET}"
-              f" — осталось {GREEN}{left}{RESET}")
-        if free_at is not None:
-            when = describe_time_left(free_at)
-            if left:
-                print(f"   {DIM}Счётчик скользящий: первое место освободится {when}{RESET}")
-            else:
-                print(f"   {YELLOW}Лимит исчерпан. Первое место освободится {when}{RESET}")
+        print(f"   Известных отправок за 24 часа: {GREEN}{sent_24h}{RESET}")
+        if '--limit' in limit_args:
+            local_limit = int(limit_args[-1])
+            print(f"   Пользовательский локальный предел: {local_limit}; "
+                  f"доступно по настройке: {max(0, local_limit - sent_24h)}")
+            free_at = next_slot_free_at(
+                list(self.applied_vacancies.values()), APPLICATION_LIMIT_WINDOW_HOURS)
+            if free_at is not None:
+                print(f"   {DIM}По локальной истории первое место освободится {describe_time_left(free_at)}{RESET}")
+        else:
+            print("   Продолжаю до сообщения HH о лимите. Остаток лимита HH неизвестен.")
         print(f"{CYAN}{'='*70}{RESET}\n")
 
         completed_process = subprocess.run(command, cwd=SCRIPT_DIR)
+        self.refresh_application_count()
         if completed_process.returncode != 0:
             raise RuntimeError(f"Отправка через браузер завершилась с кодом {completed_process.returncode}")
 
@@ -1855,15 +1876,16 @@ class HHAutoApplicant:
         print(f"{CYAN}{BOLD}{'='*70}{RESET}")
 
         # ЭТАП 1: Глубокий разбор чатов с отказами и адаптация резюме/ответов
+        chat_blocked_reason = ''
         if not any(arg in sys.argv for arg in ['--no-chat-audit', '--no-chat', '--skip-chat']):
             print(f"\n{CYAN}{BOLD}[1/5] РАЗБОР ПЕРЕПИСКИ С ОТКАЗАМИ И ПРАВКА РЕЗЮМЕ...{RESET}")
-            print(f"  {DIM}Проверяются только отказы. Приглашения и собеседования не затрагиваются.{RESET}")
+            print(f"  {DIM}Проверяются только непрочитанные чаты: причины отказов, вопросы работодателей и внешние интервью.{RESET}")
             try:
-                from rejection_analyzer import RejectionAnalyzer, auto_apply_resume_enabled, analysis_headless_enabled
+                from rejection_analyzer import (RejectionAnalyzer, auto_apply_resume_enabled,
+                                                analysis_headless_enabled, run_chat_analysis_with_recovery)
                 analyzer = RejectionAnalyzer()
                 analyzer.headless = analysis_headless_enabled(analyzer.config, sys.argv)
-                # Флаг или настройка auto_apply_resume (по умолчанию включена): правка
-                # резюме без вопроса, но только навыками, которые есть в профиле.
+                # Навыки и текст «О себе»; успех только после чтения сохранённого резюме.
                 auto_apply_skills = auto_apply_resume_enabled(analyzer.config, sys.argv)
                 analyzer.auto_apply_skills = auto_apply_skills
                 chat_limit = 0
@@ -1876,10 +1898,23 @@ class HHAutoApplicant:
                 if '--all-chats' in sys.argv or '--all-rejections' in sys.argv:
                     chat_limit = 0
                 try:
-                    res = analyzer.run_chat_analysis(limit=chat_limit, use_mock_if_empty=False, fetch_live=True, auto_apply=auto_apply_skills)
+                    res = run_chat_analysis_with_recovery(analyzer, limit=chat_limit, use_mock_if_empty=False,
+                                                          fetch_live=True, auto_apply=auto_apply_skills)
+                    if getattr(analyzer, '_recovery_show_browser', False) is True:
+                        sys.argv[:] = [arg for arg in sys.argv if arg != '--headless']
+                        if '--show-browser' not in sys.argv:
+                            sys.argv.append('--show-browser')
                     if (isinstance(res, dict) and res.get('status') == 'user_closed') or getattr(analyzer, '_user_closed', False):
                         self._user_closed = True
+                    messenger = getattr(analyzer, 'messenger_summary', {})
+                    if messenger.get('blocked') or (isinstance(res, dict) and res.get('status') == 'messenger_blocked'):
+                        chat_blocked_reason = messenger.get('reason') or 'Не удалось подтвердить открытие чатов HH'
+                    if isinstance(res, dict) and res.get('status') == 'resume_update_blocked':
+                        chat_blocked_reason = (res.get('resume_update') or {}).get('reason') or 'Правка резюме не подтверждена'
                 finally:
+                    messenger = getattr(analyzer, 'messenger_summary', {})
+                    if isinstance(messenger, dict) and messenger.get('blocked'):
+                        chat_blocked_reason = messenger.get('reason') or 'Не удалось подтвердить открытие чатов HH'
                     if getattr(analyzer, '_user_closed', False):
                         self._user_closed = True
                     analyzer.close()
@@ -1890,6 +1925,11 @@ class HHAutoApplicant:
                     return
             except Exception as e:
                 log_problem("Этап разбора переписки пропущен", e, logging.WARNING)
+
+        if chat_blocked_reason:
+            print(f"\n{RED}[СТОП] {chat_blocked_reason}. Полный цикл остановлен; "
+                  f"поиск и отправка откликов не запущены.{RESET}\n")
+            return
 
         if getattr(self, '_user_closed', False):
             print(f"\n{RED}[СТОП] Пользователь закрыл браузер. Выполнение прервано.{RESET}\n")
@@ -1924,7 +1964,6 @@ class HHAutoApplicant:
             try:
                 from resume_updater import HHResumeUpdater
                 from rejection_analyzer import analysis_headless_enabled
-                from config_manager import load_config
                 # Профиль Chrome один на всех, два драйвера на нём дерутся,
                 # поэтому свой драйвер закрываем здесь же, до следующего этапа.
                 updater = HHResumeUpdater(resume_id=self.resume_id,
@@ -1969,7 +2008,7 @@ class HHAutoApplicant:
             return
         
         print(f"\n{GREEN}[OK]{RESET} К обработке: {BOLD}{len(vacancies)}{RESET} вакансий (отсортированы по приоритету)")
-        print(f"Откликов за последние 24 часа: {GREEN}{self.applied_today}{RESET}/{self.max_applications_per_day}")
+        print(f"Известных откликов за последние 24 часа: {GREEN}{self.applied_today}{RESET}")
         
         print(f"\n{CYAN}{BOLD}ТОП вакансии (первые будут обработаны):{RESET}")
         for i, vacancy in enumerate(vacancies[:15], 1):
@@ -2027,11 +2066,12 @@ class HHAutoApplicant:
         processed = 0
         error_stats = {}
         daily_limit_reached = False
+        local_limit = local_application_limit(load_config())
         priority_stats = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
         
         for vacancy in vacancies:
-            if daily_limit_reached or self.applied_today >= self.max_applications_per_day:
-                print(f"\n[ПАУЗА] Достигнут лимит за 24 часа ({self.max_applications_per_day})")
+            if daily_limit_reached or (local_limit is not None and self.applied_today >= local_limit):
+                print("\n[СТОП] HH сообщил лимит либо достигнут пользовательский локальный предел")
                 break
             
             vacancy_id = vacancy.get('id')
@@ -2133,7 +2173,21 @@ def choose_ai_provider() -> None:
     for n, row in enumerate(rows, 2):
         suffix = ' (и следом Groq)' if row['key'] == 'gemini' else ''
         print(f"  [{n}] Первым: {row['name']}{suffix}")
+    # Сервис целиком (все его модели, лучшие по замерам впереди): «Antigravity всегда первый».
+    from ai_assistant import AIAssistant
+    probe = AIAssistant.__new__(AIAssistant)
+    probe.ai_config = ai
+    services = [str(pr.get('name')) for pr in probe._compat_providers() if pr.get('name')]
+    for k, name in enumerate(services, len(rows) + 2):
+        print(f"  [{k}] Первым: сервис {name} целиком")
     ans = input("Номер (Enter — оставить как есть): ").strip()
+    if ans.isdigit() and len(rows) + 2 <= int(ans) < len(rows) + 2 + len(services):
+        name = services[int(ans) - len(rows) - 2]
+        ai['primary_ai'] = name
+        ai['enabled'] = True
+        save_config(cfg)
+        print(f"{GREEN}Первым будет сервис {name}. Если он не ответит, пишут следующие.{RESET}")
+        return
     if ans == '1':
         ai['primary_ai'] = 'auto'
         print(f"{GREEN}Режим: Авто{RESET}")
@@ -2230,6 +2284,7 @@ MENU_GROUPS = {
         (('5',), BLUE, "Статистика откликов и конверсия"),
     )),
     'p': ("РЕЗЮМЕ И ПРОФИЛЬ", (
+        (('v',), CYAN, "Проверить редактор «О себе» без сохранения"),
         (('b', 'и'), GREEN, "Поднять резюме в поиске (бесплатно, раз в 4 часа)"),
         (('w', 'ц'), CYAN, "Мой профиль и статус аккаунта"),
         (('r', 'к'), WHITE, "Выбрать целевое резюме из аккаунта hh.ru"),
@@ -2381,19 +2436,16 @@ def main():
                     print(line)
                 continue
             elif choice in ('1', ''):
-                if not any(arg in sys.argv for arg in ('--auto', '--yes', '-y', '--full-cycle')):
-                    from rejection_analyzer import ask_browser_mode
-                    mode_flag = ask_browser_mode(load_config(), sys.argv)
-                    if mode_flag:
-                        sys.argv.append(mode_flag)
                 break
             elif choice == '2':
                 selenium_script = os.path.join(CODE_DIR, 'hh_selenium.py')
-                subprocess.run([sys.executable, selenium_script, '--api-cache', '--limit', str(selenium_apply_limit)], cwd=SCRIPT_DIR)
+                subprocess.run([sys.executable, selenium_script, '--api-cache']
+                               + selenium_limit_args(selenium_apply_limit), cwd=SCRIPT_DIR)
                 continue
             elif choice == '3':
                 selenium_script = os.path.join(CODE_DIR, 'hh_selenium.py')
-                subprocess.run([sys.executable, selenium_script, '--api-cache', '--headless', '--limit', str(selenium_apply_limit)], cwd=SCRIPT_DIR)
+                subprocess.run([sys.executable, selenium_script, '--api-cache', '--headless']
+                               + selenium_limit_args(selenium_apply_limit), cwd=SCRIPT_DIR)
                 continue
             elif choice == '4':
                 subprocess.run([sys.executable, os.path.join(CODE_DIR, 'rejection_analyzer.py'), '--limit', '100'], cwd=SCRIPT_DIR)
@@ -2407,6 +2459,10 @@ def main():
             elif choice in ('h', 'р'):
                 subprocess.run([sys.executable, os.path.join(CODE_DIR, 'resume_updater.py'), '--import-profile'],
                                cwd=SCRIPT_DIR)
+                continue
+            elif choice == 'v':
+                subprocess.run([sys.executable, os.path.join(CODE_DIR, 'resume_updater.py'),
+                                '--check-about', '--show-browser'], cwd=SCRIPT_DIR)
                 continue
             elif choice in ('b', 'и'):
                 subprocess.run([sys.executable, os.path.join(CODE_DIR, 'resume_updater.py'), '--bump'], cwd=SCRIPT_DIR)

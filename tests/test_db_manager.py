@@ -113,11 +113,10 @@ def test_auto_fix_closed_loop(temp_db):
         skills_list=["Kubernetes", "Docker", "Python"]
     )
 
-    # 4. Проверяем, что ИИ автоматически подмешал выученный навык 'Kubernetes' в письмо!
-    # Регистр не проверяем: навык хранится в базе в канонической (строчной)
-    # форме и попадает в письмо как есть — «стек: kubernetes, ...». Это
-    # косметический дефект кода, а не контракт, и чинить его тестом нельзя.
-    assert "kubernetes" in cover_letter.lower()
+    # 4. Навык из отказа в письмо не попадает, пока его нет в профиле кандидата:
+    # 05.10 письма уходили со «стек: CI/CD, Ansible, SAST, Terraform», которых у
+    # кандидата нет. Чему учит отказ, решает правка профиля, а не шаблон письма.
+    assert "kubernetes" not in cover_letter.lower()
 
 
 def test_guessed_reason_is_not_counted_as_confirmed(temp_db):

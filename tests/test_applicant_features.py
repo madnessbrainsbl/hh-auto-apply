@@ -164,7 +164,8 @@ else:
 """
     for name in ('first', 'second'):
         env = {**os.environ, 'HH_DATA_DIR': str(tmp_path), 'HH_PROFILE_ID': name}
-        result = subprocess.run([sys.executable, '-c', code], cwd=root, env=env, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([sys.executable, '-c', code], cwd=root, env=env,
+                                capture_output=True, text=True, encoding='utf-8', timeout=30)
         assert result.returncode == 0, result.stderr
     for name in ('first', 'second'):
         config = json.loads((tmp_path / 'profiles' / name / 'hh_selenium_config.json').read_text(encoding='utf-8'))

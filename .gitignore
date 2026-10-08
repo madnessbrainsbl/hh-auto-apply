@@ -83,10 +83,16 @@ htmlcov/
 ai_stats.json
 bump_schedule.json
 rejected_chats_cache.json
+chat_actions.json
+chat_followups.md
+.chat_diagnostics/
+.apply_diagnostics/
 email_outreach_log.json
 chrome_window_geometry.json
 resume_text.txt
 about_backup_*.txt
+resume_adaptation_*.json
+.resume_revisions/
 chat_rejection_analysis_report.md
 chat_rejection_analysis_report.html
 habr_article.md
@@ -95,3 +101,5 @@ resume_dump.json
 vacancies_with_tests.json
 screenshoot/
 .agents/
+
+.claude/

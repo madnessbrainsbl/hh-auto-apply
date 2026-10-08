@@ -34,6 +34,7 @@ STATUS_LABELS = {
     'discarded': 'отказ работодателя',
     'denied': 'работодатель не принимает отклики',
     'unknown': 'ответа пока нет',
+    'pending_confirmation': 'отправка не подтверждена: проверить на HH, не повторять автоматически',
     # причины пропуска вакансии
     'already_applied': 'уже откликались',
     'excluded_filter': 'не подошла по вашим настройкам поиска',
@@ -173,6 +174,9 @@ class DatabaseManager:
                 )
             """)
 
+            if 'resume_id' not in {r['name'] for r in cursor.execute('PRAGMA table_info(applications)')}:
+                cursor.execute("ALTER TABLE applications ADD COLUMN resume_id TEXT DEFAULT ''")
+
             # 2. Таблица детального анализа отказов
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS rejections (
@@ -263,7 +267,8 @@ class DatabaseManager:
         questions_count: int = 0,
         ats_score: int = 0,
         detected_skills: Optional[List[str]] = None,
-        status: str = 'sent'
+        status: str = 'sent',
+        resume_id: str = ''
     ) -> bool:
         """Сохраняет или обновляет запись об отклике."""
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -275,8 +280,8 @@ class DatabaseManager:
                 cursor.execute("""
                     INSERT INTO applications (
                         vacancy_id, title, company, url, applied_at,
-                        cover_letter, questions_count, ats_score, detected_skills, status, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        cover_letter, questions_count, ats_score, detected_skills, status, last_updated, resume_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(vacancy_id) DO UPDATE SET
                         title = excluded.title,
                         company = COALESCE(NULLIF(excluded.company, ''), applications.company),
@@ -286,10 +291,11 @@ class DatabaseManager:
                         ats_score = MAX(applications.ats_score, excluded.ats_score),
                         detected_skills = COALESCE(NULLIF(excluded.detected_skills, '[]'), applications.detected_skills),
                         status = excluded.status,
-                        last_updated = excluded.last_updated
+                        last_updated = excluded.last_updated,
+                        resume_id = COALESCE(NULLIF(applications.resume_id, ''), excluded.resume_id)
                 """, (
                     str(vacancy_id), title, company, url, now,
-                    cover_letter, questions_count, ats_score, skills_json, status, now
+                    cover_letter, questions_count, ats_score, skills_json, status, now, resume_id
                 ))
                 conn.commit()
                 return True
@@ -476,6 +482,28 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Не удалось загрузить выученные навыки: {explain_error(e)}")
             return []
+
+    def update_application_status(self, vacancy_id: str, status: str) -> None:
+        if status not in ('invited', 'discarded'):
+            raise ValueError('Неизвестный исход отклика')
+        with self._get_connection() as conn:
+            conn.execute('UPDATE applications SET status = ?, last_updated = ? WHERE vacancy_id = ?',
+                         (status, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), vacancy_id))
+
+    def get_resume_outcomes(self, resume_id: str, since: str) -> Dict[str, Any]:
+        """Когорта после правки; старым откликам резюме задним числом не приписываем."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                'SELECT status, COUNT(*) AS n FROM applications '
+                'WHERE resume_id = ? AND datetime(applied_at) >= datetime(?) '
+                'GROUP BY status', (resume_id, since)).fetchall()
+        counts = {r['status']: r['n'] for r in rows}
+        invited, discarded = counts.get('invited', 0), counts.get('discarded', 0)
+        total = sum(counts.values())
+        closed = invited + discarded
+        return {'sent': total, 'invited': invited, 'discarded': discarded,
+                'pending': total - closed,
+                'rejection_rate': round(discarded * 100 / closed, 1) if closed else None}
 
     def get_stats(self) -> Dict[str, Any]:
         """Возвращает сводную статистику откликов, отказов и прогресса конверсии к цели 8/10."""

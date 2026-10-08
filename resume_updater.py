@@ -9,8 +9,10 @@ import sys
 import time
 import json
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
+from urllib.parse import urlsplit
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -58,10 +60,10 @@ try:
 except Exception:
     pass
 file_handler.setLevel(logging.DEBUG)
-logging.basicConfig(
-    level=logging.DEBUG,
-    handlers=[file_handler, console_handler]
-)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+logger.propagate = False
 
 # Навыки с наивысшим приоритетом (уровень: Продвинутый)
 ADVANCED_SKILLS = {
@@ -132,6 +134,34 @@ def profile_grounded_skills(skills: Optional[List[str]],
             _re.search(r'(?<!\w)' + _re.escape(v) + r'(?!\w)', text) for v in variants)
         (grounded if found else advice).append(name)
     return grounded, advice
+
+
+def resume_revision_path(resume_id: str) -> str:
+    key = hashlib.sha256(str(resume_id).encode('utf-8')).hexdigest()[:16]
+    return os.path.join(SCRIPT_DIR, f'resume_adaptation_{key}.json')
+
+
+def load_resume_revision(resume_id: str) -> Dict[str, Any]:
+    try:
+        with open(resume_revision_path(resume_id), encoding='utf-8') as f:
+            row = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(row, dict) or row.get('resume_id') != resume_id:
+        raise ValueError('Повреждена запись правки целевого резюме')
+    if (row.get('status') not in ('pending', 'verified', 'not_sent')
+            or not isinstance(row.get('after'), str) or not isinstance(row.get('before'), str)
+            or not isinstance(row.get('created_at'), str)):
+        raise ValueError('В записи правки резюме нет исходного или нового текста')
+    datetime.fromisoformat(row['created_at'])
+    return row
+
+
+def save_resume_revision(row: Dict[str, Any]) -> None:
+    path = resume_revision_path(row['resume_id'])
+    with open(path + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump(row, f, ensure_ascii=False, indent=2)
+    os.replace(path + '.tmp', path)
 
 
 def is_dead_session_message(message: Any) -> bool:
@@ -354,21 +384,8 @@ class HHResumeUpdater:
 
     def _cleanup_profile_processes(self, profile_dir: str):
         """Завершает зависшие процессы Chrome, блокирующие chrome_profile."""
-        try:
-            import psutil
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    name = proc.info.get('name') or ''
-                    if 'chrome' in name.lower():
-                        cmdline = ' '.join(proc.info.get('cmdline') or [])
-                        if any(arg.lower().strip(chr(34)) == f'--user-data-dir={profile_dir}'.lower()
-                               for arg in (proc.info.get('cmdline') or [])):
-                            proc.kill()
-                except Exception:
-                    pass
-            time.sleep(1.0)
-        except Exception:
-            pass
+        from terminal_ui import kill_profile_chrome
+        kill_profile_chrome(profile_dir)
 
     def is_driver_alive(self) -> bool:
         """Проверяет, жив ли сеанс браузера."""
@@ -409,6 +426,8 @@ class HHResumeUpdater:
             options.binary_location = os.environ['CHROME_BINARY']
         if self.headless:
             options.add_argument('--headless=new')
+        # HH может не завершать load даже при уже доступной форме.
+        options.page_load_strategy = 'eager'
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
@@ -453,6 +472,7 @@ class HHResumeUpdater:
             else:
                 self.driver = webdriver.Chrome(options=options)
 
+            self.driver.set_page_load_timeout(30)
             self._restore_window_geometry()
             try:
                 from terminal_ui import ensure_hh_login, ensure_russian_interface
@@ -476,6 +496,7 @@ class HHResumeUpdater:
                         self.driver = webdriver.Chrome(service=service, options=options)
                     else:
                         self.driver = webdriver.Chrome(options=options)
+                    self.driver.set_page_load_timeout(30)
                     self._restore_window_geometry()
                     try:
                         from terminal_ui import ensure_hh_login, ensure_russian_interface
@@ -956,10 +977,145 @@ class HHResumeUpdater:
             logger.debug(f"Техническая причина: {e}")
             return False, f"Ошибка добавления навыков: {e}", added
 
+    def _is_about_editor(self) -> bool:
+        if not self.driver:
+            return False
+        try:
+            url = urlsplit(str(self.driver.current_url))
+            host = url.hostname or ''
+            return (url.scheme == 'https' and url.port in (None, 443)
+                    and (host == 'hh.ru' or host.endswith('.hh.ru'))
+                    and url.path.rstrip('/') == f'/resume/edit/{self.resume_id}/about')
+        except ValueError:
+            return False
+
+    def read_about_section(self) -> Optional[str]:
+        """None означает, что редактор не прочитан, а не пустое «О себе»."""
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.common.exceptions import TimeoutException
+        if not self.resume_id or getattr(self, '_user_closed', False):
+            return None
+        try:
+            if not self.is_driver_alive() and not self._init_driver():
+                return None
+            url = f'https://hh.ru/resume/edit/{self.resume_id}/about'
+            self.driver.set_page_load_timeout(30)
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                logger.info('Загрузка страницы не завершилась за 30 с; проверяю, доступна ли форма «О себе».')
+            field = WebDriverWait(self.driver, 15).until(
+                lambda d: next((e for e in d.find_elements(
+                    By.CSS_SELECTOR, 'textarea[data-qa="resume-editor-about"]')
+                    if e.is_displayed() and e.is_enabled()), None))
+            if not self._is_about_editor():
+                raise ValueError('Открылась не страница редактора выбранного резюме')
+            return field.get_attribute('value') or ''
+        except Exception as e:
+            logger.warning('Не прочитан редактор «О себе»: %s. Проверка без сохранения: [P] → [V].', explain_error(e))
+            try:
+                directory = os.path.join(SCRIPT_DIR, '.resume_revisions')
+                os.makedirs(directory, exist_ok=True)
+                path = os.path.join(directory, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-editor')
+                metadata = self.driver.execute_script("""
+                    return {host: location.hostname, path: location.pathname, hasFragment: !!location.hash,
+                        fields: [...document.querySelectorAll('textarea,input,[contenteditable]')]
+                        .map(e => ({tag:e.tagName,qa:e.getAttribute('data-qa'),name:e.getAttribute('name')})),
+                        editLinks:[...document.querySelectorAll('a[href*="/resume/"]')]
+                        .map(e => new URL(e.href).pathname)};
+                """)
+                with open(path + '.json', 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+                self.driver.save_screenshot(path + '.png')
+                logger.warning('Диагностика редактора сохранена: %s', path)
+            except Exception:
+                logger.debug('Снимок редактора недоступен', exc_info=True)
+            logger.debug('Сбой чтения редактора', exc_info=True)
+            return None
+
+    def about_draft_matches(self, expected: str) -> bool:
+        from selenium.webdriver.common.by import By
+        if not self._is_about_editor():
+            return True
+        fields = [e for e in self.driver.find_elements(By.CSS_SELECTOR, 'textarea[data-qa="resume-editor-about"]')
+                  if e.is_displayed()]
+        return len(fields) == 1 and fields[0].get_attribute('value') == expected
+
+    def replace_about_section(self, text: str, expected_current: str,
+                              feedback: Dict[str, Any]) -> Tuple[bool, str]:
+        """Одна правка, резервная копия до ввода, успех только после чтения HH."""
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+        from ai_assistant import clean_public_text
+        self._about_changed = False
+        if not isinstance(text, str) or not 100 <= len(text.strip()) <= 5000:
+            return False, 'Новый текст «О себе» пустой или неподходящей длины'
+        text = text.strip()
+        if clean_public_text(text, feedback.get('profile')) != text:
+            return False, 'В тексте остались зарплата или хронология работы'
+        if not self.about_draft_matches(expected_current):
+            return False, 'В редакторе появился другой текст; ручной черновик сохранён, запись отменена'
+        current = self.read_about_section()
+        if current is None:
+            return False, 'Редактор целевого резюме не прочитан; ничего не записано'
+        previous = load_resume_revision(self.resume_id)
+        if previous.get('status') == 'pending':
+            if current != previous.get('after'):
+                return False, 'Предыдущее сохранение не подтверждено: проверьте «О себе» на HH и резервную копию'
+            previous.update(status='verified', verified_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            save_resume_revision(previous)
+            return True, 'Предыдущее сохранение подтверждено; новая правка отложена'
+        if current != expected_current:
+            return False, '«О себе» изменилось после анализа; свежий текст не перезаписываю'
+        if current == text and previous.get('status') == 'verified':
+            previous.update(selection_guidance=feedback.get('selection_guidance', previous.get('selection_guidance', [])),
+                            reason=feedback.get('reason', previous.get('reason', '')))
+            save_resume_revision(previous)
+            return True, '«О себе» уже соответствует плану, менять не потребовалось'
+        row = {
+            'resume_id': self.resume_id, 'status': 'pending',
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'before': current, 'after': text,
+            'target_title': feedback.get('target_title', ''),
+            'selection_guidance': feedback.get('selection_guidance', []),
+            'analysis_count': feedback.get('analysis_count', 0),
+            'reason': feedback.get('reason', ''),
+        }
+        try:
+            backup_dir = os.path.join(SCRIPT_DIR, '.resume_revisions')
+            os.makedirs(backup_dir, exist_ok=True)
+            backup = os.path.join(backup_dir, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.json')
+            with open(backup, 'x', encoding='utf-8') as f:
+                json.dump(row, f, ensure_ascii=False, indent=2)
+            row['backup'] = backup
+            save_resume_revision(row)
+            if current != text:
+                field = self.driver.find_element(By.CSS_SELECTOR, 'textarea[data-qa="resume-editor-about"]')
+                field.send_keys(Keys.CONTROL, 'a')
+                field.send_keys(text)
+                if field.get_attribute('value') != text:
+                    row['status'] = 'not_sent'
+                    save_resume_revision(row)
+                    return False, 'В поле другой текст; сохранение отменено, резервная копия сохранена'
+                button = self.driver.find_element(By.CSS_SELECTOR, '[data-qa="resume-partial-edit-save"]')
+                if not self.real_click(button):
+                    return False, 'Сохранение не подтверждено; повторный клик автоматически запрещён'
+                time.sleep(2)
+                if self.read_about_section() != text:
+                    return False, 'HH не подтвердил точный текст после сохранения; резервная копия сохранена'
+            row.update(status='verified', verified_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            save_resume_revision(row)
+            self._about_changed = current != text
+            return True, 'Текст «О себе» сохранён и перечитан на HH' if self._about_changed else 'Текст уже соответствует плану'
+        except Exception as e:
+            logger.debug('Правка «О себе» не подтверждена: %s', explain_error(e))
+            return False, 'Правка «О себе» не подтверждена; проверьте редактор HH и локальную резервную копию'
+
     def update_about_section(self, deficit_skills: Optional[List[str]] = None) -> Tuple[bool, str]:
         """
-        Обогащает блок «Обо мне» ключевыми словами и стандартами (КриптоПро, СКЗИ, ГОСТ, Active Directory, MaxPatrol),
-        гарантируя 100% прохождение ATS-фильтров корпоративных и государственных заказчиков.
+        Ручной устаревший режим дополнения ключевыми словами.
+        Автоматический разбор использует replace_about_section с текстом из профиля.
         """
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
@@ -1362,6 +1518,27 @@ class HHResumeUpdater:
             logger.debug(f"Клик не прошёл: {e}")
             return False
 
+    def _open_resume_page(self):
+        from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        try:
+            self.driver.get(f'https://hh.ru/resume/{self.resume_id}')
+        except TimeoutException:
+            # Тайм-аут ресурсов не означает, что сама карточка резюме недоступна.
+            def ready(driver):
+                url = urlsplit(str(driver.current_url))
+                host = url.hostname or ''
+                if not (url.scheme == 'https' and url.port in (None, 443)
+                        and (host == 'hh.ru' or host.endswith('.hh.ru'))
+                        and url.path.rstrip('/') == f'/resume/{self.resume_id}'):
+                    raise ValueError('Открылась не страница выбранного резюме')
+                return any(e.is_displayed() and e.text.strip() for e in driver.find_elements(
+                    By.CSS_SELECTOR, '[data-qa="resume-block-title-position"]'))
+            WebDriverWait(self.driver, 10, poll_frequency=0.2,
+                          ignored_exceptions=(StaleElementReferenceException,)).until(ready)
+            logger.info('Загрузка ресурсов превысила тайм-аут, но выбранное резюме доступно; продолжаю.')
+
     def promote_resume(self) -> Dict[str, Any]:
         """Продвижение резюме: видимость -> статус поиска -> поднятие -> отчёт о полноте.
 
@@ -1379,7 +1556,7 @@ class HHResumeUpdater:
 
         from selenium.webdriver.common.by import By
         try:
-            self.driver.get(f"https://hh.ru/resume/{self.resume_id}")
+            self._open_resume_page()
             time.sleep(3.0)
             page = (self.driver.execute_script("return document.body.innerText") or '')
             low = page.lower()
@@ -1403,12 +1580,7 @@ class HHResumeUpdater:
             # искать его там бесполезно — проверка всегда кричала о пустоте при
             # заполненном блоке. Читаем поле прямо в редакторе.
             try:
-                self.driver.get(f"https://hh.ru/resume/edit/{self.resume_id}/about")
-                time.sleep(2.5)
-                about_text = self.driver.execute_script(
-                    "const e=document.querySelector('[data-qa=\"resume-editor-about\"]');"
-                    "return e ? (e.value || '') : null;"
-                )
+                about_text = self.read_about_section()
                 if about_text is not None and len(about_text.strip()) < 100:
                     result['gaps'].append('О себе')
             except Exception as e:
@@ -1582,11 +1754,10 @@ class HHResumeUpdater:
             return False, "Не удалось инициализировать браузер для поднятия резюме"
 
         from selenium.webdriver.common.by import By
-        resume_url = f"https://hh.ru/resume/{self.resume_id}"
         logger.info("Переход в целевое резюме для поднятия в поиске...")
 
         try:
-            self.driver.get(resume_url)
+            self._open_resume_page()
             time.sleep(2.0)
 
             # Ищем кнопку "Поднять в поиске" / "Обновить дату"
@@ -1730,6 +1901,8 @@ def run_resume_updater_cli():
     parser = argparse.ArgumentParser(description="Автоматическое обновление навыков и параметров резюме на HH.ru")
     parser.add_argument("--resume-id", default=DEFAULT_RESUME_ID, help="ID резюме на hh.ru")
     parser.add_argument("--status", action="store_true", help="Проверить текущее состояние резюме")
+    parser.add_argument("--check-about", action="store_true", help="Прочитать редактор «О себе» без сохранения")
+    parser.add_argument("--show-browser", action="store_true", help="Показать окно браузера")
     parser.add_argument("--apply", action="store_true", help="Автоматически активировать и сохранить все навыки")
     parser.add_argument("--sync-adaptive", action="store_true", help="Внедрить адаптивные навыки из базы отказов")
     parser.add_argument("--full-update", action="store_true", help="Комплексная модернизация (навыки, уровни, блок Обо мне)")
@@ -1746,9 +1919,14 @@ def run_resume_updater_cli():
     parser.add_argument("--headless", action="store_true", default=True, help="Запуск в фоновом режиме")
 
     args = parser.parse_args()
-    updater = HHResumeUpdater(resume_id=args.resume_id, headless=args.headless)
+    updater = HHResumeUpdater(resume_id=args.resume_id, headless=args.headless and not args.show_browser)
 
     try:
+        if args.check_about:
+            about = updater.read_about_section()
+            print(f'[OK] Редактор «О себе» прочитан: {len(about)} символов. Ничего не сохранено.'
+                  if about is not None else '[X] Редактор недоступен. Проверьте вход [N] → [L] и выбранное резюме [P] → [R].')
+            return
         if args.watch_bump:
             updater.watch_and_bump(every_hours=args.every_hours)
             return

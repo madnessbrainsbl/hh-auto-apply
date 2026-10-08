@@ -145,6 +145,7 @@ def main(argv=None):
                     bot.close_driver()
             if args.limit is not None:
                 bot.config['max_applications'] = args.limit
+                bot.config['stop_at_local_limit'] = True
             def interrupt(*_):
                 raise KeyboardInterrupt
             signal.signal(signal.SIGTERM, interrupt)

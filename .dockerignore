@@ -8,10 +8,14 @@
 !hh_selenium.py
 !config_manager.py
 !ai_assistant.py
+!cli_models.py
 !db_manager.py
 !email_outreach.py
 !resume_updater.py
 !rejection_analyzer.py
+!chat_workflow.py
 !template_engine.py
 !terminal_ui.py
 !hh_selenium_config.example.json
+
+!application_history.py
