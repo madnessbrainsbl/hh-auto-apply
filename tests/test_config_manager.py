@@ -39,6 +39,22 @@ def test_load_and_save_config(tmp_path):
         assert cfg_reloaded["resume_title"] == "Test Senior Python Developer"
 
 
+def test_behavior_menu_does_not_offer_salary_override(monkeypatch, capsys):
+    cfg = {'chat_autoreply': {'salary_answer': 'От 350 000 руб.'}}
+    monkeypatch.setattr(config_manager, 'load_config', lambda: cfg)
+    monkeypatch.setattr(config_manager, 'get_active_preset', lambda: {'id': 'custom'})
+    monkeypatch.setattr('builtins.input', lambda _: '0')
+    save = MagicMock()
+    monkeypatch.setattr(config_manager, 'save_config', save)
+
+    config_manager.edit_bot_behavior()
+    output = capsys.readouterr().out
+    assert '350 000' not in output
+    assert 'Ответ на прямой вопрос о зарплате в чате' not in output
+    assert cfg['chat_autoreply']['salary_answer'] == 'От 350 000 руб.'
+    save.assert_not_called()
+
+
 def test_get_and_set_active_resume(tmp_path):
     temp_config_path = str(tmp_path / "test_config.json")
     with patch('config_manager.CONFIG_FILE', temp_config_path):

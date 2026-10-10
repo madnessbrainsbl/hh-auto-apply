@@ -17,6 +17,7 @@ def bot(tmp_path, monkeypatch):
     analyzer.config = {'chat_autoreply': {'enabled': True, 'max_per_run': 0}}
     analyzer.ai_assistant = SimpleNamespace(enabled=False, candidate_profile={})
     analyzer.FOLLOWUP_WAIT_SECONDS = 0   # ожидание ответа работодателя проверяется отдельным тестом
+    analyzer.BOT_FOLLOWUP_WAIT_SECONDS = 0
     analyzer.headless = True
     analyzer.driver = SimpleNamespace(current_url='https://hh.ru/chat', window_handles=['main'])
     analyzer._user_closed = False
@@ -34,6 +35,37 @@ def snapshot(message='К сожалению, сейчас не готовы пр
         'chat_url': 'https://hh.ru/chat/42', 'vacancy_url': 'https://hh.ru/vacancy/123',
         'messages': [{'text': message, 'isOut': False, 'id': 'm1'}],
     }
+
+
+@pytest.mark.parametrize('incoming', [
+    'Какие у вас зарплатные ожидания?',
+    'Давайте созвонимся. Какие у вас финансовые ожидания?',
+    'Расскажите про опыт с Kubernetes. Какие у вас зарплатные ожидания?',
+])
+def test_salary_setting_cannot_leak_into_chat_reply(bot, incoming):
+    from ai_assistant import SALARY_ANSWER
+
+    bot.config['chat_autoreply']['salary_answer'] = 'Мои ожидания — от 350 000 руб.'
+    bot.compose_chat_reply = Mock(return_value='Применял Kubernetes для контейнерных сервисов.')
+    bot._handle_chat(snapshot(incoming))
+    bot.send_chat_reply.assert_called_once()
+    reply = bot.send_chat_reply.call_args.args[0]
+    assert '350' not in reply and 'руб' not in reply
+    assert SALARY_ANSWER in reply
+    if 'Kubernetes' in incoming:
+        assert 'Kubernetes' in reply
+        assert 'зарплат' not in bot.compose_chat_reply.call_args.args[0]
+
+
+@pytest.mark.parametrize('prefix', ['', 'Применял Kubernetes.\n\n'])
+def test_chat_sender_rejects_salary_even_if_it_matches_config(bot, prefix):
+    salary = 'Мои ожидания — от 350 000 руб.'
+    bot.config['chat_autoreply']['salary_answer'] = salary
+    bot._read_open_chat = Mock(side_effect=AssertionError('Must reject before touching the browser'))
+
+    assert RejectionAnalyzer.send_chat_reply(bot, prefix + salary) is False
+    assert bot._chat_send_failure == 'restricted_content'
+    bot._read_open_chat.assert_not_called()
 
 
 def recruiter_snapshot(question='Готовы ли вы оформить допуск по третьей форме?', options=('Да', 'Нет')):
@@ -79,13 +111,49 @@ def test_unconfirmed_recruiter_click_is_not_repeated_or_replaced_with_text(bot):
     bot.ai_assistant = SimpleNamespace(answer_question=Mock(return_value=0))
     bot.compose_chat_reply = Mock()
     bot._click_chat_choice = Mock(return_value=False)
+    bot._capture_chat_diagnostics = Mock()
     chat = recruiter_snapshot()
     bot._handle_chat(chat)
     bot._handle_chat(chat)
     bot._click_chat_choice.assert_called_once()
+    bot._capture_chat_diagnostics.assert_called_once_with('choice')
     assert next(iter(bot._load_chat_actions().values()))['status'] == 'pending_confirmation'
     bot.compose_chat_reply.assert_not_called()
     bot.send_chat_reply.assert_not_called()
+
+
+@pytest.mark.parametrize('error_name', [
+    'StaleElementReferenceException', 'ElementClickInterceptedException', 'ElementNotInteractableException',
+])
+def test_recruiter_recovers_only_when_native_click_was_not_dispatched(bot, error_name):
+    from selenium.common import exceptions
+
+    chat = recruiter_snapshot()
+    button = Mock()
+    button.click.side_effect = [getattr(exceptions, error_name)(), None]
+    bot.driver.execute_script = Mock(return_value=button)
+    bot._read_open_chat = Mock(return_value=recruiter_snapshot('Готовы работать удалённо?'))
+
+    assert bot._send_chat_action('choice', chat, 'Да', choice=chat['choice_options'][0])
+    assert button.click.call_count == 2
+    assert bot.driver.execute_script.call_count == 2
+    assert next(iter(bot._load_chat_actions().values()))['status'] == 'sent'
+
+
+def test_recruiter_uncertain_native_click_is_confirmed_without_clicking_again(bot):
+    from selenium.common.exceptions import TimeoutException
+
+    chat = recruiter_snapshot()
+    button = Mock()
+    button.click.side_effect = TimeoutException()
+    bot.driver.execute_script = Mock(return_value=button)
+    bot._read_open_chat = Mock(return_value=chat)
+    bot._capture_chat_diagnostics = Mock()
+
+    assert not bot._send_chat_action('choice', chat, 'Да', choice=chat['choice_options'][0])
+    assert not bot._send_chat_action('choice', chat, 'Да', choice=chat['choice_options'][0])
+    button.click.assert_called_once()
+    assert next(iter(bot._load_chat_actions().values()))['status'] == 'pending_confirmation'
 
 
 @pytest.mark.parametrize('index', [None, 'Да', 10, True])
@@ -304,6 +372,98 @@ def test_repeated_question_deduplicated_but_new_question_answered(bot):
     assert bot.send_chat_reply.call_count == 2
 
 
+@pytest.mark.parametrize('message', [
+    'Рассмотрим ваше резюме. Если навыки и опыт подойдут для позиции, мы свяжемся с вами.',
+    'Работа предусмотрена в офисе в Нижнем Новгороде, удалённый формат отсутствует.',
+])
+def test_incoming_statements_are_answered_once(bot, message):
+    bot.compose_chat_reply = Mock(return_value='Спасибо! Буду рад сотрудничеству и обсудить детали.')
+    chat = snapshot(message)
+    bot._handle_chat(chat)
+    bot._handle_chat(chat)
+    bot.compose_chat_reply.assert_called_once()
+    bot.send_chat_reply.assert_called_once()
+
+
+def test_ai_interview_continues_beyond_three_answers_until_departure(bot):
+    chat = snapshot('Расскажите о технических задачах?')
+    chat['messages'][0]['isBot'] = True
+    snapshots = []
+    for i in range(1, 6):
+        chat = dict(chat, messages=chat['messages'] + [
+            {'text': 'Ответ на технический вопрос.', 'isOut': True},
+            {'text': f'Расскажите о задаче {i}?', 'isOut': False, 'isBot': True},
+        ])
+        snapshots.append(chat)
+    snapshots.append(dict(chat, assistant_left=True))
+    bot._read_open_chat = Mock(side_effect=snapshots)
+    bot.compose_chat_reply = Mock(return_value='Ответ на технический вопрос.')
+    bot.BOT_FOLLOWUP_WAIT_SECONDS = 1
+    bot.FOLLOWUP_WAIT_SECONDS = 1
+    first = snapshot('Расскажите о технических задачах?')
+    first['messages'][0]['isBot'] = True
+    bot._save_chat_action('wait', {'kind': 'bot_wait', 'identity': first['identity'], 'status': 'deferred'})
+    bot._handle_chat(first)
+    assert bot.send_chat_reply.call_count == 6
+    assert bot._load_chat_actions()['wait']['status'] == 'completed'
+
+
+def test_silent_recruiter_is_deferred_after_one_minute(bot, monkeypatch):
+    import chat_workflow
+
+    del bot.BOT_FOLLOWUP_WAIT_SECONDS
+    assert bot.BOT_FOLLOWUP_WAIT_SECONDS == 60
+    now = [0]
+    monkeypatch.setattr(chat_workflow.time, 'time', lambda: now[0])
+    monkeypatch.setattr(chat_workflow.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))
+    chat = snapshot('Опишите техническую задачу?')
+    chat['messages'][0]['isBot'] = True
+    bot._read_open_chat = Mock(return_value=chat)
+
+    bot._answer_followup(chat, chat['messages'][0]['text'], 0)
+
+    assert now[0] == 60
+    action = next(iter(bot._load_chat_actions().values()))
+    assert action['kind'] == 'bot_wait' and action['status'] == 'deferred'
+    assert '60 секунд' in action['note']
+    bot.send_chat_reply.assert_not_called()
+
+
+@pytest.mark.parametrize('marked_bot', [False, True])
+def test_followup_waits_one_minute_per_turn_even_without_bot_label(bot, monkeypatch, marked_bot):
+    import chat_workflow
+
+    del bot.FOLLOWUP_WAIT_SECONDS
+    del bot.BOT_FOLLOWUP_WAIT_SECONDS
+    now = [0]
+    monkeypatch.setattr(chat_workflow.time, 'time', lambda: now[0])
+    monkeypatch.setattr(chat_workflow.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))
+    first = snapshot('Готовы к офису?')
+    first['messages'][0]['isBot'] = marked_bot
+    second = dict(first, messages=first['messages'] + [
+        {'text': 'Да.', 'isOut': True},
+        {'text': 'Когда готовы выйти?', 'isOut': False, 'isBot': marked_bot}])
+    third = dict(second, messages=second['messages'] + [
+        {'text': 'Готов обсудить дату.', 'isOut': True},
+        {'text': 'Какие задачи вам интересны?', 'isOut': False, 'isBot': marked_bot}])
+    bot._read_open_chat = Mock(side_effect=lambda: (
+        first if now[0] < 45 else second if now[0] < 90 else third if now[0] < 91
+        else dict(third, assistant_left=True)))
+    bot._chat_sent_this_run = 0
+    def answered(chat, preview, depth):
+        if not chat.get('assistant_left'):
+            bot._chat_sent_this_run += 1
+    bot._handle_chat = Mock(side_effect=answered)
+
+    bot._answer_followup(first, first['messages'][0]['text'], 0)
+
+    assert now[0] == 91
+    assert bot._chat_sent_this_run == 2
+    assert bot._handle_chat.call_count == 3
+    assert bot._handle_chat.call_args.args[0]['assistant_left'] is True
+    assert not bot._load_chat_actions()
+
+
 def test_finished_recruiter_form_does_not_answer_echoed_questions_again(bot):
     chat = snapshot('На каких игровых проектах вы работали?')
     chat['messages'].extend([
@@ -410,6 +570,27 @@ def prepare_scan(bot, cards, opened):
     bot._handle_chat = Mock(return_value=None)
     bot._back_to_chat_list = Mock(return_value=True)
     bot._mark_chat_read = Mock()
+
+
+@pytest.mark.parametrize('legacy_revisit', [False, True])
+def test_unread_scan_does_not_reopen_answered_chats(bot, legacy_revisit):
+    chat = snapshot('Расскажите о технических задачах?')
+    key = bot._chat_action_key('answer', chat, chat['messages'][0]['text'])
+    bot._save_chat_action(key, bot._action_record(
+        'answer', chat, 'sent', incoming=chat['messages'][0]['text'], reply='Ответ.'))
+    bot.config['chat_autoreply']['revisit_answered'] = legacy_revisit
+    prepare_scan(bot, [], Mock())
+    bot._chat_list_empty = Mock(return_value=True)
+    bot._revisit_answered_chats = Mock(return_value=[])
+
+    bot.process_unread_messenger_chats()
+
+    assert bot.messenger_summary['complete'] is True
+    assert bot.messenger_summary['viewed'] == 0
+    bot._open_chat_card.assert_not_called()
+    bot._revisit_answered_chats.assert_not_called()
+    bot.send_chat_reply.assert_not_called()
+    assert bot._load_chat_actions()[key]['status'] == 'sent'
 
 
 def test_repeated_open_failures_stop_scan_instead_of_warning_for_every_chat(bot):
@@ -754,7 +935,7 @@ def test_real_chrome_virtual_list_65_chats_and_no_duplicate_sends(chrome_chat):
     assert bot._open_external_interview.call_count == 21
 
 
-@pytest.mark.parametrize('mode', ['advance', 'stuck', 'draft', 'disabled', 'changed'])
+@pytest.mark.parametrize('mode', ['advance', 'stuck', 'draft', 'disabled', 'changed', 'rerender', 'reorder'])
 def test_real_chrome_recruiter_buttons_and_progress_confirmation(chrome_chat, mode):
     from ai_assistant import AIAssistant
     bot = chrome_chat
@@ -792,17 +973,25 @@ def test_real_chrome_recruiter_buttons_and_progress_confirmation(chrome_chat, mo
     chat = dict(bot._read_open_chat(), identity='topic:1')
     assert [c['label'] for c in chat['choice_options']] == ['Да', 'Нет']
     assert chat['messages'][-1]['isBot']
-    if mode == 'changed':
+    if mode in ('changed', 'rerender', 'reorder'):
         # Replace the actual question between the final snapshot and the click.
         execute = bot.driver.execute_script
+        changed = False
         def change_before_click(script, *args):
-            if "return 'ok';" in script:
-                execute("document.querySelector('[data-qa=chat-bubble-text]').textContent='Другой вопрос?';")
+            nonlocal changed
+            if 'const question = document.querySelector' in script and not changed:
+                changed = True
+                if mode == 'changed':
+                    execute("document.querySelector('[data-qa=chat-bubble-text]').textContent='Другой вопрос?';")
+                elif mode == 'rerender':
+                    execute("document.querySelectorAll('[data-bot-chat-choice], [data-bot-recruiter-question], [data-bot-chat-options-root]').forEach(el => { el.removeAttribute('data-bot-chat-choice'); el.removeAttribute('data-bot-recruiter-question'); el.removeAttribute('data-bot-chat-options-root'); })")
+                else:
+                    execute("const root=document.getElementById('fixture-choices'); root.append(root.firstElementChild)")
             return execute(script, *args)
         bot.driver.execute_script = change_before_click
     bot._handle_chat(chat)
     actual = bot.driver.execute_script('return choiceClicks;')
-    assert actual == (['Да', 'Да'] if mode == 'advance' else ['Да'] if mode == 'stuck' else [])
+    assert actual == (['Да', 'Да'] if mode in ('advance', 'rerender', 'reorder') else ['Да'] if mode == 'stuck' else [])
     bot.compose_chat_reply.assert_not_called()
     assert bot.driver.execute_script('return sent;') == []
     if mode == 'draft':
@@ -1074,6 +1263,85 @@ def test_real_chrome_multiline_reply_is_one_complete_message(chrome_chat):
     assert bot.send_chat_reply(text) is True
     sent = bot.driver.execute_script('return sent;')
     assert sent == [{'id': 1, 'text': text}]
+
+
+def test_real_chrome_sends_with_native_button_when_enter_is_not_submission(chrome_chat):
+    bot = chrome_chat
+    bot._open_chat_card(bot._read_chat_cards()[1])
+    bot.driver.execute_script('''
+        const editor=document.getElementById('composer');
+        editor.onkeydown=e=>{ if(e.key==='Enter') e.preventDefault(); };
+        const button=document.createElement('button'); button.setAttribute('aria-label','Отправить');
+        button.setAttribute('data-qa','chatik-chat-send-button');
+        editor.parentElement.append(button);
+        button.onclick=()=>{
+            const text=editor.value; editor.value='';
+            const bubble=document.createElement('div'); bubble.className='chat-bubble outgoing';
+            bubble.setAttribute('data-qa','chatik-chat-message'); bubble.textContent=text;
+            document.getElementById('messages').append(bubble);
+            sent.push({id:active,text});
+        };
+    ''')
+    text = 'Спасибо! Буду рад сотрудничеству.'
+    assert bot.send_chat_reply(text)
+    assert bot.driver.execute_script('return sent;') == [{'id': 1, 'text': text}]
+
+
+def test_real_chrome_ai_interview_answers_six_turns_and_detects_departure(chrome_chat):
+    bot = chrome_chat
+    bot.BOT_FOLLOWUP_WAIT_SECONDS = 5
+    bot.driver.execute_script('''
+        openChat(1); window.interviewAnswers=0;
+        const messages=document.getElementById('messages'), editor=document.getElementById('composer');
+        messages.innerHTML='';
+        function question() {
+            const bubble=document.createElement('div'); bubble.className='chat-bubble';
+            bubble.setAttribute('data-qa','chatik-chat-message');
+            bubble.innerHTML='<span>ИИ-помощник</span><div data-qa="chat-bubble-text">'
+                + 'Опишите техническую задачу '+interviewAnswers+'?</div>';
+            messages.append(bubble);
+        }
+        question();
+        editor.onkeydown=e=>e.preventDefault();
+        const button=document.createElement('button'); button.setAttribute('aria-label','Отправить');
+        editor.parentElement.append(button);
+        button.onclick=()=>{
+            const text=editor.value; editor.value=''; interviewAnswers++;
+            const bubble=document.createElement('div'); bubble.className='chat-bubble outgoing';
+            bubble.setAttribute('data-qa','chatik-chat-message'); bubble.textContent=text; messages.append(bubble);
+            sent.push({id:active,text});
+            if(interviewAnswers<6) question();
+            else {
+                const marker=document.createElement('div'); marker.setAttribute('data-qa','chatik-chat-message');
+                marker.textContent='Пользователь ИИ-помощник покинул чат'; messages.append(marker);
+            }
+        };
+    ''')
+    bot.compose_chat_reply = Mock(return_value='Готов обсудить технические задачи и подходы к их решению.')
+    chat = dict(bot._read_open_chat(), identity='topic:1')
+    bot._handle_chat(chat)
+    assert bot.driver.execute_script('return interviewAnswers;') == 6
+    assert len(bot.driver.execute_script('return sent;')) == 6
+    assert bot._read_open_chat()['assistant_left'] is True
+
+
+def test_real_chrome_choice_uses_message_text_not_author_and_timestamp(chrome_chat):
+    bot = chrome_chat
+    bot.driver.execute_script('''
+        openChat(1); window.choiceClicks=[];
+        document.getElementById('messages').innerHTML=
+            '<div data-qa="chatik-chat-message-1"><div class="chat-bubble chat-bubble_bot">'
+            + '<div data-qa="chatik-chat-message-1-text"><span>ИИ-помощник</span>'
+            + '<span data-qa="chat-bubble-text">Готовы к офису?</span><span>12:27</span></div></div></div>';
+        const choices=document.createElement('div');
+        document.getElementById('right').insertBefore(choices,document.getElementById('composer'));
+        const button=document.createElement('button'); button.textContent='Да'; choices.append(button);
+        button.onclick=()=>{ choiceClicks.push('Да'); choices.remove();
+            document.querySelector('[data-qa="chat-bubble-text"]').textContent='Ваши ответы отправлены работодателю.'; };
+    ''')
+    chat = dict(bot._read_open_chat(), identity='topic:1')
+    assert bot._send_chat_action('choice', chat, 'Да', choice=chat['choice_options'][0])
+    assert bot.driver.execute_script('return choiceClicks;') == ['Да']
 
 
 def replace_with_dynamic_editor(bot, rerender=False, switch_chat=False):

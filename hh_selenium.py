@@ -996,7 +996,7 @@ class HHSeleniumBot:
                 for selector in ('[data-qa="vacancy-response-popup"]', RESPONSE_MODAL_SELECTOR):
                     for modal in self.driver.find_elements(By.CSS_SELECTOR, selector):
                         try:
-                            if modal.is_displayed():
+                            if modal.tag_name.lower() not in ('button', 'input', 'textarea', 'a') and modal.is_displayed():
                                 return modal
                         except Exception:
                             continue
@@ -1817,16 +1817,7 @@ class HHSeleniumBot:
     def submit_open_response_modal(self, cover_letter, letter_sent):
         modal = self.find_response_modal(wait_seconds=2)
         if not modal:
-            # Вакансии с тестом/анкетой hh открывает отдельной страницей, модалки там нет.
-            answered = self.answer_employer_questions()
-            if self.unanswered_questions:
-                return False, letter_sent, answered, self.describe_unanswered_questions()
-            if answered:
-                if not letter_sent and not self.letter_skip_reason:
-                    self.letter_skip_reason = 'отклик шёл через страницу-анкету, поля письма в ней не было'
-                if self.click_lowest_visible_apply_button():
-                    return True, letter_sent, answered, None
-            return False, letter_sent, answered, None
+            return self.apply_via_response_page(cover_letter, letter_sent)
 
         # hh может временно прятать резюме от откликов («поменяйте видимость
         # резюме»). Проверяем до печати письма: дальше всё равно не отправится.

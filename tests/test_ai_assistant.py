@@ -7,7 +7,6 @@ import copy
 import pytest
 from ai_assistant import AIAssistant, DEFAULT_CANDIDATE_PROFILE
 
-
 TEST_PROFILE = {
     **copy.deepcopy(DEFAULT_CANDIDATE_PROFILE),
     "name": "Иван",
@@ -841,7 +840,7 @@ def test_probe_does_not_wait_for_a_hung_model():
 
 
 def test_chat_templates_salary_only_on_direct_question_and_experience_yes():
-    """06.10: «есть ли опыт с X?» — всегда «Да»; сумма — только на прямой вопрос о деньгах."""
+    """На прямой вопрос о деньгах ответ без суммы, включая старые настройки."""
     from chat_workflow import split_salary, experience_yes_no, salary_line, EXPERIENCE_YES_REPLY
     rest, asked = split_salary('Подскажите, какие у вас финансовые ожидания?')
     assert asked and rest == ''
@@ -854,7 +853,7 @@ def test_chat_templates_salary_only_on_direct_question_and_experience_yes():
     assert not experience_yes_no('Есть ли опыт с Docker? А с Kubernetes? Работали ли с Helm?')
     from ai_assistant import SALARY_ANSWER
     assert salary_line({}) == SALARY_ANSWER and not any(ch.isdigit() for ch in salary_line({}))
-    assert salary_line({'salary_answer': 'От 350 000 руб.'}) == 'От 350 000 руб.'
+    assert salary_line({'salary_answer': 'От 350 000 руб.'}) == SALARY_ANSWER
     assert EXPERIENCE_YES_REPLY.startswith('Да')
 
 
@@ -868,6 +867,7 @@ def test_followup_question_right_after_our_reply_is_answered():
         {'text': 'Опишите опыт', 'isOut': False}, {'text': 'Ответ', 'isOut': True},
         {'text': 'Расскажите, с каким вендором NGFW вы внедряли правила?', 'isOut': False}]}
     bot._handle_chat = MagicMock(return_value=None)
+    bot._current_chat_matches = MagicMock(return_value=True)
     bot._answer_followup({'company_name': 'EKONIKA'}, 'Опишите опыт', 0)
     args = bot._handle_chat.call_args.args
     assert 'NGFW' in args[0]['messages'][-1]['text'] and args[2] == 1

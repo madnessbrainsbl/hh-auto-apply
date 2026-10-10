@@ -101,7 +101,9 @@ except Exception:
 file_handler.setLevel(logging.DEBUG)
 logging.basicConfig(
     level=logging.DEBUG,
-    handlers=[file_handler, console_handler]
+    handlers=[file_handler, console_handler],
+    # config_manager is imported first and may already own the root handlers.
+    force=(__name__ == '__main__'),
 )
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("selenium").setLevel(logging.ERROR)

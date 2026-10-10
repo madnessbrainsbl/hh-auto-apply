@@ -104,18 +104,14 @@ def tenure_asked_again(chat, incoming):
 
 
 def allowed_tail_lines(cfg=None):
-    """Строки, которые пользователь сам разрешил отправлять с цифрами: зарплата и стаж."""
-    return [line for line in (salary_line(cfg), tenure_line(cfg)) if line]
+    """Явно настроенный ответ о стаже; зарплатные строки исключений не имеют."""
+    return [line for line in (tenure_line(cfg),) if line]
 
 
 def salary_line(cfg=None):
-    """Ответ на прямой вопрос о деньгах в чате.
-
-    Сумма задаётся пользователем в настройках (chat_autoreply.salary_answer). Не задана —
-    уклончивый ответ без цифры: в бота никакие личные цифры не вшиты.
-    """
+    """Нейтральный ответ без суммы, даже если в старых настройках есть salary_answer."""
     from ai_assistant import SALARY_ANSWER
-    return str(((cfg or {}).get('salary_answer') or SALARY_ANSWER)).strip()
+    return SALARY_ANSWER
 
 
 def split_salary(text):
@@ -183,6 +179,19 @@ def confirms_reply(message, reply):
         return True
     rendered = _rendered_reply(reply)
     return bool(rendered and rendered in actual)
+
+
+def confirms_turn_reply(chat, reply, incoming):
+    """Match the answer to its incoming turn, not the same text in an older exchange."""
+    turn = []
+    for message in chat.get('messages') or []:
+        if message.get('isOut'):
+            if normalized('\n\n'.join(turn)) == normalized(incoming) and confirms_reply(message, reply):
+                return True
+            turn = []
+        elif message.get('text'):
+            turn.append(message['text'])
+    return False
 
 
 _CARD_METADATA = re.compile(
@@ -358,50 +367,62 @@ class ChatWorkflowMixin:
                          or re.search(r'ваши ответы (?:отправлены|переданы) работодателю', text, re.I)))
 
     def _click_chat_choice(self, chat, choice, incoming):
-        if not self._current_chat_matches(chat, incoming):
-            self._chat_send_failure = 'choice_not_clicked'
-            return False
-        # One native option click; never type its label into the composer.
-        clicked = self.driver.execute_script(r"""
-            const button = document.querySelector('[data-bot-chat-choice="' + arguments[0] + '"]');
+        from selenium.common.exceptions import (
+            ElementClickInterceptedException, ElementNotInteractableException, StaleElementReferenceException,
+        )
+        # Retry only before dispatch; a lost confirmation never authorizes another click.
+        for attempt in range(3):
+            if not self._current_chat_matches(chat, incoming):
+                self._chat_send_failure = 'choice_not_clicked'
+                return False
+            button = self.driver.execute_script(r"""
             const question = document.querySelector('[data-bot-recruiter-question="current"]');
+            const region = document.querySelector('[data-bot-chat-options-root="current"]');
             const visible = el => el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
-            const content = question && (question.querySelector('[data-qa="chat-bubble-text"], [data-qa^="chatik-chat-message"][data-qa$="-text"]') || question);
-            if (!visible(button) || !visible(question) || !content
-                    || content.innerText.trim() !== arguments[2]
-                    || button.disabled || button.getAttribute('aria-disabled') === 'true'
-                    || button.innerText.trim() !== arguments[1]) return 'changed';
-            const later = [...document.querySelectorAll(arguments[3])].some(el =>
+            const buttons = region ? [...region.querySelectorAll('[data-bot-chat-choice]')]
+                .filter(el => visible(el) && el.innerText.trim() === arguments[0]) : [];
+            const button = buttons.length === 1 ? buttons[0] : null;
+            const content = question && (question.querySelector('[data-qa="chat-bubble-text"]')
+                || question.querySelector('[data-qa^="chatik-chat-message"][data-qa$="-text"]') || question);
+            if (!visible(question) || !content) return 'question_unavailable';
+            if (content.innerText.trim() !== arguments[1]) return 'question_changed';
+            if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return 'button_unavailable';
+            const later = [...document.querySelectorAll(arguments[2])].some(el =>
                 visible(el) && !el.contains(question) && !question.contains(el)
                 && !el.matches('input, textarea, button, [contenteditable="true"]')
                 && !/input|button|send|list|container|scroll|messages$/.test(el.getAttribute('data-qa') || '')
                 && (question.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
-            if (later) return 'changed';
-            const region = document.querySelector('[data-bot-chat-options-root="current"]');
-            if (!region || !region.contains(button)) return 'changed';
+            if (later) return 'new_message';
             if ([...region.querySelectorAll('textarea, [contenteditable="true"], input[data-qa*="chat"]')].some(el =>
-                visible(el) && !el.closest(arguments[4]) && (el.value || el.innerText || '').trim())) return 'draft';
-            return 'ok';
-        """, choice['index'], choice['label'], chat['messages'][-1].get('raw_text', chat['messages'][-1]['text']),
-            MESSAGE_SELECTOR, CARD_SELECTOR)
-        if clicked == 'ok':
-            # Клик мышью (ActionChains): JS-клик вёрстка hh на React может проигнорировать.
-            from selenium.webdriver.common.action_chains import ActionChains
-            from selenium.webdriver.common.by import By
+                visible(el) && !el.closest(arguments[3]) && (el.value || el.innerText || '').trim())) return 'draft';
+            return button;
+            """, choice['label'], chat['messages'][-1].get('raw_text', chat['messages'][-1]['text']),
+                MESSAGE_SELECTOR, CARD_SELECTOR)
+            if isinstance(button, str):
+                if button in ('button_unavailable', 'question_unavailable') and attempt < 2:
+                    logger.info('Анкета перерисована; повторно проверяю вопрос и выбранный вариант')
+                    time.sleep(.25)
+                    continue
+                self._chat_send_failure = 'draft' if button == 'draft' else 'choice_not_clicked'
+                logger.warning('Клик по варианту анкеты не выполнен: %s', {
+                    'question_changed': 'вопрос изменился', 'new_message': 'появилось новое сообщение',
+                    'question_unavailable': 'поле вопроса временно недоступно',
+                    'button_unavailable': 'выбранная кнопка недоступна', 'draft': 'в поле сохранён черновик',
+                }.get(button, button))
+                return False
             try:
-                button = self.driver.find_element(By.CSS_SELECTOR, f'[data-bot-chat-choice="{choice["index"]}"]')
-                try:
-                    ActionChains(self.driver).move_to_element(button).click().perform()
-                except Exception:
-                    button.click()
-                clicked = 'clicked'
-            except Exception as e:
-                logger.debug('Кнопка варианта не нажалась: %s', str(e)[:120])
-                clicked = 'changed'
-        if clicked != 'clicked':
-            logger.debug('Вариант робота-рекрутера не нажат: %s', clicked)
-            self._chat_send_failure = 'draft' if clicked == 'draft' else 'choice_not_clicked'
-            return False
+                button.click()
+                break
+            except (StaleElementReferenceException, ElementClickInterceptedException, ElementNotInteractableException) as error:
+                if attempt == 2:
+                    self._chat_send_failure = 'choice_not_clicked'
+                    logger.warning('Клик по варианту анкеты не выполнен: %s', type(error).__name__)
+                    return False
+                logger.info('Кнопка анкеты временно недоступна (%s); заново проверяю вопрос и кнопки', type(error).__name__)
+                time.sleep(.25)
+            except Exception:
+                logger.warning('Результат клика по анкете неизвестен; проверяю подтверждение без повторного клика', exc_info=True)
+                break
         question = chat['messages'][-1]['text']
         for _ in range(40):
             time.sleep(.25)
@@ -453,14 +474,13 @@ class ChatWorkflowMixin:
             return False
         if previous.get('status') == 'pending_confirmation' and previous.get('reply'):
             confirmed = (self._choice_advanced(chat, previous.get('question', '')) if kind == 'choice'
-                         else any(confirms_reply(m, previous['reply']) for m in chat.get('messages') or []))
+                         else confirms_turn_reply(chat, previous['reply'], previous.get('incoming', '')))
             if confirmed:
                 self._save_chat_action(key, dict(previous, status='sent'))
         if previous.get('status') in ('sent', 'pending_confirmation'):
             # An uncertain submission is never automatically repeated.
             return False
-        if kind != 'choice' and any(confirms_reply(m, text)
-               for m in chat.get('messages') or []):
+        if kind != 'choice' and confirms_turn_reply(chat, text, incoming):
             self._save_chat_action(key, self._action_record(kind, chat, 'sent'))
             return False
         limit = int(cfg.get('max_per_run') or 0)
@@ -498,11 +518,17 @@ class ChatWorkflowMixin:
                         chat.get('company_name'), text)
         else:
             failure = getattr(self, '_chat_send_failure', None)
+            if kind == 'choice':
+                self._capture_chat_diagnostics('choice')
+            if failure == 'not_dispatched':
+                action.update(status='deferred', note='Отправка не выполнялась')
+                self._save_chat_action(key, action)
             if failure in ('draft', 'choice_not_clicked'):
                 action.update(status='deferred', note='Сохранён существующий черновик' if failure == 'draft'
                               else 'Вопрос или кнопки изменились; клик не выполнен')
                 self._save_chat_action(key, action)
             reason = {'draft': 'в поле уже есть черновик', 'choice_not_clicked': 'кнопка варианта не нажалась или вопрос сменился',
+                      'not_dispatched': 'команда отправки не выполнялась',
                       'restricted_content': 'в тексте запрещённые личные сведения'}.get(
                           failure, 'поле ответа не найдено или сообщение не появилось в чате')
             logger.warning('  Отправка в чат не подтверждена (%s, %s). Повторять автоматически не буду: %s',
@@ -572,12 +598,15 @@ class ChatWorkflowMixin:
                         chat.get('company_name'), chat['unavailable_reason'])
             return None
         for key, action in list(self._load_chat_actions().items()):
+            if (action.get('kind') == 'bot_wait' and action.get('identity') == chat.get('identity')
+                    and chat.get('assistant_left')):
+                self._save_chat_action(key, dict(action, status='completed'))
             if action.get('status') != 'pending_confirmation' or not action.get('reply'):
                 continue
             if action.get('identity') != chat.get('identity'):
                 continue
             confirmed = (self._choice_advanced(chat, action.get('question', '')) if action.get('kind') == 'choice'
-                         else any(confirms_reply(m, action['reply']) for m in chat.get('messages') or []))
+                         else confirms_turn_reply(chat, action['reply'], action.get('incoming', '')))
             if confirmed:
                 self._save_chat_action(key, dict(action, status='sent'))
         if (chat.get('choice_options') and (chat.get('messages') or [{}])[-1].get('isBot')
@@ -614,16 +643,20 @@ class ChatWorkflowMixin:
             return rejection
         if not incoming:
             return None
+        if chat.get('assistant_left') and last_incoming_message.get('isBot'):
+            return None
         if (last_incoming_message.get('isBot') and '?' not in last_incoming
                 and re.search(r'ваши ответы (?:отправлены|переданы) работодателю', last_incoming, re.I)):
             logger.debug('Анкета робота-рекрутера завершена; повторный ответ не требуется')
+            if depth == 0 and chat.get('assistant_active'):
+                return self._answer_followup(chat, incoming, depth)
             return None
         if self._handle_external_invitation(chat, incoming):
             return None
         rest, has_salary = split_salary(incoming)
         is_question = bool(rest) and self.looks_like_question_card(rest)
         is_contact = wants_contact(incoming)
-        if is_question or is_contact or has_salary:
+        if incoming:
             cfg = getattr(self, 'config', {}).get('chat_autoreply') or {}
             if not cfg.get('enabled', True):
                 return None
@@ -663,7 +696,7 @@ class ChatWorkflowMixin:
                 if reply and has_salary:
                     reply += '\n\n' + money
             if reply:
-                if self._send_chat_action('answer', chat, reply, incoming) and depth < 3:
+                if self._send_chat_action('answer', chat, reply, incoming) and depth == 0:
                     return self._answer_followup(chat, incoming, depth)
             else:
                 self._save_chat_action(key, self._action_record('answer', chat, 'deferred',
@@ -671,27 +704,45 @@ class ChatWorkflowMixin:
                 logger.warning('  Вопросы %s сохранены для повторной обработки: ИИ не дал ответ', chat.get('company_name'))
         return None
 
-    # Боты рекрутеров отвечают за 1–3 с; дольше ждать нельзя: ожидание идёт после каждого ответа.
-    FOLLOWUP_WAIT_SECONDS = 6
+    FOLLOWUP_WAIT_SECONDS = 60
+    BOT_FOLLOWUP_WAIT_SECONDS = 60
 
     def _answer_followup(self, chat, answered, depth):
-        """Рекрутер или его бот часто пишет следующий вопрос сразу после нашего ответа
-        (07.10 EKONIKA: «Расскажите, с каким вендором NGFW…» через секунды). Раньше бот
-        уходил к следующему чату и отвечал только в следующий прогон. Ждём немного и
-        отвечаем на новую реплику, не больше трёх раз подряд в одном чате."""
-        deadline = time.time() + self.FOLLOWUP_WAIT_SECONDS
-        while time.time() < deadline:
-            time.sleep(2)
+        """Continue new incoming turns without recursion; never repeat an uncertain send."""
+        active_bot = chat.get('assistant_active', any(m.get('isBot') for m in chat.get('messages') or []))
+        deadline = time.time() + (self.BOT_FOLLOWUP_WAIT_SECONDS if active_bot else self.FOLLOWUP_WAIT_SECONDS)
+        while time.time() < deadline and not getattr(self, '_user_closed', False):
+            time.sleep(1)
             try:
                 current = self._read_open_chat()
             except Exception:
                 return None
+            if not self._current_chat_matches(chat):
+                return None
+            if current.get('assistant_left'):
+                self._handle_chat(dict(chat, **current), '', 1)
+                logger.info('ИИ-помощник покинул чат; беседа завершена')
+                return None
             turn = employer_turn(current)
             if turn and normalized(turn) != normalized(answered):
-                updated = dict(chat, messages=current.get('messages') or [],
-                               choice_options=current.get('choice_options'))
+                updated = dict(chat, **current)
+                updated['identity'] = chat.get('identity', '')
                 logger.info('  Работодатель ответил сразу — отвечаю в том же чате: %s', chat.get('company_name'))
-                return self._handle_chat(updated, '', depth + 1)
+                before = getattr(self, '_chat_sent_this_run', 0)
+                rejection = self._handle_chat(updated, '', 1)
+                if rejection:
+                    return rejection
+                finished = re.search(r'ваши ответы (?:отправлены|переданы) работодателю', turn, re.I)
+                if getattr(self, '_chat_sent_this_run', 0) == before and not finished:
+                    return None
+                chat, answered = updated, turn
+                active_bot = current.get('assistant_active', any(m.get('isBot') for m in current.get('messages') or []))
+                deadline = time.time() + (self.BOT_FOLLOWUP_WAIT_SECONDS if active_bot else self.FOLLOWUP_WAIT_SECONDS)
+        if active_bot:
+            key = self._chat_action_key('bot_wait', chat, answered)
+            self._save_chat_action(key, self._action_record('bot_wait', chat, 'deferred',
+                                   note=f'ИИ-помощник не завершил интервью и не ответил за {self.BOT_FOLLOWUP_WAIT_SECONDS} секунд'))
+            logger.warning('ИИ-помощник не завершил интервью; ожидание сохранено в незавершённых действиях')
         return None
 
     REVISIT_HOURS = 72
@@ -854,7 +905,7 @@ class ChatWorkflowMixin:
                     if (parent.getAttribute('data-is-own') === 'true' || parent.getAttribute('data-sender') === 'applicant') out = true;
                     if (/chat-bubble_bot(?:--|\b)/.test(String(parent.className))) bot = true;
                 }
-                if (/(?:^|\n)Робот-рекрутер(?:\n|$)/i.test(el.innerText.trim())) bot = true;
+                if (/(?:^|\n)(?:Робот-рекрутер|ИИ-помощник)(?:\n|$)/i.test(el.innerText.trim())) bot = true;
                 const state = String(el.className) + ' ' + (el.getAttribute('data-status') || '');
                 return {text: content.innerText.trim(), isOut: out, isBot: bot, id: el.getAttribute('data-message-id') || '',
                         failed: /failed|error|не отправлено/i.test(state)
@@ -864,6 +915,12 @@ class ChatWorkflowMixin:
                         links: [...el.querySelectorAll('a[href]')].map(a => a.href)};
             });
             const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+            let assistantLeft = false, assistantActive = false;
+            for (const message of messages) {
+                if (/Пользователь\s+(?:ИИ-помощник|Робот-рекрутер)\s+покинул чат/i.test(message.text)) {
+                    assistantLeft = true; assistantActive = false;
+                } else if (message.isBot) { assistantLeft = false; assistantActive = true; }
+            }
             const companies = [...document.querySelectorAll('[data-qa="participant-info-details"]')].filter(visible);
             const companyNames = [...new Set(companies.map(el => el.innerText.trim().split('\n')[0]).filter(Boolean))];
             const comp = companyNames.length === 1 ? companies[0] : null;
@@ -940,6 +997,7 @@ class ChatWorkflowMixin:
             return {company_name: comp ? companyNames[0] : '',
                     vacancy_title: unambiguous ? titles[0] : '',
                     vacancy_url: unambiguous ? urls[0] || '' : '', messages, choice_options:choices,
+                    assistant_left:assistantLeft, assistant_active:assistantActive,
                     unavailable_reason: unavailable ? unavailable.innerText.trim() : '',
                     messages_loaded: bubbles.some(el => (el.innerText || '').trim())};
         """, MESSAGE_SELECTOR, CARD_SELECTOR) or {}
@@ -1220,14 +1278,6 @@ class ChatWorkflowMixin:
                 if unread_only:
                     # Reading removes cards from this queue, changing virtual row offsets.
                     self._scroll_chat_list(reset=True)
-            # Чаты, где мы уже ответили, а работодатель написал снова, пока бот был в чате:
-            # hh считает их прочитанными, и обход «только непрочитанные» их не видит
-            # (07.10 EKONIKA: вопрос про NGFW пришёл в ту же секунду и остался без ответа).
-            if (unread_only and summary.get('complete') and not getattr(self, '_user_closed', False)
-                    and (getattr(self, 'config', {}).get('chat_autoreply') or {}).get('revisit_answered', True)):
-                for rejection in self._revisit_answered_chats(seen, summary):
-                    chats.append(rejection)
-                    summary['rejections'] += 1
         except Exception as exc:
             if is_dead_session_message(exc):
                 self._user_closed = True

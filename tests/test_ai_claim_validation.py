@@ -98,6 +98,25 @@ def test_rejection_analysis_allows_positive_transferable_skill_advice():
     assert analysis_fabrication_problem(raw, 'Python, Linux, опыт 6 лет', 6, 'Python, Linux') is None
 
 
+@pytest.mark.parametrize('profile, rejected', [
+    ('Docker, Kubernetes, GitLab CI, Python', True),
+    ('Docker, Kubernetes, GitLab CI, Python, Terraform, Helm, Prometheus, Grafana', False),
+])
+def test_rejection_analysis_checks_possession_of_skills(profile, rejected):
+    raw = json.dumps({
+        'about_me_recommendation': (
+            'Обладаю глубоким пониманием Docker, Kubernetes, GitLab CI и Python-автоматизации, '
+            'а также базовыми навыками Terraform, Helm и мониторинга (Prometheus/Grafana).'
+        ),
+    }, ensure_ascii=False)
+    problem = analysis_fabrication_problem(raw, profile, profile_text=profile)
+    if rejected:
+        assert problem and problem.startswith('about_me_recommendation:')
+        assert 'terraform' in problem
+    else:
+        assert problem is None
+
+
 def test_accepted_answer_does_not_trigger_provider_fallback():
     assistant = AIAssistant.__new__(AIAssistant)
     assistant.ai_order = Mock(return_value=['compat:fast', 'codex'])

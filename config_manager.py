@@ -1409,8 +1409,6 @@ def edit_bot_behavior():
                      f"{_toggle_label(chat.get('enabled', True))}"
                      + (f", не больше {chat['max_per_run']} за прогон"
                         if chat.get('max_per_run') else ", без локального ограничения")),
-            ('chat_salary', f"Ответ на прямой вопрос о зарплате в чате: "
-                            f"{BOLD}{chat.get('salary_answer') or 'без суммы'}{RESET}"),
             ('chat_tenure', f"Стаж цифрой, если в чате повторно спрашивают про стаж: "
                             f"{BOLD}{(str(chat.get('tenure_years')) + ' лет') if chat.get('tenure_years') else 'не называть'}{RESET}"),
             ('chat_exp', f"Шаблон «Да, есть опыт» на вопрос «есть ли опыт с X?» в чате: "
@@ -1469,17 +1467,6 @@ def edit_bot_behavior():
                         chat['max_per_run'] = max(0, int(raw))
                 except (ValueError, EOFError, KeyboardInterrupt):
                     pass
-            cfg['chat_autoreply'] = chat
-        elif key == 'chat_salary':
-            try:
-                raw = input("Текст ответа, например «Мои ожидания — от … руб.» "
-                            "(пусто — без суммы): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                continue
-            if raw:
-                chat['salary_answer'] = raw
-            else:
-                chat.pop('salary_answer', None)
             cfg['chat_autoreply'] = chat
         elif key == 'chat_tenure':
             try:
