@@ -162,6 +162,68 @@ def test_template_analysis_is_deferred_not_recorded(analyzer, capsys):
     assert recorded == []
 
 
+def test_chat_analysis_reports_waiting_without_repeating_requests(analyzer, monkeypatch, caplog):
+    import concurrent.futures
+    import logging
+    import rejection_analyzer as module
+
+    analyzer.config['allow_sample_chats'] = True
+    calls = []
+
+    def analyze(**kwargs):
+        calls.append(kwargs)
+        return {'heuristic': True}
+
+    analyzer.ai_assistant.analyze_chat_rejection = analyze
+    waits = []
+
+    def wait(futures, timeout, return_when):
+        waits.append(timeout)
+        assert return_when == concurrent.futures.FIRST_COMPLETED
+        if len(waits) == 1:
+            return set(), set(futures)
+        return concurrent.futures.wait(futures, timeout=3, return_when=return_when)
+
+    monkeypatch.setattr(module, 'wait', wait, raising=False)
+    with caplog.at_level(logging.INFO, logger='rejection_analyzer'):
+        summary = analyzer.run_chat_analysis(limit=2, fetch_live=False, auto_apply=False)
+    assert len(waits) >= 2
+    assert waits == [30] * len(waits)
+    assert 'Ожидаю ИИ' in caplog.text
+    assert 'обработано 0/2' in caplog.text
+    assert len(calls) == 2
+    assert summary['total_deferred'] == 2
+    assert summary['total_analyzed'] == 0
+
+
+def test_entrypoint_logs_survive_config_import(tmp_path):
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, HH_DATA_DIR=str(tmp_path), HH_PROFILE_ID='default')
+    # Execute only module setup, never main() or a real provider/browser.
+    script = '''
+import ast
+import logging
+from pathlib import Path
+path = Path('test.py').resolve()
+tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+first_function = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.FunctionDef))
+tree.body = tree.body[:first_function]
+exec(compile(tree, str(path), 'exec'), {'__name__': '__main__', '__file__': str(path)})
+logging.getLogger('ai_assistant').warning('synthetic-provider-warning')
+import rejection_analyzer
+rejection_analyzer.logger.warning('synthetic-chat-warning')
+logging.shutdown()
+from app_paths import DATA_DIR
+assert 'synthetic-provider-warning' in Path(DATA_DIR, 'hh_auto_apply.log').read_text(encoding='utf-8')
+assert 'synthetic-chat-warning' in Path(DATA_DIR, 'rejection_analyzer.log').read_text(encoding='utf-8')
+'''
+    result = subprocess.run([sys.executable, '-c', script], cwd=str(root), env=env,
+                            capture_output=True, text=True, encoding='utf-8', timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_chat_reply_system_prompt_is_a_string():
     """Подсказка для ответа в чат уходит в ИИ строкой, а не кортежем.
 

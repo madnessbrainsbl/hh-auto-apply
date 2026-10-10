@@ -9,6 +9,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -113,13 +114,26 @@ def test_success_message_never_silent_about_reason():
     assert msg.rstrip().endswith(('определена', 'определена.')) or len(msg) > len('Отклик отправлен БЕЗ письма: ')
 
 
+def _questionnaire_bot():
+    b = _bot()
+    b.driver = SimpleNamespace(current_url='https://hh.ru/vacancy/42')
+    b.driver.get = lambda url: setattr(b.driver, 'current_url', url)
+    b.current_vacancy_id = lambda: '42'
+    b.collect_question_blocks = lambda: [object()]
+    b.open_cover_letter_in_modal = lambda: None
+    b.fill_cover_letter = lambda *args, **kwargs: False
+    b.get_response_blocker_message = lambda: None
+    b.detect_response_state = lambda: 'success'
+    return b
+
+
 def test_questionnaire_page_branch():
     """Вакансия с анкетой открывается отдельной страницей, без модалки.
 
     Ветка обязана: ответить на вопросы, отметить причину отсутствия письма
     и нажать кнопку отклика на самой странице.
     """
-    b = _bot()
+    b = _questionnaire_bot()
     calls = {'answered': 0, 'clicked': False}
 
     b.find_response_modal = lambda wait_seconds=2: None
@@ -136,7 +150,8 @@ def test_questionnaire_page_branch():
         return True
     b.click_lowest_visible_apply_button = fake_click
 
-    ok, letter_sent, answered, err = b.submit_open_response_modal('текст письма', False)
+    with patch('hh_selenium.time.sleep'):
+        ok, letter_sent, answered, err = b.submit_open_response_modal('текст письма', False)
 
     assert ok is True, f'отклик через анкету не прошёл: {err}'
     assert answered == 2
@@ -145,13 +160,14 @@ def test_questionnaire_page_branch():
     assert 'анкет' in b.letter_skip_reason.lower()
 
 
+
 def test_questionnaire_blocks_apply_when_unanswered():
     """Есть неотвеченный вопрос — отклик не отправляется.
 
     Отправить анкету с пустым обязательным полем значит засветиться у
     работодателя с недозаполненной формой.
     """
-    b = _bot()
+    b = _questionnaire_bot()
     b.find_response_modal = lambda wait_seconds=2: None
     clicked = {'yes': False}
 
@@ -165,11 +181,13 @@ def test_questionnaire_blocks_apply_when_unanswered():
         return True
     b.click_lowest_visible_apply_button = fake_click
 
-    ok, letter_sent, answered, err = b.submit_open_response_modal('текст', False)
+    with patch('hh_selenium.time.sleep'):
+        ok, letter_sent, answered, err = b.submit_open_response_modal('текст', False)
 
     assert ok is False, 'отклик ушёл с неотвеченным вопросом'
     assert not clicked['yes'], 'кнопка нажата, хотя вопрос без ответа'
     assert err and 'КИИ' in err, f'пользователю не показано, что именно осталось без ответа: {err}'
+
 
 
 def test_neutral_fallback_when_configured():

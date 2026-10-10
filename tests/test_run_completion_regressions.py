@@ -116,6 +116,23 @@ def test_response_modal_prefers_response_form_over_unrelated_popup(local_browser
     assert bot.find_response_modal().get_attribute('id') == 'response'
 
 
+def test_questionnaire_submit_button_is_not_a_response_modal(local_browser, tmp_path):
+    bot = open_form(local_browser, tmp_path, '''
+      <h1>Отклик на вакансию</h1><form>
+        <label>Расскажите о технических задачах<textarea></textarea></label>
+        <button data-qa="vacancy-response-submit-popup">Откликнуться</button>
+      </form>''')
+    bot.apply_via_response_page = Mock(return_value=(True, True, 1, None))
+    bot.ensure_target_resume_selected = Mock()
+    bot.click_lowest_visible_apply_button = Mock()
+
+    assert bot.find_response_modal() is None
+    assert bot.submit_open_response_modal('Test letter', False) == (True, True, 1, None)
+    bot.apply_via_response_page.assert_called_once_with('Test letter', False)
+    bot.ensure_target_resume_selected.assert_not_called()
+    bot.click_lowest_visible_apply_button.assert_not_called()
+
+
 def test_resume_selection_recovers_replaced_form(local_browser, tmp_path, monkeypatch):
     monkeypatch.setattr('config_manager.get_active_resume', lambda: ('target', 'Application Security Engineer'))
     bot = open_form(local_browser, tmp_path, '''

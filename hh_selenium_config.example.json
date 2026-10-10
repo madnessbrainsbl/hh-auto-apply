@@ -38,7 +38,6 @@
     "max_per_run": 0,
     "ask_rejection_reason": true,
     "open_external_interviews": true,
-    "salary_answer": "",
     "tenure_years": null,
     "experience_yes_template": false
   },
