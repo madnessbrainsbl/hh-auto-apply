@@ -692,6 +692,10 @@ class ChatWorkflowMixin:
                     time.sleep(.25)
                 else:
                     raise RuntimeError('Не подтверждён адресат подготовленного ответа')
+                # Переход по ссылке ставит галочку «Только непрочитанные» в исходное положение и
+                # сначала показывает список: до появления поля ввода ответ не отправляем.
+                self._wait_chat_view_ready()
+                current = self._read_open_chat() or current
                 current['identity'] = expected['identity']
                 if normalized(employer_turn(current)) != normalized(employer_turn(expected)):
                     logger.info('Переписка обновилась во время подготовки; старый ответ не используется')
@@ -946,7 +950,9 @@ class ChatWorkflowMixin:
                            chat.get('company_name'))
             return False
         if kind != 'choice' and self.find_chat_message_input() is None:
-            for _ in range(5):
+            # 21.10: после перехода по ссылке поле появляется через несколько секунд (на снимке 16:50:35
+            # был ещё список, на 16:50:43 уже чат с полем). 1.25 с не хватало — ответ откладывался зря.
+            for _ in range(32):
                 composer = self.chat_composer_status()
                 if composer['state'] != 'editor_not_found':
                     break
@@ -1352,6 +1358,26 @@ class ChatWorkflowMixin:
         return rejections
 
     def _set_unread_filter(self, enabled):
+        """Включает или выключает галочку «Только непрочитанные».
+
+        21.10: на странице открытого чата галочки нет, и одна такая ошибка останавливала весь цикл
+        (чаты, разбор, резюме, отклики). Перед тем как сдаться, возвращаемся к списку: сначала
+        кнопкой «назад», потом переходом на /chat. Пока галочка не подтверждена, карточки не читаем.
+        """
+        for attempt in range(3):
+            if self._set_unread_filter_once(enabled):
+                return True
+            if attempt == 2 or getattr(self, '_user_closed', False):
+                break
+            if attempt == 0:
+                logger.info('Галочка «Только непрочитанные» не найдена: возвращаюсь к списку чатов')
+                self._back_to_chat_list()
+            else:
+                logger.info('Галочка не появилась после кнопки «назад»: открываю список чатов заново')
+                self.goto('https://hh.ru/chat')
+        return False
+
+    def _set_unread_filter_once(self, enabled):
         script = r"""
             const desired = arguments[0];
             for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
@@ -1815,7 +1841,24 @@ class ChatWorkflowMixin:
                                self._action_record('chat_open', chat, 'deferred', note=note))
         return f"{names['vacancy_title']} / {names['company_name']}: {note}"
 
+    def _wait_chat_view_ready(self, timeout=10.0):
+        """Ждёт, пока вместо списка откроется сам чат: появится поле ввода или кнопка «назад»."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.find_chat_message_input() is not None or self.driver.execute_script(
+                        "const b = document.querySelector('[data-qa=\"chatik-back-to-chats-button\"]');"
+                        "return !!(b && b.getClientRects().length);"):
+                    return True
+            except Exception:
+                return False
+            time.sleep(.25)
+        return False
+
     def _block_messenger(self, reason):
+        if 'Только непрочитанные' in str(reason):
+            # Иначе в диагностике оставалась чужая причина (editor_not_found из прошлого чата).
+            self._last_chat_open_problem = {'code': 'unread_filter_unconfirmed', 'reason': str(reason)}
         hint = ('Откройте чаты в видимом браузере, проверьте вход и загрузку переписки. '
                 'Затем выберите повторную проверку в терминале.')
         if getattr(self, '_last_chat_open_problem', {}).get('code') == 'missing_vacancy_title':
@@ -1869,8 +1912,13 @@ class ChatWorkflowMixin:
         if not self.is_driver_alive() and not self._init_driver():
             self._live_fetch_failed = True
             return []
-        if '/chat' not in (self.driver.current_url or '').lower() and not self.goto('https://hh.ru/chat'):
-            return []
+        # 21.10: браузер мог вернуться на открытый чат (/chat/<id>) — там нет списка и галочки.
+        # Список — только сам /chat; всё остальное ведём на него.
+        if not re.fullmatch(r'/chat/?', urlsplit(self.driver.current_url or '').path.lower()):
+            if not self.goto('https://hh.ru/chat'):
+                return []
+            if not re.fullmatch(r'/chat/?', urlsplit(self.driver.current_url or '').path.lower()):
+                self._back_to_chat_list()
         if 'login' in (self.driver.current_url or '').lower():
             logger.warning('Для обработки чатов требуется вход в HH')
             return []

@@ -1194,9 +1194,9 @@ class RejectionAnalyzer(ChatWorkflowMixin):
         try:
             return bool(self.driver.execute_script(
                 "return [...document.querySelectorAll('label')].some(e => "
-                "e.getClientRects().length && /только непрочитанные/i.test(e.innerText || '')) || document.querySelectorAll("
+                "e.getClientRects().length && /только непрочитанные/i.test(e.innerText || '')) || [...document.querySelectorAll("
                 "'[data-qa*=\"chatik-open-chat\"], [class*=\"chat-cell\"], a[href*=\"/chat/\"]'"
-                ").length > 0;"
+                ")].some(e => e.getClientRects().length);"
             ))
         except Exception:
             return False

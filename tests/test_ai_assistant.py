@@ -1029,7 +1029,7 @@ def test_tokenharbor_catalog_refresh_keeps_only_free_text_models(monkeypatch):
     response = Mock()
     response.json.return_value = {'data': [{'id': 'new-flash:free'}, {'id': 'paid-model'}]}
     monkeypatch.setattr('requests.get', Mock(return_value=response))
-    provider = {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1', 'api_key': 'thk_fixture'}
+    provider = {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1', 'api_key': 'thk_synthetic'}
     assert a._discovered_models(provider) == ['new-flash:free']
     assert a._ai_stats['_models']['TokenHarbor']['models'] == ['new-flash:free']
 

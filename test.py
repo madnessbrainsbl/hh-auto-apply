@@ -1907,6 +1907,15 @@ class HHAutoApplicant:
         print(f"{MAGENTA}{BOLD}ПОЛНЫЙ ЦИКЛ: РАЗБОР ОТКАЗОВ -> ПРАВКА РЕЗЮМЕ -> ПОДНЯТИЕ -> ПОИСК -> ОТКЛИКИ{RESET}")
         print(f"{CYAN}{BOLD}{'='*70}{RESET}")
 
+        # Цикл рвался посреди работы, когда hh.ru переставал отвечать. Проверяем доступ сразу и ждём
+        # до 5 минут, а не падаем на этапе резюме.
+        from terminal_ui import wait_for_network
+        if not wait_for_network(300, logging.getLogger(__name__)):
+            print(f"\n{RED}[СТОП] hh.ru не отвечает с этого подключения.{RESET}")
+            print("Причина не определена: сеть, DNS или VPN. Проверьте, открывается ли hh.ru в обычном браузере, "
+                  "и запустите цикл снова.")
+            return
+
         # ЭТАП 1: Глубокий разбор чатов с отказами и адаптация резюме/ответов
         chat_blocked_reason = ''
         if not any(arg in sys.argv for arg in ['--no-chat-audit', '--no-chat', '--skip-chat']):

@@ -2415,3 +2415,35 @@ def test_phone_number_never_reaches_chat_and_refused_telegram_in_any_word_order(
     bot._handle_chat(chat)
     assert 'https://t.me/someone' in bot.send_chat_reply.call_args.args[0]
     assert '9990000000' not in bot.send_chat_reply.call_args.args[0]
+
+
+def test_unread_filter_recovers_by_going_back_from_an_open_chat(bot):
+    # 21.10: на странице открытого чата галочки нет; раньше это сразу останавливало весь цикл.
+    results = iter([False, True])
+    bot._set_unread_filter_once = lambda enabled: next(results)
+    bot._back_to_chat_list = Mock(return_value=True)
+    bot.goto = Mock(return_value=True)
+    assert bot._set_unread_filter(True) is True
+    bot._back_to_chat_list.assert_called_once()
+    bot.goto.assert_not_called()
+
+
+def test_unread_filter_tries_back_then_chat_list_then_gives_up(bot):
+    bot._set_unread_filter_once = Mock(return_value=False)
+    bot._back_to_chat_list = Mock(return_value=True)
+    bot.goto = Mock(return_value=True)
+    assert bot._set_unread_filter(True) is False
+    assert bot._set_unread_filter_once.call_count == 3
+    bot._back_to_chat_list.assert_called_once()
+    bot.goto.assert_called_once_with('https://hh.ru/chat')
+
+
+def test_sweep_started_on_an_open_chat_url_goes_to_the_list_first(bot):
+    bot.driver.current_url = 'https://spb.hh.ru/chat/123?hhtmFrom=app'
+    bot.goto = Mock(return_value=True)
+    bot._back_to_chat_list = Mock(return_value=True)
+    bot._set_unread_filter = Mock(return_value=False)
+    bot._capture_chat_diagnostics = Mock()
+    bot.process_unread_messenger_chats()
+    bot.goto.assert_called_with('https://hh.ru/chat')
+    assert bot._last_chat_open_problem['code'] == 'unread_filter_unconfirmed'

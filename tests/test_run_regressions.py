@@ -563,3 +563,23 @@ def test_parallel_stats_updates_are_serialized():
         list(pool.map(lambda _: assistant._record('gemini', False, 1), range(12)))
     assert collided == []
     assert assistant._ai_stats['gemini']['n'] == 12
+
+
+def test_network_is_up_needs_a_real_http_answer_from_hh(monkeypatch):
+    # TCP к hh.ru открывается, а ответа нет (сбой DNS или маршрута) — это не «связь есть».
+    import socket
+    import requests
+    import terminal_ui
+
+    class FakeSocket:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(socket, 'create_connection', lambda *a, **k: FakeSocket())
+
+    def silent(*a, **k):
+        raise requests.ReadTimeout()
+    monkeypatch.setattr(requests, 'get', silent)
+    assert terminal_ui.network_is_up('hh.ru') is False
+    assert terminal_ui.network_is_up('example.org') is True       # другие хосты — только TCP
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: object())
+    assert terminal_ui.network_is_up('hh.ru') is True

@@ -509,9 +509,23 @@ def network_is_up(host: str = 'hh.ru', timeout: float = 5.0) -> bool:
     import socket
     try:
         with socket.create_connection((host, 443), timeout=timeout):
-            return True
+            pass
     except OSError:
         return False
+    if host != 'hh.ru':
+        return True
+    # Соединение с hh.ru может открываться, а ответа не быть (сбой DNS или маршрута): одной проверки TCP
+    # мало. Нужен настоящий ответ; одна осечка не приговор (разовый ReadTimeout бывает и при рабочем
+    # сайте), поэтому три попытки.
+    import requests
+    for _ in range(3):
+        try:
+            requests.get('https://hh.ru/robots.txt', timeout=(timeout, 10), allow_redirects=False,
+                         headers={'User-Agent': 'Mozilla/5.0'})
+            return True
+        except requests.RequestException:
+            continue
+    return False
 
 
 def wait_for_network(max_seconds: int = 600, log=None, should_stop=None) -> bool:
