@@ -65,6 +65,8 @@ def test_a_sentence_about_vacancy_tenure_is_not_personal_experience():
     '**1.** Уточнить формулировки резюме.\n**2.** Выделить навыки.',
     '__1)__ Уточнить формулировки резюме.',
     '1. Уточнить формулировки резюме.',
+    '- **1.** Уточнить формулировки резюме.\n- **4.** Выделить навыки.',
+    'Шаги: 1) Уточнить формулировки; 4) Выделить навыки.',
 ])
 def test_markdown_list_numbers_are_not_candidate_metrics(text):
     assert fabrication_problem(text, 'Python, Linux, опыт 6 лет', 6) is None
@@ -73,9 +75,28 @@ def test_markdown_list_numbers_are_not_candidate_metrics(text):
 @pytest.mark.parametrize('text', [
     '**1.** Получил 15 сертификатов.',
     '1) Получил 1 сертификат.',
+    'Шаги: 1) Уточнить формулировки; 4) Получил 4 сертификата.',
 ])
 def test_list_number_exemption_does_not_hide_a_metric_with_the_same_number(text):
     assert fabrication_problem(text, 'Python, Linux, опыт 6 лет', 6)
+
+
+@pytest.mark.parametrize('reference', [
+    'ISO 27001', 'ISO/IEC 27001:2022', 'ГОСТ Р 50922-2006',
+    'ГОСТ Р ИСО/МЭК 27001-2021', 'RFC 62443',
+])
+def test_standard_reference_is_not_an_invented_candidate_metric(reference):
+    assert fabrication_problem(f'Изучить требования {reference}.', 'Linux') is None
+    assert fabrication_problem(f'Требования {reference}; выполнил 30 аудитов.', 'Linux')
+
+
+def test_standard_reference_does_not_allow_an_unconfirmed_certificate():
+    assert fabrication_problem('Получил сертификат ISO 27001.', 'Linux')
+
+
+@pytest.mark.parametrize('text', ['not JSON', '{broken}', '[]', '{}'])
+def test_rejection_analysis_rejects_unusable_json(text):
+    assert analysis_fabrication_problem(text, 'Linux')
 
 
 @pytest.mark.parametrize('text', [

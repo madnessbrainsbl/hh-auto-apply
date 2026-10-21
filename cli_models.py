@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import os
 import queue
 import re
 import shutil
@@ -22,15 +23,21 @@ def temporary_cli_directory(prefix):
     try:
         yield path
     finally:
-        # Python 3.10 TemporaryDirectory retries locked directories recursively.
-        try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            logging.getLogger(__name__).warning(
-                'Временная папка CLI пока недоступна для удаления (%s); работа продолжается',
-                type(e).__name__)
+        # Windows may release the CLI working directory just after process exit.
+        for attempt in range(4):
+            try:
+                shutil.rmtree(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as e:
+                if isinstance(e, PermissionError) and attempt < 3:
+                    time.sleep(.05 * (2 ** attempt))
+                    continue
+                logging.getLogger(__name__).warning(
+                    'Временная папка CLI пока недоступна для удаления (%s); '
+                    'ответ ИИ не потерян, работа продолжается', type(e).__name__)
+                break
 
 
 class _PriceTables(HTMLParser):
@@ -87,14 +94,52 @@ def parse_openai_prices(html):
     return prices
 
 
-def fetch_openai_prices():
+def fetch_openai_prices(timeout=10):
     import requests
-    response = requests.get(OPENAI_PRICING_URL, timeout=10)
+    response = requests.get(OPENAI_PRICING_URL, timeout=timeout)
     response.raise_for_status()
     prices = parse_openai_prices(response.text)
     if not prices:
         raise ValueError('Official pricing tables were not found')
     return prices
+
+
+def run_cli_process(command, *, input, cwd, timeout, env=None):
+    # Files avoid waiting for descendant processes holding inherited output pipes.
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        stdin.write(input)
+        stdin.seek(0)
+        process = subprocess.Popen(
+            command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            start_new_session=os.name != 'nt')
+        try:
+            process.wait(timeout=timeout)
+        except BaseException:
+            if os.name == 'nt':
+                if process.poll() is None:
+                    try:
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       timeout=2, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+            else:
+                import signal
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logging.getLogger(__name__).warning('CLI не завершился после остановки; PID %s', process.pid)
+            raise
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(command, process.returncode, stdout.read(), stderr.read())
 
 
 def rank_codex_models(models, prices):
@@ -202,6 +247,6 @@ def cli_problem(detail):
                               'unsupported_model', 'model is not supported',
                               'model is not available', 'invalid model', 'unknown model',
                               'does not exist', 'no access to model', 'not have access to the model')) or re.search(
-                                  r'\bmodel\b[^\n]{0,150}\bis not (?:available|supported)\b', low):
+                                  r'\bmodel\b[^\n]{0,150}\bis (?:not (?:available|supported)|currently unavailable)\b', low):
         return 'model_unavailable'
     return 'request_failed'

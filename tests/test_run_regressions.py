@@ -18,6 +18,7 @@ def questionnaire_bot(error=False):
     bot.get_visible_page_text = lambda: 'ответьте на вопросы работодателя'
     bot.is_response_limit_reached = lambda: False
     bot.page_says_archived = lambda: False
+    bot.page_has_captcha = lambda: False
     if error:
         field_error = Mock()
         field_error.text = 'Ответьте на вопросы работодателя'
@@ -83,6 +84,18 @@ def test_late_questionnaire_fields_are_retried(monkeypatch):
     assert submitted and answered == 2 and error is None
     assert bot.answer_employer_questions.call_count == 2
     bot.click_response_submit_button.assert_called_once_with(modal)
+
+
+def test_resume_is_rechecked_after_questionnaire_before_submit(monkeypatch):
+    bot, modal = modal_questionnaire_bot()
+    bot.answer_employer_questions = Mock(return_value=2)
+    bot.ensure_target_resume_selected = Mock(side_effect=[
+        (True, None), (False, 'target resume changed'),
+    ])
+    monkeypatch.setattr('hh_selenium.time.sleep', lambda _: None)
+    assert bot.submit_open_response_modal('', True) == (False, True, 2, 'target resume changed')
+    assert bot.ensure_target_resume_selected.call_count == 2
+    bot.click_response_submit_button.assert_not_called()
 
 
 def test_unreadable_questionnaire_uses_full_response_page(monkeypatch):
@@ -163,7 +176,7 @@ def test_parallel_cli_denials_are_not_repeated(monkeypatch, tmp_path):
         time.sleep(0.05)
         return subprocess.CompletedProcess([], 1, b'', b'not logged in')
     runner = Mock(side_effect=failed)
-    monkeypatch.setattr('subprocess.run', runner)
+    monkeypatch.setattr('cli_models.run_cli_process', runner)
     barrier = Barrier(3)
     def call(_):
         barrier.wait(timeout=3)
@@ -187,6 +200,270 @@ def test_deferred_analysis_does_not_call_failed_ai_twice_or_write_skills():
     assistant.generate_cover_letter.assert_not_called()
     assistant.db.record_adaptive_skills.assert_not_called()
 
+
+def test_expired_analysis_does_not_request_ai_or_wait_for_network(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['codex']
+    assistant._call_step = Mock(return_value='late answer')
+    wait = Mock()
+    monkeypatch.setattr('terminal_ui.wait_for_network', wait)
+    assert assistant._call_llm('test', deadline=time.monotonic() - 1) is None
+    assistant._call_step.assert_not_called()
+    wait.assert_not_called()
+
+
+def test_analysis_deadline_rejects_late_reply_and_stops_fallback(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['claude', 'codex']
+    assistant._record = Mock()
+    clock = [10.0]
+    monkeypatch.setattr('ai_assistant.time.monotonic', lambda: clock[0])
+    def call(*_args):
+        clock[0] = 20.0
+        return 'late answer'
+    assistant._call_step = Mock(side_effect=call)
+    assert assistant._call_llm('test', deadline=15.0) is None
+    assistant._call_step.assert_called_once()
+    assistant._call_step = Mock(return_value='normal answer')
+    assert assistant._call_llm('test') == 'normal answer'
+
+
+def test_analysis_wait_for_busy_provider_is_bounded():
+    from threading import Event
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['codex']
+    assistant._call_cli_providers = Mock()
+    held, release = Event(), Event()
+    def hold():
+        with assistant._provider_lock('codex'):
+            held.set()
+            release.wait(2)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(hold)
+        assert held.wait(1)
+        try:
+            started = time.monotonic()
+            assert assistant._call_llm('test', deadline=started + .05) is None
+            assert time.monotonic() - started < .5
+            assistant._call_cli_providers.assert_not_called()
+        finally:
+            release.set()
+            future.result(timeout=1)
+
+
+def test_busy_analysis_provider_does_not_starve_free_fallback():
+    from threading import Event
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['claude', 'codex']
+    assistant._record = Mock()
+    assistant._call_cli_providers = Mock(return_value='analysis')
+    held, release = Event(), Event()
+    def hold():
+        with assistant._provider_lock('claude'):
+            held.set()
+            release.wait(2)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(hold)
+        assert held.wait(1)
+        try:
+            assert assistant._call_llm('test', deadline=time.monotonic() + .2) == 'analysis'
+            assistant._call_cli_providers.assert_called_once_with('test', None, only=['codex'])
+        finally:
+            release.set()
+            future.result(timeout=1)
+
+
+def test_rejection_request_passes_per_item_deadline_and_preserves_deferred_state():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.candidate_profile = {'skills': []}
+    assistant.db = Mock()
+    assistant._call_llm = Mock(return_value=None)
+    assistant._heuristic_cover_letter = Mock(return_value='template')
+    result = assistant.analyze_chat_rejection('AppSec', 'Synthetic', '')
+    assert result['heuristic']
+    assert assistant._call_llm.call_args.kwargs['deadline'] == float('inf')
+    assistant.db.record_adaptive_skills.assert_not_called()
+
+
+def test_analysis_gives_fallback_its_own_request_budget(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['claude', 'codex']
+    assistant._record = Mock()
+    clock = [100.0]
+    monkeypatch.setattr('ai_assistant.time.monotonic', lambda: clock[0])
+    def call(step, *_args):
+        if step == 'claude':
+            clock[0] += 61          # CLI получает до 60 с на попытку (14.10)
+            return 'late'
+        assert assistant._request_timeout(120) == 60
+        clock[0] += 20
+        return 'valid analysis'
+    assistant._call_step = Mock(side_effect=call)
+    assert assistant._call_llm('test', deadline=float('inf')) == 'valid analysis'
+    assert [c.args[0] for c in assistant._call_step.call_args_list] == ['claude', 'codex']
+
+
+def test_analysis_tries_other_service_before_more_models_of_failed_service(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['compat:slow', 'compat:other', 'codex']
+    assistant._compat_providers = lambda: [{'base_url': 'http://synthetic/v1', 'models': ['slow', 'other']}]
+    assistant._record = Mock()
+    def call(step, *_args):
+        return 'analysis' if step == 'codex' else None
+    assistant._call_step = Mock(side_effect=call)
+    assert assistant._call_llm('test', deadline=float('inf')) == 'analysis'
+    assert [c.args[0] for c in assistant._call_step.call_args_list] == ['compat:slow', 'codex']
+    assistant._call_step.reset_mock()
+    assert assistant._call_llm('test') == 'analysis'
+    assert [c.args[0] for c in assistant._call_step.call_args_list] == ['compat:other', 'codex']
+    # After cooldown the provider can be checked again, without a permanent blacklist.
+    assistant._ai_stats = {}
+    assistant._call_step = Mock(side_effect=lambda step, *_: 'analysis' if step == 'compat:other' else None)
+    assert assistant._call_llm('test', deadline=float('inf')) == 'analysis'
+    assert [c.args[0] for c in assistant._call_step.call_args_list] == ['compat:slow', 'codex', 'compat:other']
+
+
+@pytest.mark.parametrize('provider', ['compat', 'gemini', 'groq', 'openai', 'cli'])
+def test_analysis_deadline_reaches_actual_provider_timeout(provider, monkeypatch):
+    from types import SimpleNamespace
+    import subprocess
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.timeout = 60
+    assistant.temperature = .3
+    assistant.model_name = 'synthetic-model'
+    assistant._record = Mock()
+    assistant.ai_order = lambda: ['synthetic']
+    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='answer'))])
+    client = Mock()
+    client.chat.completions.create.return_value = response
+    if provider == 'compat':
+        assistant._compat_providers = lambda: [{'name': 'Synthetic', 'base_url': 'http://localhost/v1', 'model': 'model'}]
+        assistant._compat_clients = {'Synthetic': client}
+        assistant._compat_dead_models, assistant._compat_rest = set(), {}
+        request = lambda *args: assistant._call_compat_providers('test', None)
+        runner = client.chat.completions.create
+    elif provider == 'gemini':
+        assistant._gemini_client = Mock()
+        assistant._gemini_client.generate_content.return_value = SimpleNamespace(text='answer')
+        assistant._openai_client = None
+        assistant.ensure_model_resolved = lambda: None
+        request = lambda *args: assistant._call_llm_api('test')
+        runner = assistant._gemini_client.generate_content
+    elif provider == 'groq':
+        assistant.backup_key = 'synthetic'
+        assistant._backup_client = client
+        request = lambda *args: assistant._call_backup_provider('test')
+        runner = client.chat.completions.create
+    elif provider == 'openai':
+        assistant._gemini_client = None
+        assistant._openai_client = client
+        client.with_options.return_value = client
+        assistant.ensure_model_resolved = lambda: None
+        request = lambda *args: assistant._call_llm_api('test')
+        runner = client.chat.completions.create
+    else:
+        assistant.find_cli = lambda _: 'synthetic-cli'
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0, b'{"result":"answer"}', b''))
+        monkeypatch.setattr('cli_models.run_cli_process', runner)
+        request = lambda *args: assistant._run_cli_request('claude', {'model': 'haiku'}, 'test', None)['text']
+    assistant._call_step = request
+    assert assistant._call_llm('test', deadline=time.monotonic() + 30) == 'answer'
+    kwargs = runner.call_args.kwargs
+    timeout = kwargs['request_options']['timeout'] if provider == 'gemini' else kwargs['timeout']
+    assert 29 < timeout <= 30
+    if provider == 'openai':
+        client.with_options.assert_called_once_with(max_retries=0)
+
+
+def test_parallel_analysis_deadlines_do_not_leak_between_threads():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['synthetic']
+    assistant._record = Mock()
+    barrier = Barrier(2)
+    def request(*_args):
+        barrier.wait(timeout=1)
+        return str(assistant._request_timeout(180))
+    assistant._call_step = request
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda budget: assistant._call_llm(
+            'test', deadline=time.monotonic() + budget), [3, 30]))
+    assert 0 < float(results[0]) <= 3
+    assert 29 < float(results[1]) <= 30
+
+
+def test_analysis_missing_letter_does_not_start_another_unbounded_request():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.candidate_profile = {'skills': []}
+    assistant._call_llm = Mock(return_value='{"rejection_root_cause":"unspecified"}')
+    assistant._heuristic_cover_letter = Mock(return_value='template')
+    assistant.generate_cover_letter = Mock()
+    result = assistant.analyze_chat_rejection('AppSec', 'Synthetic', '')
+    assert result['improved_cover_letter'] == 'template'
+    assistant._call_llm.assert_called_once()
+    assistant.generate_cover_letter.assert_not_called()
+
+
+def test_deferred_analysis_keeps_per_provider_diagnostics(monkeypatch, caplog):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.candidate_profile = {'skills': []}
+    assistant.ai_order = lambda: ['claude', 'codex']
+    assistant._record = Mock()
+    assistant._heuristic_cover_letter = Mock(return_value='template')
+    assistant._call_step = Mock(side_effect=[TimeoutError(), '{broken}'])
+    with caplog.at_level('INFO', logger='ai_assistant'):
+        result = assistant.analyze_chat_rejection('Synthetic', 'Synthetic', '')
+    assert result['heuristic']
+    assert [row['status'] for row in result['ai_attempts']] == ['timeout', 'invalid_response']
+    assert result['ai_attempts'][1]['reason'] == 'invalid_json'
+    assert all(row['seconds'] >= 0 for row in result['ai_attempts'])
+    assert 'claude' in caplog.text and 'codex' in caplog.text
+
+
+def test_analysis_catalog_and_prices_share_step_budget(monkeypatch):
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.ai_order = lambda: ['codex']
+    assistant._record = Mock()
+    assistant._ai_stats = {}
+    assistant._save_stats = Mock()
+    assistant.find_cli = lambda _: 'synthetic-cli'
+    clock = [100.0]
+    monkeypatch.setattr('ai_assistant.time.monotonic', lambda: clock[0])
+    def catalog(_exe, timeout=20):
+        assert timeout <= 20
+        clock[0] += 58          # CLI-попытка длится до 60 с (14.10); на цены остаётся ~2 с
+        return [{'model': 'gpt-future-luna'}]
+    prices = Mock(return_value={})
+    monkeypatch.setattr('cli_models.codex_catalog', catalog)
+    monkeypatch.setattr('cli_models.fetch_openai_prices', prices)
+    assistant._call_step = lambda *_: (assistant._discover_cli_models('codex') and None)
+    assert assistant._call_llm('test', deadline=float('inf')) is None
+    assert 0 < prices.call_args.kwargs['timeout'] <= 2
+
+
+def test_invalid_analysis_json_falls_back_to_next_provider():
+    assistant = AIAssistant.__new__(AIAssistant)
+    assistant.enabled = True
+    assistant.candidate_profile = {'skills': []}
+    assistant.ai_order = lambda: ['claude', 'codex']
+    assistant._record = Mock()
+    assistant._heuristic_cover_letter = Mock(return_value='template')
+    assistant._call_step = Mock(side_effect=['{broken}', '{"rejection_root_cause":"Synthetic reason"}'])
+    result = assistant.analyze_chat_rejection('Synthetic', 'Synthetic', '')
+    assert not result.get('heuristic')
+    assert result['rejection_root_cause'] == 'Synthetic reason'
+    assert assistant._call_step.call_count == 2
 
 def test_browser_continues_past_local_200_until_hh_blocks():
     bot = HHSeleniumBot.__new__(HHSeleniumBot)

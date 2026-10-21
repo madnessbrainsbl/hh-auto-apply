@@ -2,7 +2,10 @@
 from unittest.mock import Mock
 
 import pytest
-from selenium.common.exceptions import ElementClickInterceptedException, NoSuchWindowException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException, NoSuchWindowException, StaleElementReferenceException,
+    WebDriverException,
+)
 
 import terminal_ui
 from hh_selenium import HHSeleniumBot
@@ -54,6 +57,22 @@ def test_login_requires_account_controls():
     driver = LoginDriver()
     driver.sign_in()
     assert terminal_ui.is_hh_logged_in(driver) is True
+    driver.login_buttons = [Mock()]
+    assert terminal_ui.is_hh_logged_in(driver) is False
+
+
+def test_new_mobile_profile_control_confirms_login_unless_login_button_is_visible():
+    driver = LoginDriver('https://hh.ru/vacancy/138611522')
+    profile = Mock()
+    profile.is_displayed.return_value = True
+    profile.get_attribute.return_value = 'mainmenu_applicantProfileMobileDrop'
+    original = driver.find_elements
+    driver.find_elements = lambda by, selector: (
+        [profile] if selector == '[data-qa="mainmenu_applicantProfileMobileDrop"]' else original(by, selector))
+    assert terminal_ui.is_hh_logged_in(driver) is True
+    profile.is_displayed.return_value = False
+    assert terminal_ui.is_hh_logged_in(driver) is False
+    profile.is_displayed.return_value = True
     driver.login_buttons = [Mock()]
     assert terminal_ui.is_hh_logged_in(driver) is False
 
@@ -138,6 +157,79 @@ def test_headless_does_not_wait_for_impossible_manual_login(monkeypatch):
     monkeypatch.setattr(terminal_ui, 'wait_for_hh_login', wait)
     assert terminal_ui.ensure_hh_login(driver, headless=True) is False
     wait.assert_not_called()
+
+
+def test_login_check_recovers_updated_dom_without_reloading(monkeypatch):
+    driver = LoginDriver()
+    check = Mock(side_effect=[StaleElementReferenceException(), True])
+    monkeypatch.setattr(terminal_ui, 'is_hh_logged_in', check)
+    monkeypatch.setattr('time.sleep', lambda _seconds: None)
+    assert terminal_ui.ensure_hh_login(driver, headless=True) is True
+    driver.get.assert_called_once_with(terminal_ui.HH_RESUMES_URL)
+    assert check.call_count == 2
+
+
+def test_login_check_persistent_dom_changes_are_bounded(monkeypatch):
+    driver = LoginDriver()
+    check = Mock(side_effect=StaleElementReferenceException())
+    monkeypatch.setattr(terminal_ui, 'is_hh_logged_in', check)
+    monkeypatch.setattr('time.sleep', lambda _seconds: None)
+    assert terminal_ui.ensure_hh_login(driver, headless=True) is False
+    assert check.call_count == 3
+    driver.get.assert_called_once_with(terminal_ui.HH_RESUMES_URL)
+
+
+def test_login_check_retries_dns_failure_before_skipping_chats(monkeypatch):
+    driver = LoginDriver()
+    driver.sign_in()
+    driver.get.side_effect = [WebDriverException('net::ERR_NAME_NOT_RESOLVED'), None]
+    wait = Mock(return_value=True)
+    monkeypatch.setattr(terminal_ui, 'wait_for_network', wait)
+    assert terminal_ui.ensure_hh_login(driver, headless=True) is True
+    assert driver.get.call_count == 2
+    wait.assert_called_once()
+
+
+@pytest.mark.parametrize('network_back, calls, waits', [(True, 3, 2), (False, 1, 1)])
+def test_login_check_network_retries_are_bounded(monkeypatch, network_back, calls, waits):
+    driver = LoginDriver()
+    driver.get.side_effect = WebDriverException('net::ERR_NAME_NOT_RESOLVED')
+    wait = Mock(return_value=network_back)
+    monkeypatch.setattr(terminal_ui, 'wait_for_network', wait)
+    assert terminal_ui.ensure_hh_login(driver, headless=True) is False
+    assert driver.get.call_count == calls
+    assert wait.call_count == waits
+
+
+def test_login_check_does_not_retry_closed_browser(monkeypatch):
+    driver = LoginDriver()
+    driver.get.side_effect = NoSuchWindowException()
+    wait = Mock()
+    monkeypatch.setattr(terminal_ui, 'wait_for_network', wait)
+    assert terminal_ui.ensure_hh_login(driver, headless=True) is False
+    driver.get.assert_called_once()
+    wait.assert_not_called()
+
+
+def test_login_check_stop_does_not_navigate(monkeypatch):
+    driver = LoginDriver()
+    assert terminal_ui.ensure_hh_login(driver, should_stop=lambda: True) is False
+    driver.get.assert_not_called()
+
+
+@pytest.mark.parametrize('configured, expected', [(None, '20'), ('45', '45')])
+def test_chrome_service_bounds_manager_network_wait(tmp_path, monkeypatch, configured, expected):
+    if configured is None:
+        monkeypatch.delenv('SE_TIMEOUT', raising=False)
+    else:
+        monkeypatch.setenv('SE_TIMEOUT', configured)
+    monkeypatch.setenv('CHROMEDRIVER', str(tmp_path / 'driver.exe'))
+    factory = Mock()
+    monkeypatch.setattr('selenium.webdriver.chrome.service.Service', factory)
+    terminal_ui.chrome_service(str(tmp_path))
+    assert terminal_ui.os.environ['SE_TIMEOUT'] == expected
+    assert factory.call_args.kwargs['executable_path'] == str(tmp_path / 'driver.exe')
+    factory.call_args.kwargs['log_output'].close()
 
 
 @pytest.mark.parametrize('cls', [RejectionAnalyzer, HHResumeUpdater])

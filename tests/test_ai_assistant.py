@@ -6,23 +6,14 @@ import copy
 
 import pytest
 from ai_assistant import AIAssistant, DEFAULT_CANDIDATE_PROFILE
-
-TEST_PROFILE = {
-    **copy.deepcopy(DEFAULT_CANDIDATE_PROFILE),
-    "name": "Иван",
-    "specialization": "Python Developer / Application Security",
-    "experience_years": 3,
-    "skills": ["Python", "Docker", "PostgreSQL", "Linux",
-               "Application Security", "Penetration Testing", "DevSecOps"],
-    "contacts": {"github": "https://github.com/example", "telegram": "", "email": ""},
-}
+REAL_COMPAT_PROVIDERS = AIAssistant._compat_providers
 
 
 @pytest.fixture
 def assistant():
     config = {
         "ai_config": {"enabled": False},  # Тестируем надежный эвристический движок без внешних вызовов
-        "candidate_profile": TEST_PROFILE
+        "candidate_profile": DEFAULT_CANDIDATE_PROFILE
     }
     return AIAssistant(config)
 
@@ -347,9 +338,9 @@ def test_primary_ai_goes_first_in_chain():
     assert assistant._call_llm('p') == 'письмо'
     assert calls == ['claude', 'compat:claude-sonnet-4-6', 'compat:gemini-3.8-flash', 'gemini']
 
-    # 'compat' — все модели сервиса первыми.
+    # A manual pin must not put failed models ahead of a tested working spare.
     assistant.ai_config['primary_ai'] = 'compat'
-    assert assistant.ai_order()[:2] == STEPS[:2]
+    assert assistant.ai_order()[0] == 'gemini'
 
     # «Авто» без истории — обычный порядок.
     calls.clear()
@@ -381,14 +372,13 @@ def test_unknown_ai_does_not_beat_measured_one():
     assert assistant.ai_order()[0] == 'compat:claude-sonnet-4-6'
 
 
-def test_auto_explores_rarely_only_with_measured_leader():
-    """Иногда пробует первым малоизученного — но только когда есть замеренный лидер."""
+def test_auto_keeps_ready_leader_instead_of_exploring_on_business_tasks():
     assistant = _assistant({})
     assistant.ai_config['auto_explore'] = 1.0      # всегда исследовать
     assert assistant.ai_order() == STEPS            # данных нет — обычный порядок
     for _ in range(3):
         assistant._record('compat:gemini-3.8-flash', True, 2.0)
-    assert assistant.ai_order()[0] != 'compat:gemini-3.8-flash'
+    assert assistant.ai_order()[0] == 'compat:gemini-3.8-flash'
 
 
 def test_letter_quality_check():
@@ -557,6 +547,48 @@ def test_compat_minute_quota_is_not_treated_as_daily():
     assert a._call_step('compat:m2', 'p', None) == 'Письмо'
 
 
+def test_daily_token_quota_is_not_a_short_rate_limit():
+    assert AIAssistant.is_daily_limit('Daily token quota exceeded. Retry after 9746 seconds.')
+    assert not AIAssistant.is_daily_limit('Requests quota per minute exceeded.')
+
+
+def test_compat_unavailable_model_400_is_not_requested_again(caplog):
+    import httpx, openai
+    from unittest.mock import Mock
+    a, _, req = _compat_assistant({'m1': None})
+    request = Mock(side_effect=openai.BadRequestError(
+        "Model 'm1' is currently unavailable.", response=httpx.Response(400, request=req), body=None))
+    a._compat_clients['LLM7'].chat.completions.create = request
+    with caplog.at_level('WARNING'):
+        assert a._call_step('compat:m1', 'test', None) is None
+        assert a._call_step('compat:m1', 'test', None) is None
+    assert request.call_count == 1
+    assert ('LLM7', 'm1') in a._compat_dead_models
+    assert 'модель недоступна' in caplog.text
+
+
+@pytest.mark.parametrize('status,message,hint', [
+    (401, 'Unauthorized', 'авторизация'),
+    (402, 'Insufficient balance', 'баланс'),
+    (403, 'Forbidden', 'доступ'),
+    (429, 'Daily token quota exceeded', 'суточная квота'),
+    (400, "Model 'm1' is currently unavailable.", 'модель недоступна'),
+])
+def test_provider_probe_explains_http_failure_without_response_body(monkeypatch, caplog, status, message, hint):
+    from unittest.mock import Mock
+    a, _, _ = _compat_assistant({'m1': None})
+    class Failure(Exception):
+        status_code = status
+    client = Mock()
+    client.chat.completions.create.side_effect = Failure(message + ' private-secret')
+    monkeypatch.setattr('openai.OpenAI', lambda **_: client)
+    with caplog.at_level('WARNING'):
+        assert a._probe_one('compat:m1')[1] is False
+    warnings = '\n'.join(row.message for row in caplog.records if row.levelno == 30)
+    assert hint in warnings
+    assert 'private-secret' not in warnings
+
+
 def test_compat_forbidden_is_not_reported_as_not_running(caplog):
     """403 от удалённого сервиса — «отказал в доступе», а не «забыли включить»."""
     import httpx, openai
@@ -584,6 +616,17 @@ def test_compat_timeout_does_not_disable_service():
     assert 'LLM7' not in a._compat_rest
 
 
+def test_compat_timed_out_model_does_not_delay_each_next_request():
+    import openai
+    models = {'m1': None, 'm2': None}
+    a, calls, req = _compat_assistant(models)
+    models['m1'] = openai.APITimeoutError(request=req)
+    assert a._call_compat_providers('p', None)
+    assert a._call_compat_providers('p', None)
+    assert calls.count('m1') == 1 and calls.count('m2') == 2
+    assert 'LLM7' not in a._compat_rest
+
+
 def test_invalid_gemini_key_is_explained():
     """Ключ «0» в настройках: пользователь видит «ключ недействителен», а не «неизвестный сбой»."""
     from terminal_ui import explain_error
@@ -591,11 +634,11 @@ def test_invalid_gemini_key_is_explained():
     assert 'ключ недействителен' in msg
 
 
-def test_fabrication_check_rejects_invented_projects_and_names():
-    """Вымышленные проекты и имя адресата: «более 15 проектов», «Уважаемая Татьяна» — не из профиля и не из чата."""
+def test_fabrication_check_on_real_analysis_28_09():
+    """28.09 разбор через Groq: «более 15 проектов», «Уважаемая Татьяна» — не из профиля и не из чата."""
     import json
     from ai_assistant import fabrication_problem, analysis_fabrication_problem
-    source = ('Вакансия: Руководитель группы ИБ в Компания-пример\n'
+    source = ('Вакансия: Руководитель группы ИБ в Красный Яр\n'
               'Переписка: [Работодатель]: К сожалению, мы не готовы пригласить вас.\n'
               'Профиль: {"experience_years": 6.75, "skills": ["OWASP Top 10", "152-ФЗ"]}')
     bad_about = 'За 6 лет реализовал более 15 проектов по защите в облаке.'
@@ -689,6 +732,18 @@ def test_salary_questions_never_get_a_number():
     assert not is_salary_question('Опыт работы с Kubernetes')
 
 
+@pytest.mark.parametrize('question', [
+    'Как ты относишься к Альфа-банку как зарплатной карте? Не против ли ты, чтобы мы ее завели?',
+    'Готовы оформить зарплатную карту?',
+    'Can you use our payroll card?',
+])
+def test_payroll_card_is_not_a_salary_amount_question(question):
+    from ai_assistant import is_salary_question, is_restricted_question
+    assert not is_salary_question(question)
+    assert not is_restricted_question(question)
+    assert is_salary_question(question + ' Какую зарплату ожидаете?')
+
+
 def test_fabrication_check_accepts_reformatted_phone_time_and_list_markers():
     """30.09: «+7 999 000-00-00» (в профиле «+79990000000»), «14:00» (в чате «14-00»), «1)» — не выдумки."""
     from ai_assistant import fabrication_problem
@@ -777,8 +832,8 @@ def test_template_letter_stack_grounded_deduped_and_vacancy_aware():
     assert len(names) == len(set(names)) and 'terraform' not in stack.lower()
 
 
-def test_primary_ai_can_pin_whole_service_by_name():
-    """«Antigravity всегда первым»: закреплён сервис целиком, даже при плохой статистике."""
+def test_pinned_service_with_failed_models_uses_available_fallback():
+    """Закрепление сервиса не поднимает модели, не ответившие при проверке."""
     a = AIAssistant.__new__(AIAssistant)
     a.ai_config = {'primary_ai': 'Antigravity', 'auto_explore': 0, 'cli_providers': ['claude'],
                    'openai_compatible': [
@@ -789,8 +844,9 @@ def test_primary_ai_can_pin_whole_service_by_name():
                              'compat:m-b': {'avg': 8, 'success': 0.5, 'n': 10},
                              'claude': {'avg': 3, 'success': 0.99, 'n': 50}, '_down': ['compat:m-a', 'compat:m-b']}
     order = a.ai_order()
-    assert order[:2] == ['compat:m-a', 'compat:m-b']   # порядок из настроек, не из статистики
-    assert order.index('claude') > 1
+    assert order[:2] == ['claude', 'compat:m-c']
+    assert order.index('compat:m-a') > order.index('claude')
+    assert order.index('compat:m-b') > order.index('claude')
 
 
 def test_rank_service_models_picks_best_and_follows_new_releases():
@@ -805,6 +861,209 @@ def test_rank_service_models_picks_best_and_follows_new_releases():
     assert 'claude-opus-5-6' in rank_service_models(newer) and 'claude-opus-5-5' not in rank_service_models(newer)
 
 
+def test_tokenharbor_models_never_add_paid_or_media_routes():
+    from ai_assistant import rank_tokenharbor_models
+    assert rank_tokenharbor_models([
+        'deepseek-v4-pro', 'deepseek-v4-flash:free', 'image-model:free',
+        'claude-sonnet-5:free', 'deepseek-v4-flash:free', 'embedding-model:free',
+    ]) == ['deepseek-v4-flash:free', 'claude-sonnet-5:free']
+
+
+def test_tokenharbor_keeps_all_free_candidates_and_ranks_measured_speed():
+    from ai_assistant import rank_tokenharbor_models
+    ids = [f'model-{i}:free' for i in range(8)] + ['new-flash:free', 'paid-model']
+    stats = {'compat:model-7:free': {'avg': 1, 'success': 1, 'n': 3},
+             'compat:new-flash:free': {'avg': 12, 'success': 1, 'n': 3}}
+    ranked = rank_tokenharbor_models(ids, stats)
+    assert len(ranked) == 9
+    assert ranked[0] == 'model-7:free'
+    assert 'paid-model' not in ranked
+
+
+def test_tokenharbor_free_routes_precede_cli_even_when_cli_faster():
+    a = _assistant({'auto_explore': 1})
+    a.ai_config['auto_explore'] = 1
+    a.steps = lambda: ['codex', 'compat:slow:free', 'compat:fast:free']
+    a._ai_stats = {'codex': {'avg': .1, 'success': 1, 'n': 10},
+                   'compat:slow:free': {'avg': 9, 'success': 1, 'n': 3},
+                   'compat:fast:free': {'avg': 2, 'success': 1, 'n': 3}}
+    assert a.ai_order() == ['compat:fast:free', 'compat:slow:free', 'codex']
+
+
+def test_unavailable_free_model_does_not_block_working_fallback():
+    a = _assistant({})
+    a.steps = lambda: ['compat:model:free', 'codex']
+    a._ai_stats = {'_down': ['compat:model:free']}
+    assert a.ai_order() == ['codex', 'compat:model:free']
+
+
+def test_exploration_never_moves_unknown_nonfree_ahead_of_free_leader():
+    a = _assistant({})
+    a.ai_config['auto_explore'] = 1
+    a.steps = lambda: ['codex', 'compat:fast:free']
+    a._ai_stats = {'compat:fast:free': {'avg': 2, 'success': 1, 'n': 3}}
+    assert a.ai_order() == ['compat:fast:free', 'codex']
+
+
+def test_pinned_tokenharbor_uses_speed_and_filters_paid_config_routes():
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'primary_ai': 'TokenHarbor', 'openai_compatible': [
+        {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1',
+         'models': ['new-flash:free', 'fast:free', 'paid-model']}]}
+    a._ai_stats = {'compat:fast:free': {'avg': 1, 'success': 1, 'n': 3}}
+    a._compat_providers = lambda: REAL_COMPAT_PROVIDERS(a)
+    assert a.ai_order()[0] == 'compat:fast:free'
+    assert 'compat:paid-model' not in a.ai_order()
+
+
+def test_pinned_service_keeps_primary_then_uses_fast_free_fallback(monkeypatch):
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'primary_ai': 'Antigravity', 'auto_explore': 0}
+    a._compat_providers = lambda: [
+        {'name': 'Antigravity', 'models': ['flash', 'opus'], 'base_url': 'http://127.0.0.1:1/v1'},
+        {'name': 'TokenHarbor', 'models': ['slow:free', 'fast:free'], 'base_url': 'https://tokenharbor.ai/v1'}]
+    a._ai_stats = {'compat:flash': {'avg': 22, 'success': 1, 'n': 3},
+                   'compat:opus': {'avg': 19, 'success': 1, 'n': 3},
+                   'compat:slow:free': {'avg': 9, 'success': 1, 'n': 3},
+                   'compat:fast:free': {'avg': 2, 'success': 1, 'n': 3}}
+    order = a.ai_order()
+    # 14.10: все рабочие модели закреплённого сервиса первыми, затем остальные по скорости.
+    assert order[:4] == ['compat:flash', 'compat:opus', 'compat:fast:free', 'compat:slow:free']
+    calls = []
+    a.enabled = True
+    a._record = lambda *args: None
+
+    def call(step, *args):
+        calls.append(step)
+        return 'готов' if step == 'compat:fast:free' else None
+
+    monkeypatch.setattr(a, '_call_step', call)
+    assert a._call_llm('synthetic test without candidate data') == 'готов'
+    assert calls == ['compat:flash', 'compat:opus', 'compat:fast:free']
+
+
+def test_pinned_service_does_not_put_failed_model_before_available_free_fallback():
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'primary_ai': 'Antigravity', 'auto_explore': 0}
+    a._compat_providers = lambda: [
+        {'name': 'Antigravity', 'models': ['flash'], 'base_url': 'http://127.0.0.1:1/v1'},
+        {'name': 'TokenHarbor', 'models': ['fast:free'], 'base_url': 'https://tokenharbor.ai/v1'}]
+    a._ai_stats = {'_down': ['compat:flash']}
+    assert a.ai_order()[0] == 'compat:fast:free'
+
+
+def test_tokenharbor_empty_catalog_removes_retired_models(monkeypatch):
+    from unittest.mock import Mock
+    import time
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'openai_compatible': [
+        {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1',
+         'auto_models': True, 'models': ['retired:free']}]}
+    a._ai_stats = {'_models': {'TokenHarbor': {'at': time.time() - 601,
+                                             'models': ['retired:free']}}}
+    a._save_stats = Mock()
+    response = Mock()
+    response.json.return_value = {'data': [{'id': 'paid-model'}]}
+    get = Mock(return_value=response)
+    monkeypatch.setattr('requests.get', get)
+    assert REAL_COMPAT_PROVIDERS(a)[0]['models'] == []
+    assert REAL_COMPAT_PROVIDERS(a)[0]['models'] == []
+    assert get.call_count == 1
+
+
+def test_tokenharbor_catalog_failure_preserves_free_cached_routes(monkeypatch):
+    from unittest.mock import Mock
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'openai_compatible': [
+        {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1',
+         'auto_models': True, 'models': ['configured:free']}]}
+    a._ai_stats = {'_models': {'TokenHarbor': {'at': 0, 'models': ['cached:free']}}}
+    a._save_stats = Mock()
+    monkeypatch.setattr('requests.get', Mock(side_effect=TimeoutError))
+    assert REAL_COMPAT_PROVIDERS(a)[0]['models'] == ['cached:free']
+
+
+def test_tokenharbor_catalog_refresh_replaces_old_model_after_ten_minutes(monkeypatch):
+    from unittest.mock import Mock
+    import time
+    a = AIAssistant.__new__(AIAssistant)
+    a._ai_stats = {'_models': {'TokenHarbor': {'at': time.time() - 601,
+                                             'models': ['old:free']}}}
+    a._save_stats = Mock()
+    response = Mock()
+    response.json.return_value = {'data': [{'id': 'new:free'}]}
+    monkeypatch.setattr('requests.get', Mock(return_value=response))
+    provider = {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1'}
+    assert a._discovered_models(provider) == ['new:free']
+
+
+def test_invalid_tokenharbor_catalog_never_erases_cached_models(monkeypatch):
+    from unittest.mock import Mock
+    a = AIAssistant.__new__(AIAssistant)
+    a._ai_stats = {'_models': {'TokenHarbor': {'at': 0, 'models': ['cached:free']}}}
+    a._save_stats = Mock()
+    response = Mock()
+    response.json.return_value = {'error': 'temporarily unavailable'}
+    monkeypatch.setattr('requests.get', Mock(return_value=response))
+    provider = {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1'}
+    assert a._discovered_models(provider) == ['cached:free']
+    a._save_stats.assert_not_called()
+
+
+def test_compatible_provider_resolves_key_from_its_environment(monkeypatch):
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'openai_compatible': [{'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1',
+                                        'api_key_env': 'TOKEN_HARBOR_API_KEY', 'models': ['model:free']}]}
+    monkeypatch.delenv('TOKEN_HARBOR_API_KEY', raising=False)
+    assert REAL_COMPAT_PROVIDERS(a) == []
+    monkeypatch.setenv('TOKEN_HARBOR_API_KEY', 'thk_synthetic')
+    assert REAL_COMPAT_PROVIDERS(a)[0]['api_key'] == 'thk_synthetic'
+    assert 'api_key' not in a.ai_config['openai_compatible'][0]
+
+
+def test_tokenharbor_catalog_refresh_keeps_only_free_text_models(monkeypatch):
+    from unittest.mock import Mock
+    a = AIAssistant.__new__(AIAssistant)
+    a._ai_stats = {}
+    a._save_stats = Mock()
+    response = Mock()
+    response.json.return_value = {'data': [{'id': 'new-flash:free'}, {'id': 'paid-model'}]}
+    monkeypatch.setattr('requests.get', Mock(return_value=response))
+    provider = {'name': 'TokenHarbor', 'base_url': 'https://tokenharbor.ai/v1', 'api_key': 'thk_fixture'}
+    assert a._discovered_models(provider) == ['new-flash:free']
+    assert a._ai_stats['_models']['TokenHarbor']['models'] == ['new-flash:free']
+
+
+def test_new_provider_is_probed_even_when_previous_queue_probe_is_fresh():
+    from unittest.mock import Mock
+    import time
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'cli_providers': []}
+    a._ai_stats = {'_probe_version': a.PROBE_VERSION, '_probed_at': time.time(),
+                   '_probe_compat_steps': ['compat:old']}
+    a._save_stats = Mock()
+    a._compat_providers = lambda: []
+    a.steps = lambda: ['compat:old', 'compat:new:free']
+    a._probe_one = Mock(side_effect=lambda step: (step, True, .1))
+    assert len(a.probe_providers()) == 2
+    assert a._probe_one.call_count == 2
+
+
+def test_latency_reordering_does_not_repeat_fresh_provider_probe():
+    from unittest.mock import Mock
+    import time
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'cli_providers': []}
+    a._ai_stats = {'_probe_version': a.PROBE_VERSION, '_probed_at': time.time(),
+                   '_probe_compat_steps': ['compat:a:free', 'compat:b:free']}
+    a._save_stats = Mock()
+    a._compat_providers = lambda: []
+    a.steps = lambda: ['compat:b:free', 'compat:a:free']
+    a._probe_one = Mock()
+    assert a.probe_providers() == []
+    a._probe_one.assert_not_called()
+
+
 def test_employer_contact_request_gets_answer_with_telegram():
     """Работодатель пишет «хотим связаться» без вопроса — бот соглашается и даёт Telegram из профиля."""
     from chat_workflow import wants_contact, contact_reply
@@ -812,8 +1071,8 @@ def test_employer_contact_request_gets_answer_with_telegram():
     assert wants_contact('Предлагаем обсудить детали в телеграм')
     assert not wants_contact('Рассмотрим ваше резюме. Если навыки и опыт подойдут, мы свяжемся с вами.')
     assert not wants_contact('К сожалению, мы не готовы пригласить вас на следующий этап.')
-    reply = contact_reply({'contacts': {'telegram': 'candidate_example'}})
-    assert '@candidate_example' in reply and 'готов обсудить' in reply
+    reply = contact_reply({'contacts': {'telegram': 'someone'}}, 'Оставьте ваш контакт для связи')
+    assert '@someone' in reply and 'Telegram' in reply
     assert 'Telegram' not in contact_reply({'contacts': {}})
 
 
@@ -926,10 +1185,82 @@ def test_recently_answered_chats_are_revisited_when_employer_wrote_again():
     assert summary['viewed'] == 1
 
 
-def test_default_candidate_profile_has_no_personal_data_or_assumed_skills():
-    assert not DEFAULT_CANDIDATE_PROFILE["name"]
-    assert not DEFAULT_CANDIDATE_PROFILE["specialization"]
-    assert DEFAULT_CANDIDATE_PROFILE["experience_years"] == 0
-    assert not DEFAULT_CANDIDATE_PROFILE["skills"]
-    assert not DEFAULT_CANDIDATE_PROFILE["about"]
-    assert not any(DEFAULT_CANDIDATE_PROFILE["contacts"].values())
+def test_salary_is_not_named_even_when_asked_again():
+    """Старые настройки и повторные вопросы не разрешают сумму."""
+    from chat_workflow import salary_asked_again, salary_line, allowed_tail_lines
+    from ai_assistant import SALARY_ANSWER
+    cfg = {'salary_answer': 'Мои ожидания — от N руб.'}
+    first = {'messages': [{'text': 'Здравствуйте', 'isOut': True},
+                          {'text': 'На какой уровень заработной платы вы ориентируетесь?', 'isOut': False}]}
+    assert not salary_asked_again(first, first['messages'][-1]['text'])
+    again = {'messages': first['messages'] + [{'text': SALARY_ANSWER, 'isOut': True},
+                                              {'text': 'И всё же, какие у вас зарплатные ожидания?', 'isOut': False}]}
+    assert salary_asked_again(again, again['messages'][-1]['text'])
+    assert salary_line(cfg, concrete=False) == SALARY_ANSWER
+    assert salary_line(cfg, concrete=True) == SALARY_ANSWER
+    assert salary_line({}, concrete=True) == SALARY_ANSWER
+    assert 'Мои ожидания — от N руб.' not in allowed_tail_lines(cfg)
+
+
+def test_two_models_of_one_service_work_in_parallel_but_not_one_model_twice():
+    """14.10: «1 ИИ — 1 задача, а ИИ в сервисе несколько» — замок на модель, предел на сервис."""
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'openai_compatible': [{'name': 'S', 'base_url': 'http://s/v1', 'models': ['m1', 'm2', 'm3'],
+                                          'max_parallel': 2}]}
+    a._compat_providers = lambda: a.ai_config['openai_compatible']
+    l1, g1 = a._provider_lock('compat:m1'), a._service_gate('compat:m1')
+    assert l1.acquire(blocking=False) and g1.acquire(blocking=False)
+    assert a._provider_lock('compat:m2').acquire(blocking=False)          # другая модель свободна
+    assert a._service_gate('compat:m2').acquire(blocking=False)           # второй слот сервиса
+    assert not a._service_gate('compat:m3').acquire(blocking=False)       # предел сервиса 2
+
+
+def test_attempt_budget_follows_provider_timeout_and_cli_gets_more():
+    """14.10: Antigravity с timeout 45 и Claude CLI не должны обрываться на общих 30 с."""
+    a = AIAssistant.__new__(AIAssistant)
+    a.ai_config = {'openai_compatible': [{'name': 'S', 'base_url': 'http://s/v1', 'models': ['m'], 'timeout': 45}]}
+    a._compat_providers = lambda: a.ai_config['openai_compatible']
+    assert a._attempt_budget('compat:m') == 45
+    assert a._attempt_budget('claude') == 60
+    assert a._attempt_budget('gemini') == 30
+
+
+def test_budget_makes_chain_skip_busy_models(assistant):
+    """Письма наперёд идут с пределом по времени: занятая модель пропускается, а не ждётся."""
+    import ai_assistant as mod
+    ai = assistant
+    seen = {}
+    ai.enabled = True
+    ai._try_chain = lambda *a, **k: seen.setdefault('deadline', mod._AI_DEADLINE.get()) or 'x'
+    token = mod._AI_BUDGET.set(150)
+    try:
+        ai._call_llm('p')
+    finally:
+        mod._AI_BUDGET.reset(token)
+    assert seen['deadline'] is not None
+    seen.clear()
+    ai._call_llm('p')
+    assert seen['deadline'] is None
+
+
+def test_clean_public_text_turns_escaped_newlines_into_real_ones():
+    from ai_assistant import clean_public_text
+    out = clean_public_text('Здравствуйте!' + chr(92) + 'n' + chr(92) + 'nОткликаюсь на позицию.', {})
+    assert chr(92) not in out and 'Откликаюсь' in out
+
+
+def test_removed_tenure_leaves_no_dangling_more_than():
+    from ai_assistant import clean_public_text
+    out = clean_public_text('Я специалист по ИБ с более чем 7-летним опытом защиты веб-приложений.', {})
+    assert 'более чем опыт' not in out and 'опытом' in out
+
+
+def test_disabled_or_keyless_services_are_named_and_cooldown_is_parsed(monkeypatch):
+    monkeypatch.delenv('NO_SUCH_KEY_VAR', raising=False)
+    ai = AIAssistant.__new__(AIAssistant)
+    ai.ai_config = {'openai_compatible': [
+        {'name': 'A', 'base_url': 'http://x/v1', 'enabled': False},
+        {'name': 'B', 'base_url': 'http://y/v1', 'api_key_env': 'NO_SUCH_KEY_VAR'},
+        {'name': 'C', 'base_url': 'http://z/v1', 'api_key': 'k'}]}
+    assert ai.disabled_compat_providers() == [('A', 'выключен в настройках'),
+                                              ('B', 'нет ключа (переменная NO_SUCH_KEY_VAR)')]

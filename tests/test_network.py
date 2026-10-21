@@ -5,6 +5,36 @@
 секунды, а прогон откликов замер навсегда на «Составляю письмо…».
 """
 import terminal_ui
+from unittest.mock import Mock
+
+import pytest
+import requests
+
+
+def test_aborted_connection_has_a_specific_explanation():
+    error = requests.ConnectionError('Connection aborted.', 'Remote end closed connection without response')
+    assert 'соединение' in terminal_ui.explain_error(error)
+    assert 'неизвестный' not in terminal_ui.explain_error(error)
+
+
+@pytest.mark.parametrize('method, failures, succeeds, expected_calls', [
+    ('GET', 1, True, 2), ('GET', 10, False, 3), ('POST', 1, False, 1),
+])
+def test_api_retries_transport_errors_only_for_reads(monkeypatch, method, failures, succeeds, expected_calls):
+    import test as menu
+    bot = menu.HHAutoApplicant.__new__(menu.HHAutoApplicant)
+    bot.user_agent = 'synthetic test'
+    bot.access_token = None
+    response = Mock(status_code=200)
+    bot.session = Mock()
+    bot.session.request.side_effect = [requests.ConnectionError('Connection aborted.')] * failures + [response]
+    monkeypatch.setattr(menu.time, 'sleep', lambda _seconds: None)
+    if succeeds:
+        assert bot.make_request(method, 'https://api.hh.ru/resumes/mine') is response
+    else:
+        with pytest.raises(requests.ConnectionError):
+            bot.make_request(method, 'https://api.hh.ru/resumes/mine')
+    assert bot.session.request.call_count == expected_calls
 
 
 def test_wait_for_network_returns_when_connection_is_back(monkeypatch):
@@ -44,7 +74,8 @@ def test_ai_waits_for_network_and_retries_once(monkeypatch):
     assert assistant._call_llm('p') == 'письмо после возвращения сети'
 
 
-def test_apply_network_failure_is_reported_as_network(monkeypatch):
+@pytest.mark.parametrize('error', ['ERR_INTERNET_DISCONNECTED', 'ERR_SSL_PROTOCOL_ERROR'])
+def test_apply_network_failure_is_reported_as_network(monkeypatch, error):
     """Сетевой сбой при отклике — отдельный исход: цикл дождётся сети и повторит."""
     import hh_selenium as m
     bot = m.HHSeleniumBot.__new__(m.HHSeleniumBot)
@@ -53,7 +84,7 @@ def test_apply_network_failure_is_reported_as_network(monkeypatch):
 
     class Driver:
         def get(self, url):
-            raise Exception('unknown error: net::ERR_INTERNET_DISCONNECTED')
+            raise Exception('unknown error: net::' + error)
     bot.driver = Driver()
     bot.maybe_bump_resume = lambda: None
     success, message = bot.apply_to_vacancy('https://hh.ru/vacancy/1', 'Вакансия')

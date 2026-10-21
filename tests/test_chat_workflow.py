@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -19,7 +20,8 @@ def bot(tmp_path, monkeypatch):
     analyzer.FOLLOWUP_WAIT_SECONDS = 0   # ожидание ответа работодателя проверяется отдельным тестом
     analyzer.BOT_FOLLOWUP_WAIT_SECONDS = 0
     analyzer.headless = True
-    analyzer.driver = SimpleNamespace(current_url='https://hh.ru/chat', window_handles=['main'])
+    analyzer.driver = SimpleNamespace(current_url='https://hh.ru/chat', window_handles=['main'],
+                                     execute_script=Mock(return_value={}))
     analyzer._user_closed = False
     analyzer.is_driver_alive = lambda: True
     analyzer._chat_state_path = lambda: str(tmp_path / 'chat_actions.json')
@@ -37,13 +39,213 @@ def snapshot(message='К сожалению, сейчас не готовы пр
     }
 
 
+@pytest.mark.parametrize('copies', [0, 1, 2])
+def test_visible_reply_audit_counts_only_replies_after_matching_turn(copies):
+    from chat_workflow import visible_turn_reply_count
+    chat = snapshot('Current question?')
+    chat['messages'] = [{'text': 'Older question?', 'isOut': False},
+                        {'text': 'Same answer.', 'isOut': True},
+                        {'text': 'Current question?', 'isOut': False}]
+    chat['messages'] += [{'text': 'Same answer.', 'isOut': True} for _ in range(copies)]
+    assert visible_turn_reply_count(chat, 'Same answer.', 'Current question?') == copies
+
+
+def test_chat_reader_preserves_separate_identical_outgoing_bubbles_for_audit(bot):
+    from chat_workflow import visible_turn_reply_count
+    bot.driver.execute_script.return_value = {'messages': [
+        {'text': 'Current question?', 'isOut': False, 'id': 'incoming'},
+        {'text': 'Same answer.', 'isOut': True, 'id': 'outgoing1'},
+        {'text': 'Same answer.', 'isOut': True, 'id': 'outgoing2'},
+    ]}
+    chat = bot._read_open_chat()
+    assert visible_turn_reply_count(chat, 'Same answer.', 'Current question?') == 2
+
+
+def test_chat_preparation_is_parallel_but_browser_dispatch_is_single_owner(bot):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    main = threading.get_ident()
+    ready = threading.Barrier(3)
+    release = threading.Event()
+    opened = {}
+    bot._chat_reply_pool = ThreadPoolExecutor(max_workers=3)
+    bot._chat_reply_queue, bot._chat_reply_futures = [], {}
+    bot._collect_chat_replies = True
+    browser_threads = []
+
+    def prepare(question, *_args, **_kwargs):
+        assert threading.get_ident() != main
+        ready.wait(timeout=3)
+        assert release.wait(3)
+        return 'Технический ответ на ' + question
+
+    def goto(url):
+        browser_threads.append(threading.get_ident())
+        bot._read_open_chat.return_value = opened[url]
+        return True
+
+    bot.compose_chat_reply = Mock(side_effect=prepare)
+    bot.goto = Mock(side_effect=goto)
+    bot._read_open_chat = Mock()
+    bot._back_to_chat_list = Mock(return_value=True)
+    try:
+        for i in range(3):
+            chat = snapshot(f'Какие задачи решали с Python {i}?')
+            chat.update(identity=f'chat:{i}', chat_url=f'https://hh.ru/chat/{i}')
+            opened[chat['chat_url']] = chat
+            bot._handle_chat(chat)
+        assert len(bot._chat_reply_queue) == 3
+        bot.send_chat_reply.assert_not_called()
+        assert all(row['status'] == 'deferred' for row in bot._load_chat_actions().values())
+        release.set()
+        summary = {'failed': 0, 'rejections': 0}
+        assert bot._drain_chat_reply_queue([], summary)
+        assert bot.send_chat_reply.call_count == 3
+        assert summary['failed'] == 0
+        assert browser_threads == [main] * 3
+        assert all(row['status'] == 'sent' for row in bot._load_chat_actions().values())
+        # Revisiting the same incoming turns must not send another reply.
+        for chat in opened.values():
+            bot._handle_chat(chat)
+        assert bot.send_chat_reply.call_count == 3
+    finally:
+        release.set()
+        bot._chat_reply_pool.shutdown(wait=True)
+
+
+def test_prepared_reply_is_discarded_when_incoming_turn_changes(bot):
+    from concurrent.futures import ThreadPoolExecutor
+
+    bot._chat_reply_pool = ThreadPoolExecutor(max_workers=1)
+    bot._chat_reply_queue, bot._chat_reply_futures = [], {}
+    bot._collect_chat_replies = True
+    old = snapshot('Как проверяете Python?')
+    fresh = snapshot('Как проверяете Docker?')
+    bot.compose_chat_reply = Mock(side_effect=lambda question, *_a, **_k: 'Ответ: ' + question)
+    bot.goto = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=fresh)
+    bot._back_to_chat_list = Mock(return_value=True)
+    try:
+        bot._handle_chat(old)
+        assert bot._drain_chat_reply_queue([], {'failed': 0, 'rejections': 0})
+        bot.send_chat_reply.assert_called_once()
+        assert 'Docker' in bot.send_chat_reply.call_args.args[0]
+        assert 'Python' not in bot.send_chat_reply.call_args.args[0]
+        assert bot._load_chat_actions()[bot._chat_action_key('answer', old, old['messages'][0]['text'])]['status'] == 'resolved'
+    finally:
+        bot._chat_reply_pool.shutdown(wait=True)
+
+
+def test_prepared_reply_never_sent_to_unconfirmed_chat(bot):
+    from concurrent.futures import ThreadPoolExecutor
+
+    bot._chat_reply_pool = ThreadPoolExecutor(max_workers=1)
+    bot._chat_reply_queue, bot._chat_reply_futures = [], {}
+    bot._collect_chat_replies = True
+    bot.compose_chat_reply = Mock(return_value='Ответ на вопрос.')
+    bot.goto = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=snapshot('Вопрос?'))
+    bot._current_chat_matches.return_value = False
+    bot._back_to_chat_list = Mock(return_value=True)
+    try:
+        bot._handle_chat(snapshot('Расскажите про Python?'))
+        summary = {'failed': 0, 'rejections': 0}
+        assert bot._drain_chat_reply_queue([], summary)
+        assert summary['failed'] == 1
+        bot.send_chat_reply.assert_not_called()
+        assert next(iter(bot._load_chat_actions().values()))['status'] == 'deferred'
+    finally:
+        bot._chat_reply_pool.shutdown(wait=True)
+
+
+def test_scan_pipeline_prepares_three_unread_chats_before_dispatch(bot):
+    import threading
+
+    owner = threading.get_ident()
+    started = threading.Barrier(3)
+    chats = {}
+    cards = []
+    for i in range(3):
+        chat = snapshot(f'Расскажите про Python {i}?')
+        chat.update(identity=f'chat:{i}', chat_url=f'https://hh.ru/chat/{i}')
+        chats[chat['chat_url']] = chat
+        cards.append({'idx': i, 'key': chat['identity'], 'text': chat['messages'][0]['text'], 'href': chat['chat_url']})
+
+    def compose(question, *_args, **_kwargs):
+        assert threading.get_ident() != owner
+        started.wait(timeout=3)
+        return 'Технический ответ: ' + question
+
+    def open_card(card):
+        assert threading.get_ident() == owner
+        bot.driver.current_url = card['href']
+        return chats[card['href']]
+
+    def goto(url):
+        assert threading.get_ident() == owner
+        bot.driver.current_url = url
+        return True
+
+    bot._set_unread_filter = Mock(return_value=True)
+    bot._scroll_chat_list = Mock(return_value={'moved': False})
+    bot._read_chat_cards = Mock(return_value=cards)
+    bot._open_chat_card = Mock(side_effect=open_card)
+    bot._back_to_chat_list = Mock(return_value=True)
+    bot._mark_chat_read = Mock()
+    bot._read_open_chat = Mock(side_effect=lambda: chats[bot.driver.current_url])
+    bot.goto = Mock(side_effect=goto)
+    bot.compose_chat_reply = Mock(side_effect=compose)
+    bot.process_unread_messenger_chats()
+    assert bot.messenger_summary['complete'] is True
+    assert bot.messenger_summary['failed'] == 0
+    assert bot.messenger_summary['viewed'] == 3
+    assert bot.messenger_summary['sent'] == 3
+    assert bot.compose_chat_reply.call_count == 3
+
+
+def test_scan_resumes_only_unsent_preparation_not_uncertain_dispatch(bot):
+    chat = snapshot('Расскажите про Python?')
+    key = bot._chat_action_key('answer', chat, chat['messages'][0]['text'])
+    bot._save_chat_action(key, bot._action_record(
+        'answer', chat, 'deferred', incoming=chat['messages'][0]['text'], preparation_pending=True))
+    uncertain = dict(chat, identity='chat:99', chat_url='https://hh.ru/chat/99')
+    pending_key = bot._chat_action_key('answer', uncertain, 'Другой вопрос?')
+    bot._save_chat_action(pending_key, bot._action_record(
+        'answer', uncertain, 'pending_confirmation', incoming='Другой вопрос?',
+        preparation_pending=True, reply='Не повторять'))
+    bot._set_unread_filter = Mock(return_value=True)
+    bot._scroll_chat_list = Mock(return_value={'moved': False})
+    bot._read_chat_cards = Mock(return_value=[])
+    bot._chat_list_empty = Mock(return_value=True)
+    bot._back_to_chat_list = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=chat)
+    bot.goto = Mock(return_value=True)
+    bot.compose_chat_reply = Mock(return_value='Применял Python для анализа API.')
+    bot.process_unread_messenger_chats()
+    bot.send_chat_reply.assert_called_once()
+    assert bot.goto.call_args_list[0].args == (chat['chat_url'],)
+    assert bot._load_chat_actions()[key]['status'] == 'sent'
+    assert bot._load_chat_actions()[pending_key]['status'] == 'pending_confirmation'
+
+
+def test_missing_ai_reply_is_counted_and_kept_for_later_preparation(bot):
+    bot.compose_chat_reply = Mock(return_value=None)
+    bot._handle_chat(snapshot('Расскажите про Python?'))
+    bot.send_chat_reply.assert_not_called()
+    assert bot._chat_deferred_this_run == 1
+    action = next(iter(bot._load_chat_actions().values()))
+    assert action['status'] == 'deferred'
+    assert action['preparation_pending'] is True
+
+
 @pytest.mark.parametrize('incoming', [
     'Какие у вас зарплатные ожидания?',
     'Давайте созвонимся. Какие у вас финансовые ожидания?',
     'Расскажите про опыт с Kubernetes. Какие у вас зарплатные ожидания?',
 ])
 def test_salary_setting_cannot_leak_into_chat_reply(bot, incoming):
-    from ai_assistant import SALARY_ANSWER
+    from chat_workflow import SALARY_CHAT_VARIANTS
 
     bot.config['chat_autoreply']['salary_answer'] = 'Мои ожидания — от 350 000 руб.'
     bot.compose_chat_reply = Mock(return_value='Применял Kubernetes для контейнерных сервисов.')
@@ -51,19 +253,19 @@ def test_salary_setting_cannot_leak_into_chat_reply(bot, incoming):
     bot.send_chat_reply.assert_called_once()
     reply = bot.send_chat_reply.call_args.args[0]
     assert '350' not in reply and 'руб' not in reply
-    assert SALARY_ANSWER in reply
+    assert any(v in reply for v in SALARY_CHAT_VARIANTS)
     if 'Kubernetes' in incoming:
         assert 'Kubernetes' in reply
         assert 'зарплат' not in bot.compose_chat_reply.call_args.args[0]
 
 
 @pytest.mark.parametrize('prefix', ['', 'Применял Kubernetes.\n\n'])
-def test_chat_sender_rejects_salary_even_if_it_matches_config(bot, prefix):
-    salary = 'Мои ожидания — от 350 000 руб.'
-    bot.config['chat_autoreply']['salary_answer'] = salary
+@pytest.mark.parametrize('amount', ['350 000', '500 000'])
+def test_chat_sender_rejects_salary_even_from_old_settings(bot, prefix, amount):
+    bot.config['chat_autoreply']['salary_answer'] = 'Мои ожидания — от 350 000 руб.'
     bot._read_open_chat = Mock(side_effect=AssertionError('Must reject before touching the browser'))
 
-    assert RejectionAnalyzer.send_chat_reply(bot, prefix + salary) is False
+    assert RejectionAnalyzer.send_chat_reply(bot, prefix + f'Мои ожидания — от {amount} руб.') is False
     assert bot._chat_send_failure == 'restricted_content'
     bot._read_open_chat.assert_not_called()
 
@@ -346,6 +548,161 @@ def test_rejection_with_disabled_composer_is_not_recorded_as_sent(bot):
     assert not any(a['status'] == 'sent' for a in state.values())
 
 
+def test_missing_composer_without_restriction_is_deferred_with_incoming(bot):
+    bot.find_chat_message_input.return_value = None
+    bot.chat_composer_status = Mock(return_value={'state': 'editor_not_found', 'notice': '', 'editors': []})
+    bot._capture_chat_diagnostics = Mock(return_value='private-snapshot')
+    chat = snapshot()
+    bot._ask_rejection_reason(chat)
+    action = next(iter(bot._load_chat_actions().values()))
+    assert action['status'] == 'deferred'
+    assert action['incoming'] == chat['messages'][0]['text']
+    assert action['composer_state'] == 'editor_not_found'
+    assert action['diagnostic'] == 'private-snapshot'
+    bot.send_chat_reply.assert_not_called()
+
+
+def test_visible_invitation_gate_records_exact_reason_without_dispatch(bot):
+    notice = 'Переписка будет доступна после приглашения работодателя'
+    bot.find_chat_message_input.return_value = None
+    bot.chat_composer_status = Mock(return_value={'state': 'invitation_required', 'notice': notice, 'editors': []})
+    bot._ask_rejection_reason(snapshot())
+    action = next(iter(bot._load_chat_actions().values()))
+    assert action['status'] == 'composer_disabled'
+    assert action['composer_state'] == 'invitation_required'
+    assert action['note'] == notice
+    bot.send_chat_reply.assert_not_called()
+
+
+def test_visible_archive_gate_is_not_an_unexplained_missing_editor(bot):
+    notice = 'Вакансия «Системный инженер» была перенесена в архив'
+    bot.find_chat_message_input.return_value = None
+    bot.chat_composer_status = Mock(return_value={'state': 'vacancy_archived', 'notice': notice, 'editors': []})
+    bot._ask_rejection_reason(snapshot())
+    action = next(iter(bot._load_chat_actions().values()))
+    assert action['status'] == 'composer_disabled'
+    assert action['composer_state'] == 'vacancy_archived'
+    assert action['note'] == notice
+    bot.send_chat_reply.assert_not_called()
+
+
+def test_composer_appearing_during_recheck_can_send_once(bot):
+    bot.find_chat_message_input.return_value = None
+    bot.chat_composer_status = Mock(side_effect=[{'state': 'editor_not_found'}, {'state': 'ready'}])
+    bot._ask_rejection_reason(snapshot())
+    bot._ask_rejection_reason(snapshot())
+    bot.send_chat_reply.assert_called_once()
+    assert next(iter(bot._load_chat_actions().values()))['status'] == 'sent'
+
+
+def test_input_inspection_is_read_only_and_limits_recent_distinct_chats(bot):
+    bot._save_chat_action('old', dict(status='composer_disabled', updated_at='2026-10-01',
+                                    chat_url='https://hh.ru/chat/1', company='Test', title='AppSec'))
+    for i in range(1, 5):
+        bot._save_chat_action(str(i), dict(status='composer_disabled', updated_at=f'2026-10-{10+i}',
+                                         chat_url=f'https://hh.ru/chat/{i}', company='Test', title='AppSec'))
+    before = bot._load_chat_actions().copy()
+    bot.goto = Mock(return_value=True)
+    bot.chat_composer_status = Mock(return_value={'state': 'invitation_required', 'notice': 'Gate'})
+    bot._capture_chat_diagnostics = Mock(return_value='private-snapshot')
+    report = bot.inspect_chat_inputs()
+    assert len(report) == 4
+    assert [call.args[0] for call in bot.goto.call_args_list] == [f'https://hh.ru/chat/{i}' for i in (4, 3, 2, 1)]
+    assert bot._load_chat_actions() == before
+    bot.send_chat_reply.assert_not_called()
+
+
+def test_input_inspection_prioritizes_unresolved_editor_and_send_failures(bot):
+    for key, action in {
+        'restricted': dict(status='composer_disabled', company='Restricted', updated_at='2026-10-21'),
+        'missing': dict(status='deferred', company='Missing', composer_state='editor_not_found', updated_at='2026-10-19'),
+        'button': dict(status='deferred', company='Button', note='Отправка не выполнялась', updated_at='2026-10-20'),
+        'uncertain': dict(status='pending_confirmation', company='Uncertain', updated_at='2026-10-22'),
+    }.items():
+        bot._save_chat_action(key, dict(action, chat_url=f'https://hh.ru/chat/{len(key)}', title='AppSec'))
+    before = bot._load_chat_actions().copy()
+    bot.goto = Mock(return_value=True)
+    bot.chat_composer_status = Mock(return_value={'state': 'ready', 'notice': ''})
+    bot._capture_chat_diagnostics = Mock(return_value='private-snapshot')
+    report = bot.inspect_chat_inputs(limit=2)
+    assert [row['company'] for row in report] == ['Button', 'Missing']
+    assert bot._load_chat_actions() == before
+    bot.send_chat_reply.assert_not_called()
+
+
+@pytest.mark.parametrize('state', ['deferred', 'pending_confirmation', 'sent'])
+def test_resume_draft_only_dispatches_a_proven_not_sent_action(bot, state):
+    chat = snapshot('Расскажите о задачах в облаке?')
+    chat['messages_loaded'] = True
+    reply = 'Настраиваю сети и контроль доступа в облачной инфраструктуре.'
+    key = bot._chat_action_key('answer', chat, chat['messages'][0]['text'])
+    bot._save_chat_action(key, bot._action_record('answer', chat, state, reply=reply,
+                         incoming=chat['messages'][0]['text'], note='Отправка не выполнялась'))
+    bot.goto = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=chat)
+    bot._answer_followup = Mock()
+    result = bot.resume_chat_draft(key[:12])
+    if state == 'deferred':
+        bot.send_chat_reply.assert_called_once_with(reply, resume_draft=True)
+        bot._answer_followup.assert_called_once()
+        assert result['sent'] == 1
+    else:
+        bot.send_chat_reply.assert_not_called()
+        bot._answer_followup.assert_not_called()
+        assert result['sent'] == 0
+
+
+def test_resume_draft_reconciles_visible_delivery_without_another_send(bot):
+    chat = snapshot('Какие облачные задачи решаете?')
+    reply = 'Настраиваю сети и контроль доступа.'
+    incoming = chat['messages'][0]['text']
+    key = bot._chat_action_key('answer', chat, incoming)
+    bot._save_chat_action(key, bot._action_record('answer', chat, 'deferred',
+                         reply=reply, incoming=incoming, note='Отправка не выполнялась'))
+    chat['messages'] += [{'isOut': True, 'text': reply}]
+    chat.update(messages_loaded=True, assistant_left=True)
+    bot.goto = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=chat)
+    bot._answer_followup = Mock()
+    result = bot.resume_chat_draft(key[:12])
+    bot.send_chat_reply.assert_not_called()
+    assert bot._load_chat_actions()[key]['status'] == 'sent'
+    assert result['status'] == 'assistant_left'
+
+
+def test_resume_draft_refuses_changed_question(bot):
+    old = snapshot('Какие облачные задачи решаете?')
+    key = bot._chat_action_key('answer', old, old['messages'][0]['text'])
+    bot._save_chat_action(key, bot._action_record('answer', old, 'deferred',
+        reply='Технический ответ.', incoming=old['messages'][0]['text'], note='Отправка не выполнялась'))
+    bot.goto = Mock(return_value=True)
+    bot._read_open_chat = Mock(return_value=dict(snapshot('Другой вопрос?'), messages_loaded=True))
+    bot._answer_followup = Mock()
+    result = bot.resume_chat_draft(key[:12])
+    assert result['status'] == 'question_changed'
+    bot.send_chat_reply.assert_not_called()
+
+
+@pytest.mark.parametrize('mode', ['matching', 'different', 'empty', 'already_sent'])
+def test_real_chrome_explicit_draft_send_never_replaces_or_repeats_text(chrome_chat, mode):
+    bot = chrome_chat
+    bot.driver.execute_script('openChat(1);')
+    text = 'Проверяю права доступа в облачной инфраструктуре.'
+    draft = text if mode in ('matching', 'already_sent') else 'Другой черновик' if mode == 'different' else ''
+    bot.driver.execute_script('document.getElementById("composer").value=arguments[0];', draft)
+    if mode == 'already_sent':
+        bot.driver.execute_script('''
+            const bubble=document.createElement('div'); bubble.className='chat-bubble outgoing';
+            bubble.dataset.qa='chatik-chat-message'; bubble.textContent=arguments[0];
+            document.getElementById('messages').append(bubble);
+        ''', text)
+    result = bot.send_chat_reply(text, resume_draft=True)
+    assert result is (mode in ('matching', 'already_sent'))
+    assert bot.driver.execute_script('return sent.length;') == (1 if mode == 'matching' else 0)
+    if mode != 'matching':
+        assert bot.driver.execute_script('return document.getElementById("composer").value;') == draft
+
+
 def test_uncertain_send_not_retried_and_existing_manual_reply_respected(bot):
     bot.send_chat_reply.return_value = False
     bot._ask_rejection_reason(snapshot())
@@ -358,6 +715,26 @@ def test_uncertain_send_not_retried_and_existing_manual_reply_respected(bot):
     chat['messages'].append({'text': 'Подскажите, почему отказали?', 'isOut': True})
     bot._ask_rejection_reason(chat)
     bot.send_chat_reply.assert_not_called()
+
+
+@pytest.mark.parametrize('failure, status, counter', [
+    (None, 'pending_confirmation', '_chat_unconfirmed_this_run'),
+    ('not_dispatched', 'deferred', '_chat_deferred_this_run'),
+    ('draft', 'deferred', '_chat_deferred_this_run'),
+])
+def test_send_failures_have_separate_current_run_counters(bot, failure, status, counter):
+    def fail(_text):
+        bot._chat_send_failure = failure
+        return False
+    bot.send_chat_reply.side_effect = fail
+    chat = snapshot()
+    assert not bot._send_chat_action('answer', chat, 'Synthetic reply', 'Synthetic question')
+    assert next(iter(bot._load_chat_actions().values()))['status'] == status
+    assert getattr(bot, counter) == 1
+    if status == 'pending_confirmation':
+        assert not bot._send_chat_action('answer', chat, 'Synthetic reply', 'Synthetic question')
+        assert getattr(bot, counter) == 1
+        bot.send_chat_reply.assert_called_once()
 
 
 def test_repeated_question_deduplicated_but_new_question_answered(bot):
@@ -374,6 +751,156 @@ def test_repeated_question_deduplicated_but_new_question_answered(bot):
 
 @pytest.mark.parametrize('message', [
     'Рассмотрим ваше резюме. Если навыки и опыт подойдут для позиции, мы свяжемся с вами.',
+    'Иван, добрый день! Передала Ваше резюме в отдел. Петрова Анна Сергеевна, специалист отдела персонала',
+    'Всё зафиксировал, спасибо. Передаю информацию работодателю.',
+])
+def test_acknowledgement_gets_no_reply_and_is_not_reprocessed(bot, message):
+    # 15.10: «рассмотрим / передали резюме» ответа не требует — бот не пишет, только помечает.
+    bot.compose_chat_reply = Mock(return_value='Спасибо! Буду рад сотрудничеству.')
+    chat = snapshot(message)
+    bot._handle_chat(chat)
+    bot._handle_chat(chat)
+    bot.compose_chat_reply.assert_not_called()
+    bot.send_chat_reply.assert_not_called()
+    assert any(a['status'] == 'acknowledged' for a in bot._load_chat_actions().values())
+
+
+def test_telegram_is_not_added_for_ai_assistant_or_plain_questions(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='Да, работал с ACL.')
+    chat = snapshot('Спасибо. Мы перейдём к интервью. Работали ли вы с ACL?')
+    chat['messages'][0]['isBot'] = True
+    bot._handle_chat(chat)
+    sent = bot.send_chat_reply.call_args.args[0]
+    assert '@someone' not in sent
+    assert bot.compose_chat_reply.call_args.kwargs['with_contacts'] is False
+
+
+SELECTION_UPDATE = (
+    'Благодарим за интерес к компании и участие в процессе отбора. '
+    'На данный момент мы продолжаем рассматривать кандидатов и анализировать результаты собеседований. '
+    'Ваша кандидатура остается в числе тех, кто нас заинтересовал. '
+    'Если мы примем положительное решение, обязательно свяжемся с вами в ближайшее время.'
+)
+
+
+@pytest.mark.parametrize('incoming', [
+    SELECTION_UPDATE,
+    'Спасибо за участие в интервью. Решение пока не принято, свяжемся с вами позже.',
+    'Расскажите о разработке Telegram-ботов и интеграции с API.',
+    'По результатам собеседования пригласить вас сейчас не можем.',
+])
+def test_contact_intent_requires_an_actual_invitation(incoming):
+    from chat_workflow import wants_contact
+    assert not wants_contact(incoming)
+
+
+def test_selection_update_gets_a_short_relevant_reply_once(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='Неуместное предложение созвониться')
+    chat = snapshot(SELECTION_UPDATE)
+    bot._handle_chat(chat)
+    bot._handle_chat(chat)
+    bot.send_chat_reply.assert_called_once()
+    reply = bot.send_chat_reply.call_args.args[0]
+    assert 'решени' in reply.lower() and len(reply) < 200
+    assert not any(word in reply.lower() for word in ('удовольств', 'telegram', '@someone', 'созвон'))
+    bot.compose_chat_reply.assert_not_called()
+
+
+def test_technical_telegram_question_does_not_share_candidate_contact(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='Для Telegram-ботов использую webhook и API.')
+    bot._handle_chat(snapshot('Расскажите о разработке Telegram-ботов и интеграции с API.'))
+    assert bot.compose_chat_reply.call_args.kwargs['with_contacts'] is False
+    assert bot.send_chat_reply.call_args.args[0] == 'Для Telegram-ботов использую webhook и API.'
+
+
+def test_interview_invitation_does_not_automatically_move_chat_to_telegram(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='Да, завтра удобно. В какое время?')
+    bot._handle_chat(snapshot('Приглашаем вас на собеседование. Вам удобно завтра?'))
+    assert bot.compose_chat_reply.call_args.kwargs['with_contacts'] is False
+    assert '@someone' not in bot.send_chat_reply.call_args.args[0]
+
+
+@pytest.mark.parametrize('incoming,expected', [
+    ('Оставьте ваш контакт для связи', True),
+    ('Напишите ваш Telegram', True),
+    ('Как с вами связаться?', True),
+    ('Предлагаем обсудить детали в телеграм', True),
+    ('Давайте созвонимся завтра', False),
+    ('Спасибо за участие в собеседовании. Мы свяжемся с вами позже.', False),
+    ('Расскажите про ваш опыт разработки Telegram-ботов.', False),
+])
+def test_contact_details_need_a_request_for_details_or_channel(incoming, expected):
+    from chat_workflow import contact_details_requested
+    assert contact_details_requested(incoming) is expected
+
+
+def test_review_update_does_not_hide_an_actual_question(bot):
+    bot.compose_chat_reply = Mock(return_value='Да, завтра удобно.')
+    bot._handle_chat(snapshot('Решение пока не принято. Вам удобно созвониться завтра?'))
+    bot.compose_chat_reply.assert_called_once()
+    assert bot.send_chat_reply.call_args.args[0] == 'Да, завтра удобно.'
+
+
+def test_invitation_with_known_time_uses_contextual_ai_reply(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='Да, завтра в предложенное время удобно.')
+    incoming = 'Приглашаем вас на собеседование завтра в 17:00.'
+    bot._handle_chat(snapshot(incoming))
+    assert bot.compose_chat_reply.call_args.args[0] == incoming
+    assert bot.send_chat_reply.call_args.args[0] == 'Да, завтра в предложенное время удобно.'
+
+
+def test_unrequested_model_contact_signature_is_removed_without_losing_technical_answer(bot):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value=(
+        'Для Telegram-ботов использую webhook и API.\n\n'
+        'Детали удобно обсудить в Telegram: @someone.'
+    ))
+    bot._handle_chat(snapshot('Расскажите о разработке Telegram-ботов и интеграции с API.'))
+    assert bot.send_chat_reply.call_args.args[0] == 'Для Telegram-ботов использую webhook и API.'
+
+
+@pytest.mark.parametrize('reply', [
+    'Анна. Напишу в Telegram.',
+    'Спасибо! Уже написал вам в Telegram.',
+    'Свяжусь с вами в телеграме.',
+])
+def test_external_contact_request_never_promises_an_unperformed_action(bot, reply):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value=reply)
+    chat = snapshot('Хотим обсудить детали. Напишите в чат https://t.me/recruiter_example')
+    bot._handle_chat(chat)
+    bot._handle_chat(chat)
+    bot.send_chat_reply.assert_called_once()
+    sent = bot.send_chat_reply.call_args.args[0]
+    assert sent == 'Спасибо за приглашение! Готов обсудить детали здесь, в чате hh.'
+    assert '@someone' not in sent
+    tasks = [a for a in bot._load_chat_actions().values() if a['kind'] == 'external_contact']
+    assert len(tasks) == 1 and tasks[0]['status'] == 'deferred'
+    assert 'самостоятельно' in tasks[0]['note']
+    bot._write_chat_followups()
+    report = Path(bot._chat_state_path()).with_name('chat_followups.md')
+    assert 'самостоятельно' in report.read_text(encoding='utf-8')
+
+
+def test_external_action_guard_keeps_technical_answer_without_contact_promotion(bot):
+    bot.compose_chat_reply = Mock(return_value='Для API использую проверки авторизации. Напишу в Telegram.')
+    bot._handle_chat(snapshot('Как проверяете API? Затем напишите в Telegram: @recruiter_example'))
+    assert bot.send_chat_reply.call_args.args[0] == 'Для API использую проверки авторизации.'
+
+
+def test_external_action_guard_does_not_remove_telegram_development_answer(bot):
+    bot.compose_chat_reply = Mock(return_value='Написал Telegram-бота для уведомлений в CI/CD.')
+    bot._handle_chat(snapshot('Расскажите про разработку Telegram-ботов.'))
+    assert bot.send_chat_reply.call_args.args[0] == 'Написал Telegram-бота для уведомлений в CI/CD.'
+    assert not any(a['kind'] == 'external_contact' for a in bot._load_chat_actions().values())
+
+
+@pytest.mark.parametrize('message', [
     'Работа предусмотрена в офисе в Нижнем Новгороде, удалённый формат отсутствует.',
 ])
 def test_incoming_statements_are_answered_once(bot, message):
@@ -521,6 +1048,21 @@ def test_chat_prompt_uses_profile_conditions_and_covers_each_question(bot):
     assert 'живу в Сибири' not in prompts['system']
     assert 'по пунктам' in prompts['system']
     assert 'отсутствие упоминания' in prompts['system'].lower()
+    assert '2-4 коротких предложения' in prompts['system']
+    assert 'самочувствии' in prompts['system']
+
+
+def test_repeated_salary_question_never_uses_old_configured_amount(bot):
+    from chat_workflow import SALARY_CHAT_VARIANTS
+    bot.config['chat_autoreply']['salary_answer'] = 'Мои ожидания — от 350 000 руб.'
+    chat = snapshot('И всё же, какие у вас зарплатные ожидания?')
+    chat['messages'][:0] = [
+        {'text': 'Какие у вас зарплатные ожидания?', 'isOut': False},
+        {'text': SALARY_CHAT_VARIANTS[0], 'isOut': True},
+    ]
+    bot._handle_chat(chat)
+    reply = bot.send_chat_reply.call_args.args[0]
+    assert reply in SALARY_CHAT_VARIANTS and not any(ch.isdigit() for ch in reply)
 
 
 def test_corrupt_action_history_blocks_sends_instead_of_duplicate(bot):
@@ -922,11 +1464,75 @@ def chrome_chat(tmp_path, bot):
         driver.quit()
 
 
+@pytest.mark.parametrize('mode, notice, expected', [
+    ('footer', 'Переписка будет доступна после приглашения работодателя', 'invitation_required'),
+    ('footer', 'Работодатель отключил переписку по данной вакансии', 'employer_disabled'),
+    ('bubble', 'Переписка будет доступна после приглашения работодателя', 'editor_not_found'),
+    ('hidden', 'Работодатель отключил переписку по данной вакансии', 'editor_not_found'),
+    ('ready', 'Переписка будет доступна после приглашения работодателя', 'ready'),
+    ('footer', 'Вакансия «Системный инженер» была перенесена в архив', 'vacancy_archived'),
+    ('bubble', 'Вакансия «Системный инженер» была перенесена в архив', 'editor_not_found'),
+    ('hidden', 'Вакансия «Системный инженер» была перенесена в архив', 'editor_not_found'),
+    ('ready', 'Вакансия «Системный инженер» была перенесена в архив', 'ready'),
+    ('footer', 'Вакансия в архиве', 'editor_not_found'),
+])
+def test_real_chrome_composer_gate_is_not_confused_with_message_text(chrome_chat, mode, notice, expected):
+    bot = chrome_chat
+    bot.driver.execute_script('''
+        openChat(1);
+        if (arguments[0] !== 'ready') document.getElementById('composer').remove();
+        const node = document.createElement('div'); node.textContent = arguments[1];
+        if (arguments[0] === 'hidden') node.style.display = 'none';
+        if (arguments[0] === 'bubble') node.className = 'chat-bubble';
+        document.getElementById('right').append(node);
+    ''', mode, notice)
+    result = bot.chat_composer_status()
+    assert result['state'] == expected
+    assert result['notice'] == (notice if mode in ('footer', 'ready') and notice != 'Вакансия в архиве' else '')
+    assert bot.driver.execute_script('return sent;') == []
+
+
+@pytest.mark.parametrize('tag, separator', [('label', ' '), ('div', '\u00a0'), ('p', '\n')])
+def test_real_chrome_disabled_composer_notice_uses_visible_normalized_text(chrome_chat, tag, separator):
+    bot = chrome_chat
+    bot.driver.execute_script('''
+        openChat(1);
+        document.getElementById('composer').remove();
+        const node = document.createElement(arguments[0]);
+        node.style.whiteSpace = 'pre-wrap';
+        node.textContent = 'Работодатель отключил переписку по данной вакансии'.split(' ').join(arguments[1]);
+        document.getElementById('right').append(node);
+    ''', tag, separator)
+    result = bot.chat_composer_status()
+    assert result['state'] == 'employer_disabled'
+    assert result['notice'] == 'Работодатель отключил переписку по данной вакансии'
+    assert bot.driver.execute_script('return sent;') == []
+
+
+def test_real_chrome_reader_keeps_identical_outgoing_bubbles_for_audit(chrome_chat):
+    from chat_workflow import visible_turn_reply_count
+    bot = chrome_chat
+    bot.driver.execute_script('''
+        openChat(1);
+        const root = document.getElementById('messages'); root.innerHTML = '';
+        for (const [text, outgoing] of [['Current question?', false], ['Same answer.', true], ['Same answer.', true]]) {
+            const bubble = document.createElement('div');
+            bubble.className = 'chat-bubble' + (outgoing ? ' outgoing' : '');
+            bubble.textContent = text; root.append(bubble);
+        }
+    ''')
+    chat = dict(bot._read_open_chat(), identity='topic:1')
+    assert visible_turn_reply_count(chat, 'Same answer.', 'Current question?') == 2
+    assert not bot._send_chat_action('answer', chat, 'Same answer.', 'Current question?')
+    assert bot.driver.execute_script('return sent;') == []
+
+
 def test_real_chrome_virtual_list_65_chats_and_no_duplicate_sends(chrome_chat):
     bot = chrome_chat
     refusals = bot.process_unread_messenger_chats()
     assert len(refusals) == 22
-    assert bot.messenger_summary == {'viewed': 65, 'rejections': 22, 'sent': 44, 'failed': 0, 'complete': True}
+    assert bot.messenger_summary == {'viewed': 65, 'rejections': 22, 'sent': 44, 'failed': 0,
+                                     'complete': True, 'send_unconfirmed': 0, 'send_deferred': 0}
     assert set(bot.driver.execute_script('return opened;')) == set(range(65))
     assert len(bot.driver.execute_script('return sent;')) == 44
     assert bot._open_external_interview.call_count == 21
@@ -1014,10 +1620,12 @@ def test_real_chrome_unread_queue_shrinks_without_opening_read_chats(chrome_chat
     bot.process_unread_messenger_chats()
     assert bot.driver.execute_script('return opened;') == expected
     assert bot.driver.execute_script('return document.getElementById("unread").checked;') is True
-    assert bot.messenger_summary == {'viewed': 44, 'rejections': 22, 'sent': 44, 'failed': 0, 'complete': True}
+    assert bot.messenger_summary == {'viewed': 44, 'rejections': 22, 'sent': 44, 'failed': 0,
+                                     'complete': True, 'send_unconfirmed': 0, 'send_deferred': 0}
     assert bot._chat_list_visible() is True
     bot.process_unread_messenger_chats()
-    assert bot.messenger_summary == {'viewed': 0, 'rejections': 0, 'sent': 0, 'failed': 0, 'complete': True}
+    assert bot.messenger_summary == {'viewed': 0, 'rejections': 0, 'sent': 0, 'failed': 0,
+                                     'complete': True, 'send_unconfirmed': 0, 'send_deferred': 0}
     assert bot.driver.execute_script('return opened;') == expected
     assert bot.driver.execute_script('return sent.length;') == 44
 
@@ -1248,6 +1856,45 @@ def test_real_chrome_manual_draft_preserved(chrome_chat):
     assert bot.driver.execute_script('return sent.length;') == 0
 
 
+@pytest.mark.parametrize('mode', ['transient', 'persistent', 'unknown_after_dispatch', 'unknown_without_delivery'])
+def test_real_chrome_send_retries_only_a_proven_pre_dispatch_failure(chrome_chat, monkeypatch, mode):
+    from selenium.webdriver.remote.webelement import WebElement
+    from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
+    bot = chrome_chat
+    bot._open_chat_card(bot._read_chat_cards()[0])
+    bot.driver.execute_script('''
+        const button=document.createElement('button');
+        button.dataset.qa='chatik-do-send-message'; button.textContent='Отправить';
+        button.onclick=()=>document.getElementById('composer').dispatchEvent(
+            new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+        document.getElementById('right').append(button);
+    ''')
+    original = WebElement.click
+    calls = []
+
+    def click(element):
+        if element.get_attribute('data-qa') == 'chatik-do-send-message':
+            calls.append(1)
+            if mode == 'persistent' or (mode == 'transient' and len(calls) == 1):
+                raise ElementClickInterceptedException('Synthetic overlay')
+            if mode == 'unknown_without_delivery':
+                raise WebDriverException('Synthetic unknown click result')
+            result = original(element)
+            if mode == 'unknown_after_dispatch':
+                raise WebDriverException('Synthetic lost acknowledgement')
+            return result
+        return original(element)
+
+    monkeypatch.setattr(WebElement, 'click', click)
+    text = 'Здравствуйте! Подскажите причину отказа.'
+    assert bot.send_chat_reply(text) is (mode in ('transient', 'unknown_after_dispatch'))
+    assert len(calls) == {'transient': 2, 'persistent': 3, 'unknown_after_dispatch': 1, 'unknown_without_delivery': 1}[mode]
+    assert bot.driver.execute_script('return sent.length;') == (0 if mode in ('persistent', 'unknown_without_delivery') else 1)
+    if mode == 'persistent':
+        assert bot._chat_send_failure == 'not_dispatched'
+        assert bot.driver.execute_script('return document.getElementById("composer").value') == text
+
+
 def test_real_chrome_empty_field_without_outgoing_is_not_success(chrome_chat):
     bot = chrome_chat
     bot._open_chat_card(bot._read_chat_cards()[0])
@@ -1285,6 +1932,36 @@ def test_real_chrome_sends_with_native_button_when_enter_is_not_submission(chrom
     text = 'Спасибо! Буду рад сотрудничеству.'
     assert bot.send_chat_reply(text)
     assert bot.driver.execute_script('return sent;') == [{'id': 1, 'text': text}]
+
+
+@pytest.mark.parametrize('mode', ['delayed', 'persistent', 'changed'])
+def test_real_chrome_waits_for_send_button_without_retrying_a_dispatch(chrome_chat, monkeypatch, mode):
+    import threading
+    import rejection_analyzer
+    bot = chrome_chat
+    monkeypatch.setattr(rejection_analyzer.time, 'sleep', lambda seconds: threading.Event().wait(seconds))
+    bot.driver.execute_script('''
+        openChat(1);
+        const editor=document.getElementById('composer');
+        const button=document.createElement('button');
+        button.dataset.qa='chatik-do-send-message'; button.textContent='Отправить'; button.disabled=true;
+        editor.parentElement.append(button);
+        button.onclick=()=>editor.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+        editor.addEventListener('input',()=>{
+            if (arguments[0]==='delayed') setTimeout(()=>button.disabled=false,400);
+            if (arguments[0]==='changed') setTimeout(()=>{
+                const bubble=document.createElement('div'); bubble.className='chat-bubble';
+                bubble.dataset.qa='chatik-chat-message'; bubble.textContent='А как проверяете API?';
+                document.getElementById('messages').append(bubble); button.disabled=false;
+            },400);
+        });
+    ''', mode)
+    text = 'Проверяю права доступа и обработку входных данных.'
+    assert bot.send_chat_reply(text) is (mode == 'delayed')
+    assert bot.driver.execute_script('return sent.length;') == (1 if mode == 'delayed' else 0)
+    if mode != 'delayed':
+        assert bot._chat_send_failure == 'not_dispatched'
+        assert bot.driver.execute_script('return document.getElementById("composer").value;') == text
 
 
 def test_real_chrome_ai_interview_answers_six_turns_and_detects_departure(chrome_chat):
@@ -1595,3 +2272,146 @@ def test_real_chrome_hh_quick_reply_chips_are_not_recruiter_choices(chrome_chat)
     ''', ['Да', 'Нет', 'Где находится место работы?', 'У меня есть профильный опыт', '…'])
     chat = bot._read_open_chat()
     assert [c['label'] for c in chat['choice_options']] == ['Да', 'Нет']
+
+
+def test_answer_to_our_reason_request_is_saved_as_rejection_not_argued(bot):
+    """14.10: на «Подскажите причину отказа» ответили «Отсутствие профильного образования» —
+    бот спорил в ответ. Это причина отказа: сохраняем, не отвечаем."""
+    from chat_workflow import REASON_REQUEST
+    chat = snapshot()
+    chat['messages'] += [{'text': REASON_REQUEST, 'isOut': True, 'id': 'm2'},
+                         {'text': 'Отсутствие профильного образования', 'isOut': False, 'id': 'm3'}]
+    bot.compose_chat_reply = Mock(return_value='спорный ответ')
+    rejection = bot._handle_chat(chat, '')
+    assert rejection and 'Отсутствие профильного образования' in rejection['rejection_message']
+    bot.compose_chat_reply.assert_not_called()
+    bot.send_chat_reply.assert_not_called()
+
+
+def test_chat_with_new_unread_text_is_visited_again_but_only_three_times(bot):
+    # 15.10: работодатель дописал, пока бот отвечал — чат остаётся непрочитанным с новым текстом.
+    texts = iter(['Вопрос 1', 'Вопрос 2', 'Вопрос 3', 'Вопрос 4', 'Вопрос 5'])
+    current = {'idx': 0, 'key': '7', 'text': next(texts)}
+    prepare_scan(bot, [], Mock(side_effect=lambda _card: snapshot()))
+
+    def handled(*_args):
+        bot._chat_sent_this_run = getattr(bot, '_chat_sent_this_run', 0) + 1  # мы ответили — чат мог измениться
+    bot._handle_chat = Mock(side_effect=handled)
+
+    def cards():
+        return [dict(current)]
+    bot._read_chat_cards = Mock(side_effect=cards)
+    original_back = bot._back_to_chat_list
+
+    def back():
+        current['text'] = next(texts, current['text'])
+        return original_back()
+    bot._back_to_chat_list = Mock(side_effect=back)
+    bot._chat_list_empty = Mock(return_value=True)
+    bot.process_unread_messenger_chats()
+    assert bot._open_chat_card.call_count == 3
+
+
+def test_live_variants_pass_the_public_text_filter_and_carry_no_digits():
+    from ai_assistant import clean_public_text, DEFAULT_CANDIDATE_PROFILE, is_salary_question
+    from chat_workflow import SALARY_CHAT_VARIANTS, EXPERIENCE_YES_VARIANTS, contact_reply, split_salary
+    for line in SALARY_CHAT_VARIANTS + EXPERIENCE_YES_VARIANTS:
+        assert clean_public_text(line, DEFAULT_CANDIDATE_PROFILE) == line, line
+        assert not any(ch.isdigit() for ch in line)
+    for _ in range(10):
+        reply = contact_reply({'contacts': {'telegram': 'someone'}}, 'Оставьте ваш Telegram')
+        assert clean_public_text(reply, DEFAULT_CANDIDATE_PROFILE) == reply and '@someone' in reply
+    # 15.10: «от какой суммы рассматриваете уровень зп?» — это вопрос о деньгах
+    rest, asked = split_salary('Иван, добрый день. Подскажите, от какой суммы рассматриваете уровень зп?')
+    assert asked and 'зп' not in rest
+
+
+def test_will_review_and_report_later_is_an_acknowledgement():
+    from chat_workflow import is_acknowledgement
+    assert is_acknowledgement('Компания ООО Пример рассмотрит Ваше резюме на вакансию '
+                              'Специалист по информационной безопасности и позже сообщит Вам о своем решении.')
+    assert not is_acknowledgement('Рассмотрим резюме. Можете созвониться завтра?')
+
+
+@pytest.mark.parametrize('incoming', [
+    'не смогла дозвониться. сработал автоответчик',
+    'Чтобы понимать, подходите ли вы нам, позвоните по номеру 8 900 000 00 01 Сергей Петрович',
+    'Напишите мне в WhatsApp +7 900 123 45 67',
+])
+def test_missed_call_or_call_us_request_is_redirected_to_telegram(bot, incoming):
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='не должен вызываться')
+    bot._handle_chat(snapshot(incoming))
+    reply = bot.send_chat_reply.call_args.args[0]
+    assert 'https://t.me/someone' in reply and 'тг' in reply.lower()
+    bot.compose_chat_reply.assert_not_called()
+
+
+def test_thanks_only_gets_no_reply(bot):
+    bot.compose_chat_reply = Mock(return_value='Пожалуйста!')
+    bot._handle_chat(snapshot('Спасибо'))
+    bot.send_chat_reply.assert_not_called()
+    bot.compose_chat_reply.assert_not_called()
+
+
+def test_no_please_and_no_second_greeting_in_replies(bot):
+    from chat_workflow import strip_politeness_tells
+    assert strip_politeness_tells('Подскажите, пожалуйста, в какие сроки?') == 'Подскажите, в какие сроки?'
+    assert strip_politeness_tells('Пожалуйста! Если появятся вопросы, пишите.') == 'Если появятся вопросы, пишите.'
+    assert strip_politeness_tells('Напишите пожалуйста мне.') == 'Напишите мне.'
+    chat = snapshot('Какие у вас задачи по инфраструктуре?')
+    chat['messages'].insert(0, {'text': 'Здравствуйте! Готов обсудить.', 'isOut': True})
+    bot.compose_chat_reply = Mock(return_value='Здравствуйте! Подскажите, пожалуйста, какой стек.')
+    bot._handle_chat(chat)
+    sent = bot.send_chat_reply.call_args.args[0]
+    assert 'пожалуйста' not in sent.lower() and not sent.startswith('Здравствуйте')
+
+
+def test_salary_pushback_gets_a_counter_question_not_a_number(bot):
+    # 15.10: «Ну если вы рассматриваете 500 тыс, то нет смысла…» -> «а вы сколько предлагаете?)»
+    from ai_assistant import clean_public_text, DEFAULT_CANDIDATE_PROFILE
+    from chat_workflow import SALARY_CHAT_VARIANTS, SALARY_PUSHBACK_REPLIES
+    for line in SALARY_PUSHBACK_REPLIES:
+        assert clean_public_text(line, DEFAULT_CANDIDATE_PROFILE) == line
+    bot.compose_chat_reply = Mock(return_value='не должен вызываться')
+    chat = snapshot('Ну если вы рассматриваете 500 тыс, то нет смысла проводить следующий этап))')
+    chat['messages'].insert(0, {'text': SALARY_CHAT_VARIANTS[0], 'isOut': True})
+    bot._handle_chat(chat)
+    assert bot.send_chat_reply.call_args.args[0] in SALARY_PUSHBACK_REPLIES
+    bot.compose_chat_reply.assert_not_called()
+
+
+def test_salary_pushback_needs_our_earlier_answer_and_ignores_employer_offers():
+    from chat_workflow import salary_pushback, SALARY_CHAT_VARIANTS
+    base = {'messages': [{'text': SALARY_CHAT_VARIANTS[1], 'isOut': True}]}
+    assert salary_pushback(base, {}, 'Это дорого для нас, нет смысла продолжать')
+    assert not salary_pushback(base, {}, 'Мы предлагаем 150 тыс на руки')
+    assert not salary_pushback({'messages': []}, {}, 'Ну если вы рассматриваете 500 тыс, то нет смысла')
+
+
+def test_silent_chat_is_not_reopened_and_refused_telegram_is_not_pushed(bot):
+    from chat_workflow import TG_REFUSED
+    assert TG_REFUSED.search('Иван, в тг, к сожалению, неудобно')
+    assert not TG_REFUSED.search('в тг удобно, пишите')
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone'}}
+    bot.compose_chat_reply = Mock(return_value='не должен вызываться')
+    chat = snapshot('Иван, в тг, к сожалению, неудобно. Могли бы мне набрать 7 900 000 00 02')
+    bot._handle_chat(chat)
+    bot.send_chat_reply.assert_not_called()
+    action = next(a for a in bot._load_chat_actions().values() if a['status'] == 'deferred')
+    assert '7 900 000 00 02' in action['note']
+
+
+def test_phone_number_never_reaches_chat_and_refused_telegram_in_any_word_order(bot):
+    # 16.10: «мне неудобно в тг, нет рабочего тг, когда созвонимся?» -> бот написал номер пользователя.
+    from chat_workflow import TG_REFUSED, strip_phone_numbers
+    assert TG_REFUSED.search('Иван, мне неудобно в тг. У меня нет рабочего тг')
+    assert strip_phone_numbers('Могу сегодня. Мой номер +79990000000. Какое время удобно?') == 'Могу сегодня.\n\nКакое время удобно?'
+    bot.ai_assistant.candidate_profile = {'contacts': {'telegram': '@someone', 'phone': '+79990000000'}}
+    bot.compose_chat_reply = Mock(return_value='Мой номер +79990000000. Позвоните.')
+    bot._handle_chat(snapshot('Иван, мне неудобно в тг. В какое время мы сможем созвониться по телефону?'))
+    bot.send_chat_reply.assert_not_called()
+    chat = snapshot('Оставьте, пожалуйста, ваш номер телефона')
+    bot._handle_chat(chat)
+    assert 'https://t.me/someone' in bot.send_chat_reply.call_args.args[0]
+    assert '9990000000' not in bot.send_chat_reply.call_args.args[0]

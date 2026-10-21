@@ -86,6 +86,16 @@ STATUS_LABELS.setdefault('server_error', 'сайт hh.ru ответил ошиб
 STATUS_LABELS.setdefault('questions_unfilled', 'анкета работодателя осталась незаполненной')
 
 
+def verified_employer_quote(quote, employer_messages) -> str:
+    """Only source-matching text may be attributed to the employer."""
+    if not isinstance(quote, str) or not quote.strip():
+        return ''
+    normalized = ' '.join(quote.split()).casefold()
+    return quote.strip() if any(isinstance(message, str) and normalized in
+                               ' '.join(message.split()).casefold()
+                               for message in (employer_messages or [])) else ''
+
+
 def canonical_skill_name(skill) -> str:
     """Приводит навык к одному написанию перед записью в базу.
 
@@ -195,26 +205,15 @@ class DatabaseManager:
                 )
             """)
 
-            # 2.1. Признак «причина подтверждена словами работодателя».
-            # ALTER под try/except: на уже существующей базе колонка есть, и
-            # повторный ALTER падает — ронять из-за этого запуск незачем.
-            # Backfill идёт только в момент реального добавления колонки:
-            # 245 накопленных строк иначе молча стали бы «не подтверждено».
+            # Old flags without source quotes are not evidence; preserve rows without backfilling guesses.
             try:
                 cursor.execute(
                     "ALTER TABLE rejections ADD COLUMN evidence_based INTEGER DEFAULT 0"
                 )
-                filled = 0
-                for row in cursor.execute(
-                        "SELECT id, rejection_reason FROM rejections").fetchall():
-                    if not is_generic_reason(row['rejection_reason']):
-                        cursor.execute(
-                            "UPDATE rejections SET evidence_based = 1 WHERE id = ?",
-                            (row['id'],))
-                        filled += 1
-                logger.info(f"Отмечено отказов, подтверждённых ответом работодателя: {filled}")
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
+            if 'employer_reason_quote' not in {row['name'] for row in cursor.execute('PRAGMA table_info(rejections)')}:
+                cursor.execute("ALTER TABLE rejections ADD COLUMN employer_reason_quote TEXT DEFAULT ''")
 
             # 3. Таблица адаптивных навыков (багаж опыта и авто-исправлений)
             cursor.execute("""
@@ -315,27 +314,20 @@ class DatabaseManager:
         knockout_filters: Optional[List[str]] = None,
         remediation_advice: Optional[List[str]] = None,
         evidence_based: Optional[bool] = None,
-        employer_messages: Optional[List[str]] = None
+        employer_messages: Optional[List[str]] = None,
+        employer_reason_quote: Optional[str] = None
     ) -> int:
         """Сохраняет разбор отказа и регистрирует навыки для исправления резюме.
 
-        Признак «причину назвал работодатель» считается ровно по одному правилу:
-        подтверждено = остались непустые реплики работодателя. Раньше признак в
-        части путей выводился из ТЕКСТА причины, и свободная формулировка ИИ
-        («Работодатель ищет специалиста по КИИ») проходила как подтверждённая,
-        хотя работодатель в чате не написал ни слова.
-
-        employer_messages сюда передаются уже вычищенными
-        (rejection_analyzer.clean_employer_messages): в сыром виде туда попадает
-        вёрстка страницы («Отклик на вакансию», «Без сопроводительного письма»,
-        время), и такие строки помечались подтверждёнными.
-
-        evidence_based оставлен для случая, когда вызывающий код знает ответ сам;
-        текст причины на него больше не влияет.
+        Цитата хранится отдельно от гипотезы ИИ и проверяется по репликам работодателя.
+        Наличие стандартного отказа не подтверждает догадку о причине.
         """
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        if evidence_based is None:
-            evidence_based = any(str(m).strip() for m in (employer_messages or []))
+        employer_reason_quote = verified_employer_quote(
+            rejection_reason if employer_reason_quote is None else employer_reason_quote, employer_messages)
+        if evidence_based is False:
+            employer_reason_quote = ''
+        evidence_based = bool(employer_reason_quote)
         missing = missing_keywords or []
         knockouts = knockout_filters or []
         remediation = remediation_advice or []
@@ -377,15 +369,15 @@ class DatabaseManager:
                         vacancy_id, title, company, url, analyzed_at,
                         rejection_reason, ats_score, missing_keywords,
                         knockout_filters, remediation_advice, auto_fixed,
-                        evidence_based
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                        evidence_based, employer_reason_quote
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """, (
                     str(vacancy_id), title, company, url, now,
                     rejection_reason, ats_score,
                     json.dumps(missing, ensure_ascii=False),
                     json.dumps(knockouts, ensure_ascii=False),
                     json.dumps(remediation, ensure_ascii=False),
-                    1 if evidence_based else 0
+                    1 if evidence_based else 0, employer_reason_quote
                 ))
                 rej_id = cursor.lastrowid
 
@@ -526,11 +518,9 @@ class DatabaseManager:
                 cursor.execute("SELECT COUNT(*) as total_rej FROM rejections")
                 total_rejections_audited = cursor.fetchone()['total_rej']
 
-                # Сколько причин названы самим работодателем, а сколько бот
-                # дописал за него. Без этого деления шаблон «Опыт и грейд»
-                # выглядит как установленный факт и забивает реальный сигнал.
+                # Count source-backed quotes, not legacy flags or the existence of a standard refusal.
                 cursor.execute(
-                    "SELECT COUNT(*) as cnt FROM rejections WHERE evidence_based = 1")
+                    "SELECT COUNT(*) as cnt FROM rejections WHERE evidence_based = 1 AND trim(coalesce(employer_reason_quote, '')) != ''")
                 rejections_confirmed = cursor.fetchone()['cnt']
                 rejections_guessed = total_rejections_audited - rejections_confirmed
 
@@ -540,7 +530,7 @@ class DatabaseManager:
                 # равно не идёт (см. print_stats_cli) — у подтверждённых строк
                 # score тоже проставлен константой.
                 cursor.execute(
-                    "SELECT AVG(ats_score) as avg_score FROM rejections WHERE evidence_based = 1")
+                    "SELECT AVG(ats_score) as avg_score FROM rejections WHERE evidence_based = 1 AND trim(coalesce(employer_reason_quote, '')) != ''")
                 avg_ats_row = cursor.fetchone()
                 avg_ats = round(avg_ats_row['avg_score'] or 0, 1)
 
@@ -650,7 +640,7 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT vacancy_id, title, company, analyzed_at, rejection_reason,
-                           ats_score, missing_keywords, knockout_filters, remediation_advice
+                           ats_score, missing_keywords, knockout_filters, remediation_advice, employer_reason_quote
                     FROM rejections
                     ORDER BY id DESC LIMIT ?
                 """, (limit,))
@@ -663,6 +653,7 @@ class DatabaseManager:
                         "company": row['company'],
                         "analyzed_at": row['analyzed_at'],
                         "rejection_reason": row['rejection_reason'],
+                        "employer_reason_quote": row['employer_reason_quote'],
                         "ats_score": row['ats_score'],
                         "missing_keywords": json.loads(row['missing_keywords'] or '[]'),
                         "knockout_filters": json.loads(row['knockout_filters'] or '[]'),
@@ -737,7 +728,7 @@ def print_stats_cli():
     print(f"Отказов:                       {stats.get('discards', 0)}")
     print(f"Доля приглашений:              {stats.get('conversion_rate', 0)}% (цель: 80%)")
     print(f"Проанализировано отказов:      {stats.get('total_rejections_audited', 0)}")
-    print(f"   со слов работодателя:       {stats.get('rejections_confirmed', 0)}")
+    print(f"   с проверенной цитатой:      {stats.get('rejections_confirmed', 0)}")
     print(f"   догадка бота, не факт:      {stats.get('rejections_guessed', 0)}")
     # Показателя «Резюме подходило вакансиям» здесь больше нет: ats_score в
     # rejections на три четверти проставлен константами (0/70/85/100) из

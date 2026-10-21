@@ -66,7 +66,8 @@ from config_manager import (
     SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS, search_direction_chosen, local_application_limit,
     security_title_by_meaning, commercial_title_keyword,
     find_title_keyword,
-    STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS, title_excludes,
+    STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS,
+    TECHNICAL_FALLBACK_EXCLUDE_KEYWORDS, title_excludes,
     get_active_resume,
     get_active_preset,
     interactive_resume_picker,
@@ -74,6 +75,7 @@ from config_manager import (
     interactive_cover_letter_editor,
     prompt_gemini_key,
     prompt_groq_key,
+    prompt_tokenharbor_key,
     load_config,
     save_config,
     check_title_grade
@@ -256,7 +258,8 @@ def validate_apply_title(title: object, allow_technical_fallback: bool = True) -
         if find_keyword(title, STRICT_TITLE_INCLUDE_KEYWORDS) or security_title_by_meaning(title):
             return True, "strict_security"
 
-        if allow_technical_fallback and find_keyword(title, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS):
+        if (allow_technical_fallback and find_keyword(title, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS)
+                and not find_keyword(title, TECHNICAL_FALLBACK_EXCLUDE_KEYWORDS)):
             return True, "technical_fallback"
 
         return False, "Не security/appsec/pentest/devsecops/soc или технический fallback"
@@ -381,13 +384,19 @@ class HHAutoApplicant:
         # Максимальный приоритет, на который реально откликаемся.
         # 1 Пентест/RedTeam, 2 ИБ, 3 Спец-ИБ, 4 Защита данных, 5 Разработка с ИБ.
         # 6 (чистая разработка) и 7 (другое IT) исключаются из откликов.
-        self.max_apply_priority = 5
+        # 14.10: «бот всегда должен откликаться, даже когда на все ИБ-вакансии уже откликнуто».
+        # max_apply_priority в настройках: 5 — только ИБ и разработка с ИБ, 7 — всё найденное
+        # (ИБ первыми, потом разработка/DevOps/админы, потом остальное IT).
+        try:
+            self.max_apply_priority = int(load_config().get('max_apply_priority', 5))
+        except (TypeError, ValueError):
+            self.max_apply_priority = 5
         
         self.load_applied_vacancies()
         
         # Всегда исключаем вакансии с тестами
         self.skip_vacancies_with_tests = True
-
+        
         # ПРИОРИТЕТ НА КИБЕРБЕЗОПАСНОСТЬ
         self.security_priority = True
         self._user_closed = False
@@ -578,17 +587,17 @@ class HHAutoApplicant:
             log_problem("Не удалось сохранить список вакансий", e)
 
     def load_vacancies_cache(self):
-        """Загружает вакансии из кеша если он актуален И содержит достаточно вакансий"""
+        """Загружает оставшуюся очередь для объединения со свежим поиском."""
         try:
             with open(self.vacancies_cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
             cache_time = datetime.fromisoformat(cache_data['timestamp'])
             age_hours = (datetime.now() - cache_time).total_seconds() / 3600
+            self._cache_age_hours = age_hours
             
             if age_hours > self.cache_lifetime_hours:
                 print(f"Список вакансий устарел: ему {age_hours:.1f} ч., обновляем каждые {self.cache_lifetime_hours} ч.")
-                return None
             
             vacancies = cache_data['vacancies']
             
@@ -629,7 +638,7 @@ class HHAutoApplicant:
                 print("Требуется обновление поиска...")
                 return None
             
-            print(f"[OK] Список вакансий свежий, можно откликаться ({len(filtered_vacancies)} вакансий)")
+            print(f"[OK] Сохранённая очередь: {len(filtered_vacancies)} вакансий; проверю новые публикации")
             return filtered_vacancies
             
         except FileNotFoundError:
@@ -736,7 +745,7 @@ class HHAutoApplicant:
         
         print("\n[!] ВАЖНО: после входа браузер откроет страницу с ошибкой — это нормально")
         print("Скопируйте ПОЛНЫЙ адрес из адресной строки браузера")
-        callback_url = input("\nВставьте полный URL после авторизации: ").strip()
+        callback_url = input("\nВставьте полный URL после авторизации (Enter — пропустить, бот продолжит через браузер): ").strip()
         
         parsed_url = urlparse(callback_url)
         query_params = parse_qs(parsed_url.query)
@@ -948,6 +957,14 @@ class HHAutoApplicant:
                 retry_count += 1
                 
             except requests.exceptions.RequestException as e:
+                if (method.upper() in ('GET', 'HEAD')
+                        and isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+                        and retry_count < MAX_REQUEST_RETRIES - 1):
+                    retry_count += 1
+                    logging.warning('Сбой чтения hh.ru: %s. Повтор %s/%s через 1 с.',
+                                    explain_error(e), retry_count, MAX_REQUEST_RETRIES - 1)
+                    time.sleep(1)
+                    continue
                 log_problem("Запрос к hh.ru не выполнен", e)
                 log_detail(f"Адрес запроса: {method} {url}")
                 raise
@@ -1194,7 +1211,7 @@ class HHAutoApplicant:
         requirement = (snippet.get('requirement') or '').lower()
         responsibility = (snippet.get('responsibility') or '').lower()
         full_text = f"{name} {requirement} {responsibility}"
-
+        
         # ПРИОРИТЕТ 1 - Чистая кибербезопасность и пентестинг
         priority_1_keywords = [
             'пентест', 'pentest', 'penetration test',
@@ -1205,7 +1222,7 @@ class HHAutoApplicant:
             'exploit', 'zero day', '0day',
             'кибербезопасность', 'cybersecurity', 'cyber security'
         ]
-
+        
         # ПРИОРИТЕТ 2 - Информационная безопасность
         priority_2_keywords = [
             'информационная безопасность', 'информационной безопасности',
@@ -1216,7 +1233,7 @@ class HHAutoApplicant:
             'incident response', 'threat intelligence', 'threat hunting',
             'malware analyst', 'reverse engineer', 'forensics'
         ]
-
+        
         # ПРИОРИТЕТ 3 - Специализированная ИБ
         priority_3_keywords = [
             'siem', 'dlp', 'waf', 'ids', 'ips', 'edr', 'xdr',
@@ -1227,7 +1244,7 @@ class HHAutoApplicant:
             'security audit', 'security compliance', 'grc',
             'iso 27001', 'pci dss', 'gdpr'
         ]
-
+        
         # ПРИОРИТЕТ 4 - Защита данных и крипто
         priority_4_keywords = [
             'защита информации', 'защита данных',
@@ -1236,33 +1253,39 @@ class HHAutoApplicant:
             'фстэк', 'скзи', 'pki',
             'data protection', 'privacy engineer'
         ]
-
+        
         # Проверяем приоритеты
         for keyword in priority_1_keywords:
             if keyword in name or keyword in full_text:
                 return 1
-
+                
         for keyword in priority_2_keywords:
             if keyword in name or keyword in full_text:
                 return 2
-
+                
         for keyword in priority_3_keywords:
             if keyword in name or keyword in full_text:
                 return 3
-
+                
         for keyword in priority_4_keywords:
             if keyword in name or keyword in full_text:
                 return 4
-
+        
         # ПРИОРИТЕТ 5 - Разработка с безопасностью
         if any(kw in full_text for kw in ['secure', 'security', 'безопасн']) and \
            any(kw in full_text for kw in ['developer', 'разработчик', 'python', 'javascript']):
             return 5
-
-        # ПРИОРИТЕТ 6 - Чистая разработка
+        
+        # ПРИОРИТЕТ 6 - Разработка и технические роли. DevOps/SRE/админы раньше уходили в «Другое IT»,
+        # хотя давали собеседования (SRE, DevOps, «сетевой инженер»).
+        if any(kw in name for kw in ['devops', 'девопс', 'sre', 'site reliability', 'системный администратор',
+                                     'system administrator', 'linux', 'unix', 'сетевой инженер',
+                                     'сетевой администратор', 'network engineer', 'инженер инфраструктуры',
+                                     'platform engineer']):
+            return 6
         if any(kw in full_text for kw in ['developer', 'разработчик', 'программист', 'python', 'javascript']):
             return 6
-
+        
         # ПРИОРИТЕТ 7 - Остальное IT
         return 7
 
@@ -1319,19 +1342,25 @@ class HHAutoApplicant:
         self.sync_cache_with_applied()
         
         cached_vacancies = self.load_vacancies_cache()
-        
-        # Используем кеш, если в нем есть вакансии
-        if cached_vacancies:
-            print("Беру вакансии из сохранённого списка")
-            print(f"[OK] Подходящих вакансий в списке: {len(cached_vacancies)}")
-            # Сортируем кешированные вакансии по приоритету
+
+        # Новый поиск — раз в search_refresh_hours (по умолчанию 6 ч), а не каждый запуск: 81 запрос
+        # к hh занимает минуты, и hh начинает «брать паузу». Пока очередь свежая — откликаемся по ней.
+        try:
+            refresh_hours = float(load_config().get('search_refresh_hours', 6))
+        except (TypeError, ValueError):
+            refresh_hours = 6.0
+        age = getattr(self, '_cache_age_hours', None)
+        if cached_vacancies and age is not None and age < refresh_hours:
+            print(f"[OK] Поиск был {age:.1f} ч. назад, следующий — через {refresh_hours - age:.1f} ч. "
+                  f"Беру сохранённую очередь")
             cached_vacancies.sort(key=lambda v: self.get_vacancy_priority(v))
             return cached_vacancies
-        else:
-            print("Выполняется новый поиск вакансий...")
-        
-        all_vacancies = []
-        processed_ids = set()
+
+        print("Проверяю новые вакансии; оставшаяся очередь и история откликов сохраняются")
+
+        all_vacancies = list(cached_vacancies or [])
+        processed_ids = {str(v.get('id')) for v in all_vacancies}
+        cached_count = len(all_vacancies)
         excluded_with_tests = 0
         excluded_already_applied = 0
         excluded_not_suitable = 0
@@ -1359,7 +1388,7 @@ class HHAutoApplicant:
                 '"offensive security"',
                 '"vulnerability researcher"',
                 '"exploit developer"',
-
+                
                 '"кибербезопасность"',
                 '"cybersecurity"',
                 '"cyber security"',
@@ -1369,7 +1398,7 @@ class HHAutoApplicant:
                 '"security engineer"',
                 '"security architect"',
                 '"security specialist"',
-
+                
                 '"SOC analyst"',
                 '"SOC engineer"',
                 '"SIEM administrator"',
@@ -1379,14 +1408,14 @@ class HHAutoApplicant:
                 '"malware analyst"',
                 '"reverse engineer"',
                 '"forensics analyst"',
-
+                
                 '"application security"',
                 '"appsec engineer"',
                 '"devsecops"',
                 '"security operations"',
                 '"blue team"',
                 '"purple team"',
-
+                
                 # === РАСШИРЕННЫЕ ЗАПРОСЫ ПО ИБ ===
                 'пентест',
                 'pentest',
@@ -1395,45 +1424,45 @@ class HHAutoApplicant:
                 'vulnerability assessment',
                 'security testing',
                 'security audit',
-
+                
                 'кибербезопасность',
                 'cybersecurity',
                 'информационная безопасность',
                 'information security',
                 'IT security',
                 'security operations center',
-
+                
                 'SIEM SOAR',
                 'XDR EDR MDR',
                 'DLP WAF IDS IPS',
                 'incident management',
                 'security monitoring',
-
+                
                 'cloud security',
                 'network security',
                 'web application security',
                 'mobile security',
                 'endpoint security',
-
+                
                 'защита информации',
                 'защита данных',
                 'безопасность приложений',
                 'безопасность инфраструктуры',
-
+                
                 'криптография',
                 'СКЗИ ФСТЭК',
                 'compliance security',
                 'GRC analyst',
                 'ISO 27001',
                 'PCI DSS',
-
+                
                 # === РАЗРАБОТКА С БЕЗОПАСНОСТЬЮ ===
                 'security developer',
                 'secure coding',
                 'security engineer developer',
                 'python security',
                 'security automation',
-
+                
                 # === СПЕЦИФИЧНЫЕ РОЛИ ===
                 'DevSecOps engineer',
                 'AppSec engineer',
@@ -1451,7 +1480,7 @@ class HHAutoApplicant:
                 search_queries = [f'"{preset["custom_query"]}"']
             if not search_queries:
                 search_queries = ['"разработчик"']
-
+        
         url = f"{self.base_url}/vacancies"
         total_queries = len(search_queries)
         
@@ -1478,7 +1507,7 @@ class HHAutoApplicant:
                 if stop_search_reason:
                     break
 
-                if len(all_vacancies) >= SEARCH_RESULT_LIMIT:
+                if len(all_vacancies) - cached_count >= SEARCH_RESULT_LIMIT:
                     break
                 
                 clean_query = query.replace('"', '')
@@ -1601,6 +1630,7 @@ class HHAutoApplicant:
         if stop_search_reason:
             print(f" [!] Поиск остановлен досрочно: {stop_search_reason}")
         print(f" Найдено подходящих вакансий: {len(all_vacancies)}")
+        print(f" Новых к сохранённой очереди: {len(all_vacancies) - cached_count}")
         print(f" [ПРОПУСК] С тестами: {excluded_with_tests}")
         print(f" Уже обработано: {excluded_already_applied}")
         print(f" [-] Не подходят: {excluded_not_suitable}")
@@ -1612,7 +1642,7 @@ class HHAutoApplicant:
             for v in all_vacancies:
                 priority = self.get_vacancy_priority(v)
                 priority_counts[priority] = priority_counts.get(priority, 0) + 1
-
+            
             print(f"\nРаспределение по приоритетам:")
             priority_names = {
                 1: "[P1] Пентестинг и Red Team",
@@ -1620,10 +1650,10 @@ class HHAutoApplicant:
                 3: "[P3] Специализированная ИБ",
                 4: "[P4] Защита данных и крипто",
                 5: "[P5] Разработка с безопасностью",
-                6: "[P6] Чистая разработка",
+                6: "[P6] Разработка, DevOps, админы",
                 7: "[P7] Другое IT"
             }
-
+            
             for priority in sorted(priority_counts.keys()):
                 if priority_counts[priority] > 0:
                     print(f" {priority_names.get(priority, f'Приоритет {priority}')}: {priority_counts[priority]}")
@@ -1631,7 +1661,7 @@ class HHAutoApplicant:
             # Для откликов оставляем только ИБ + разработку с ИБ (приоритеты 1..max_apply_priority)
             target_vacancies = [v for v in all_vacancies if self._is_apply_priority(v)]
             dropped = len(all_vacancies) - len(target_vacancies)
-            print(f"\n[OK] К отклику" + (" (ИБ + разработка с ИБ)" if preset_id == 'security' else "")
+            print(f"\n[OK] К отклику" + ((" (ИБ + разработка с ИБ)" if getattr(self, 'max_apply_priority', 5) <= 5 else " (ИБ первыми, затем разработка, DevOps, остальное IT)") if preset_id == 'security' else "")
                   + f": {len(target_vacancies)}")
             if dropped > 0:
                 print(f" [-] Исключено не-ИБ (чистая разработка / другое IT): {dropped}")
@@ -1647,10 +1677,10 @@ class HHAutoApplicant:
         """Сопроводительное письмо с акцентом на кибербезопасность"""
         position_name = vacancy_details.get('name', 'данную позицию')
         company_name = vacancy_details.get('employer', {}).get('name', 'вашей компании')
-
+        
         # Определяем тип вакансии
         name_lower = position_name.lower()
-
+        
         # Для пентестинга
         if any(kw in name_lower for kw in ['пентест', 'pentest', 'ethical hack', 'red team']):
             templates = [
@@ -1658,11 +1688,11 @@ class HHAutoApplicant:
 
 Заинтересовала позиция "{position_name}" в {company_name}.
 
-Имею опыт в проведении тестирования на проникновение и поиске уязвимостей.
+Имею опыт в проведении тестирования на проникновение и поиске уязвимостей. 
 Готов применить свои навыки для повышения уровня защищенности инфраструктуры компании.
 
 С уважением!""",
-
+                
                 f"""Добрый день!
 
 Позиция "{position_name}" полностью соответствует моей специализации.
@@ -1681,7 +1711,7 @@ class HHAutoApplicant:
 Специализируюсь на информационной безопасности и готов внести вклад в защиту цифровых активов компании.
 
 С уважением!""",
-
+                
                 f"""Добрый день!
 
 Позиция "{position_name}" соответствует моему опыту в области кибербезопасности.
@@ -1700,7 +1730,7 @@ class HHAutoApplicant:
 Имею опыт разработки с акцентом на безопасность кода и защищенность приложений.
 
 С уважением!""",
-
+                
                 f"""Добрый день!
 
 Рассматриваю вакансию "{position_name}" как возможность применить навыки безопасной разработки.
@@ -1719,7 +1749,7 @@ class HHAutoApplicant:
 
 С уважением!"""
             ]
-
+        
         return random.choice(templates)
 
     def apply_to_vacancy(self, vacancy_id, cover_letter=None):
@@ -2136,7 +2166,7 @@ class HHAutoApplicant:
                 3: "[P3] Специализированная ИБ",
                 4: "[P4] Защита данных",
                 5: "[P5] Разработка с безопасностью",
-                6: "[P6] Чистая разработка",
+                6: "[P6] Разработка, DevOps, админы",
                 7: "[P7] Другое IT"
             }
             
@@ -2152,7 +2182,7 @@ class HHAutoApplicant:
             print(f"\nСтатистика ошибок:")
             for error_type, count in sorted(error_stats.items(), key=lambda x: x[1], reverse=True):
                 print(f" • {human_status(error_type)}: {count}")
-
+        
         # Подсчет откликов на ИБ
         security_applications = sum(priority_stats.get(i, 0) for i in [1, 2, 3, 4])
         if security_applications > 0 and active_direction()[0]:
@@ -2182,7 +2212,40 @@ def choose_ai_provider() -> None:
     services = [str(pr.get('name')) for pr in probe._compat_providers() if pr.get('name')]
     for k, name in enumerate(services, len(rows) + 2):
         print(f"  [{k}] Первым: сервис {name} целиком")
+    print('  [O] OpenCode: подключить, выбрать Free / Go и модель')
+    print('  [T] Проверить очередь контрольным запросом без откликов')
+    print('  [W] Проверить параллельную подготовку трёх ответов без отправки в HH')
+    print('  [V] Проверить Vision на двух контрольных картинках без откликов')
     ans = input("Номер (Enter — оставить как есть): ").strip()
+    if ans.lower() in ('w', 'ц'):
+        from chat_workflow import check_parallel_chat_preparation
+        try:
+            check_parallel_chat_preparation(cfg)
+        except Exception as exc:
+            print(f'[!] Параллельная проверка не завершена ({type(exc).__name__}). Отправок в HH не было.')
+        return
+    if ans.lower() in ('v', 'м'):
+        from vision_provider import check_vision_provider
+        try:
+            check_vision_provider(cfg)
+        except Exception as exc:
+            print(f'[!] Проверка Vision не завершена ({type(exc).__name__}). Настройки не изменены.')
+        return
+    if ans.lower() in ('t', 'е'):
+        try:
+            checker = AIAssistant(cfg)
+            answer = checker._call_llm(
+                'Сколько будет 7 + 5? Ответь только числом.',
+                'Контрольный запрос. Без инструментов, файлов и команд.',
+                validate=lambda text: None if text.strip() == '12' else 'Неверный контрольный ответ')
+            print('[OK] Рабочая очередь вернула 12.' if answer else '[!] Никто не дал верный контрольный ответ.')
+        except Exception as exc:
+            print(f'[!] Проверка очереди не завершена: {explain_error(exc)}')
+        return
+    if ans.lower() in ('o', 'щ'):
+        from config_manager import edit_opencode_provider
+        edit_opencode_provider()
+        return
     if ans.isdigit() and len(rows) + 2 <= int(ans) < len(rows) + 2 + len(services):
         name = services[int(ans) - len(rows) - 2]
         ai['primary_ai'] = name
@@ -2281,6 +2344,10 @@ MENU_GROUPS = {
         (('3',), CYAN, "Фоновые отклики, без окна браузера"),
     )),
     'd': ("ОТКАЗЫ И АНАЛИТИКА", (
+        (('x', 'ч'), CYAN, "Ответить на непрочитанные чаты без правки резюме"),
+        (('j', 'о'), CYAN, "Проверить поля и кнопки в пропущенных чатах (без отправки)"),
+        (('y',), CYAN, "Проверить отклик на HH по ID вакансии (без отправки)"),
+        (('e',), CYAN, "Отправить выбранный сохранённый черновик и продолжить этот чат"),
         (('a', 'ф'), CYAN, "Разбор переписки с работодателями и правка резюме"),
         (('4',), MAGENTA, "Почему отказали: разбор причин и проверка резюме"),
         (('5',), BLUE, "Статистика откликов и конверсия"),
@@ -2301,6 +2368,7 @@ MENU_GROUPS = {
         (('i', 'ш'), CYAN, "Какой ИИ пишет письма: выбор и очередь"),
         (('g', 'п'), CYAN, "Ключ ИИ-генератора писем (Google Gemini)"),
         (('k', 'л'), GREEN, "Запасной ИИ, если основной исчерпает лимит (Groq)"),
+        (('j', 'о'), CYAN, "Подключить TokenHarbor: скрытый ввод API-ключа"),
         (('q', 'й'), YELLOW, "Ответы на вопросы работодателей (зарплата, город, график)"),
         (('m', 'ь'), GREEN, "Поведение бота: лимит, анкеты, письма, чат, фильтры"),
         (('c', 'с'), WHITE, "Очистить список найденных вакансий"),
@@ -2338,6 +2406,8 @@ def resolve_menu_choice(choice: str):
     except (EOFError, KeyboardInterrupt):
         return None
 
+    if MENU_GROUP_ALIASES.get(choice, choice) == 'n' and sub in ('q', 'й'):
+        return 'question_answers'
     if sub in ('', '0', 'q', 'й'):
         return None
     for keys, _color, _label in items:
@@ -2371,7 +2441,7 @@ def main():
             # Одна серая строка, как было. Итог проверки виден в строке «ИИ» меню;
             # длинный список моделей над шапкой пользователю не нужен.
             print(f"{DIM}Проверяю, какие ИИ сейчас отвечают...{RESET}")
-            report = AIAssistant(load_config()).probe_report()
+            report = AIAssistant(load_config()).probe_report(first_ready=True)
             for line in (report or '').splitlines():
                 if not line.startswith('Проверка ИИ:'):
                     print(f"{YELLOW}{line}{RESET}")   # «Antigravity не запущен…»
@@ -2421,6 +2491,8 @@ def main():
                 choice = '1'
             else:
                 try:
+                    print(f"{CYAN}{BOLD}[ОЖИДАНИЕ ВВОДА]{RESET} Нажмите Enter для полного цикла или выберите пункт меню.")
+                    print(f"{DIM}Фоновые проверки ИИ не мешают запуску. Подробности: hh_auto_apply.log{RESET}")
                     choice = input(f"{BOLD}Выберите действие [Enter - Полный цикл, 0 - Выход]: {RESET}").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     choice = '0'
@@ -2457,6 +2529,28 @@ def main():
                 continue
             elif choice in ('a', 'ф'):
                 subprocess.run([sys.executable, os.path.join(CODE_DIR, 'rejection_analyzer.py'), '--chats', '--limit', '0'], cwd=SCRIPT_DIR)
+                continue
+            elif choice in ('x', 'ч'):
+                subprocess.run([sys.executable, os.path.join(CODE_DIR, 'rejection_analyzer.py'),
+                                '--unread-chats-only', '--show-browser'], cwd=SCRIPT_DIR)
+                continue
+            elif choice in ('j', 'о'):
+                count = input('Сколько чатов проверить [Enter — 4]: ').strip()
+                count = count if count.isdigit() and int(count) > 0 else '4'
+                subprocess.run([sys.executable, os.path.join(CODE_DIR, 'rejection_analyzer.py'),
+                                '--inspect-chat-inputs', '--limit', count, '--show-browser'], cwd=SCRIPT_DIR)
+                continue
+            elif choice == 'e':
+                action_key = input('Код сохранённого действия (не менее 12 символов, Enter — отмена): ').strip().lower()
+                if re.fullmatch(r'[a-f0-9]{12,64}', action_key):
+                    subprocess.run([sys.executable, os.path.join(CODE_DIR, 'rejection_analyzer.py'),
+                                    '--resume-chat-draft', action_key, '--show-browser'], cwd=SCRIPT_DIR)
+                continue
+            elif choice == 'y':
+                vacancy_id = input('ID вакансии для проверки без отправки (Enter — отмена): ').strip()
+                if re.fullmatch(r'\d{1,15}', vacancy_id):
+                    subprocess.run([sys.executable, os.path.join(CODE_DIR, 'hh_selenium.py'),
+                                    '--inspect-application', vacancy_id], cwd=SCRIPT_DIR)
                 continue
             elif choice in ('h', 'р'):
                 subprocess.run([sys.executable, os.path.join(CODE_DIR, 'resume_updater.py'), '--import-profile'],
@@ -2513,7 +2607,10 @@ def main():
             elif choice in ('k', 'л'):
                 prompt_groq_key()
                 continue
-            elif choice in ('q', 'й'):
+            elif choice in ('j', 'о'):
+                prompt_tokenharbor_key()
+                continue
+            elif choice == 'question_answers':
                 # Ответы на вопросы работодателей правятся из меню, а не в файле
                 # настроек: у каждого свой город, зарплата и готовность к сменам.
                 from config_manager import edit_question_answers

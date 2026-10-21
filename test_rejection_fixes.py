@@ -56,7 +56,6 @@ def test_daily_quota_stops_retrying():
     """Суточный лимит не должен уходить в 60 с пауз на каждый отказ."""
     import time as _t
     from ai_assistant import AIAssistant
-    from unittest.mock import patch
 
     ai = AIAssistant.__new__(AIAssistant)
     ai.enabled = True
@@ -64,7 +63,6 @@ def test_daily_quota_stops_retrying():
     ai._quota_exhausted = False
     ai.model_name = 'gemini-flash-latest'
     ai.temperature = 0.3
-    ai.ai_config = {'cli_providers': [], 'openai_compatible': []}
 
     class DailyQuota:
         # **kwargs: в вызов добавлен request_options с таймаутом — без него
@@ -78,13 +76,12 @@ def test_daily_quota_stops_retrying():
     ai._gemini_client = DailyQuota()
     # соседние модели тоже пусты — проверяем именно отказ от 60-секундных пауз
     ai._retry_on_other_gemini_model = lambda _p: None
-    with patch('terminal_ui.network_is_up', return_value=True):
-        start = _t.time()
-        assert ai._call_llm('тест') is None
-        assert _t.time() - start < 5, 'суточный лимит уходил в backoff'
-        assert ai._quota_exhausted is True
-        # следующий вызов вообще не идет в сеть
-        assert ai._call_llm('тест') is None
+    start = _t.time()
+    assert ai._call_llm('тест') is None
+    assert _t.time() - start < 5, 'суточный лимит уходил в backoff'
+    assert ai._quota_exhausted is True
+    # следующий вызов вообще не идет в сеть
+    assert ai._call_llm('тест') is None
 
 
 def test_cache_is_cleaned_on_load():
@@ -179,7 +176,9 @@ def test_rejection_reasons_are_grouped():
     # шаблонные причины бот пишет сам — за ними нет ответа работодателя
     assert not is_evidence_based_reason('Автоматический скрининг или отбор более опытного кандидата')
     assert not is_evidence_based_reason('Отказ работодателя.')
-    assert is_evidence_based_reason('Работодатель ищет специалиста по КИИ и 187-ФЗ, а не пентестера')
+    quote = 'Работодатель ищет специалиста по КИИ и 187-ФЗ, а не пентестера'
+    assert not is_evidence_based_reason(quote)
+    assert is_evidence_based_reason(quote, [quote])
 
 
 def test_fix_plan_uses_real_rejections_only():
@@ -190,6 +189,7 @@ def test_fix_plan_uses_real_rejections_only():
             return [
                 {'title': 'AppSec', 'company': 'Альфа',
                  'rejection_reason': 'Кандидат не прикрепил сопроводительное письмо, отправил только имя',
+                 'employer_reason_quote': 'Кандидат не прикрепил сопроводительное письмо, отправил только имя',
                  'missing_keywords': ['AppSec', 'appsec', 'Kubernetes'],
                  'remediation_advice': ['В письме не были явно подсвечены ключевые требования вакансии.',
                                         'В «О себе» указать опыт код-ревью',
@@ -210,6 +210,8 @@ def test_fix_plan_uses_real_rejections_only():
             'experience_advice': 'Выдуманный опыт'}
     real = {'vacancy_title': 'SOC-аналитик', 'company_name': 'Гамма',
             'rejection_root_cause': 'Ожидания по зарплате выше вилки позиции',
+            'employer_reason_quote': 'Ожидания по зарплате выше вилки позиции',
+            'employer_messages': ['Ожидания по зарплате выше вилки позиции'],
             'missing_skills': ['EDR'],
             'about_me_recommendation': 'В «О себе» добавить триаж алертов SOC',
             'experience_advice': 'Описать дежурства в SOC и SLA реагирования'}

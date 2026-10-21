@@ -16,6 +16,7 @@ def bot(monkeypatch):
                         lambda: ('test-id', 'Application Security Engineer / AppSec-инженер'))
     bot = HHSeleniumBot(headless=True)
     bot.driver = MagicMock()
+    bot.page_has_captcha = MagicMock(return_value=False)
     return bot
 
 
@@ -127,6 +128,7 @@ def test_apply_to_vacancy_letter_sent_initialized(bot):
     apply_btn.text = "Откликнуться"
     apply_btn.is_displayed.return_value = True
     bot.driver.find_elements.return_value = [apply_btn]
+    bot.driver.find_elements.side_effect = lambda _by, selector: [] if 'account-login-form' in selector else [apply_btn]
 
     # submit_open_response_modal returns submitted=True, letter_sent=True, answered=0, blocker=None
     bot.submit_open_response_modal = MagicMock(return_value=(True, True, 0, None))
@@ -139,6 +141,123 @@ def test_apply_to_vacancy_letter_sent_initialized(bot):
     # Ensure letter_sent argument was passed as False initially
     call_args = bot.submit_open_response_modal.call_args[0]
     assert call_args[1] is False
+
+
+def test_application_login_gate_recovers_before_letter_or_send(bot):
+    bot.driver.current_url = 'https://hh.ru/vacancy/123'
+    bot.driver.get = MagicMock()
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    form = MagicMock()
+    form.tag_name = 'form'
+    bot.driver.find_elements.side_effect = [[form], []]
+    bot.check_login = MagicMock(return_value=True)
+    bot.detect_response_state = MagicMock(return_value='already')
+    bot.ai_assistant.generate_cover_letter = MagicMock()
+    bot.submit_open_response_modal = MagicMock()
+    assert bot.apply_to_vacancy('https://hh.ru/vacancy/123', 'AppSec') == (False, 'Уже откликнулись')
+    bot.check_login.assert_called_once()
+    assert bot.driver.get.call_count == 2
+    bot.ai_assistant.generate_cover_letter.assert_not_called()
+    bot.submit_open_response_modal.assert_not_called()
+
+
+def test_regional_login_gate_recovers_on_same_canonical_vacancy(bot):
+    bot.driver.current_url = 'https://hh.ru/vacancy/123'
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    form = MagicMock(tag_name='form')
+    bot.driver.find_elements.side_effect = [[form], []]
+    bot.check_login = MagicMock(return_value=True)
+    bot.detect_response_state = MagicMock(return_value='already')
+    bot.submit_open_response_modal = MagicMock()
+    original = 'https://spb.hh.ru/vacancy/123?from=login'
+    assert bot.apply_to_vacancy(original, 'AppSec') == (False, 'Уже откликнулись')
+    assert bot.driver.get.call_args_list[-1].args == ('https://hh.ru/vacancy/123',)
+    bot.submit_open_response_modal.assert_not_called()
+
+
+def test_login_recovery_waits_for_transient_form_to_disappear(bot, monkeypatch):
+    import hh_selenium
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    form = MagicMock(tag_name='form')
+    bot.driver.find_elements.side_effect = [[form], [form], [form], []]
+    bot.driver.current_url = 'https://hh.ru/vacancy/123'
+    bot.check_login = MagicMock(return_value=True)
+    bot.detect_response_state = MagicMock(return_value='already')
+    monkeypatch.setattr(hh_selenium.time, 'sleep', lambda _: None)
+    assert bot.apply_to_vacancy('https://spb.hh.ru/vacancy/123', 'AppSec') == (False, 'Уже откликнулись')
+    assert bot.driver.find_elements.call_count == 4
+
+
+def test_login_recovery_never_sends_to_redirected_different_vacancy(bot):
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    form = MagicMock(tag_name='form')
+    bot.driver.find_elements.side_effect = [[form], []]
+    bot.check_login = MagicMock(return_value=True)
+    bot.driver.current_url = 'https://hh.ru/vacancy/999'
+    bot.application_ui_problem = MagicMock(return_value='wrong vacancy')
+    bot.submit_open_response_modal = MagicMock()
+    assert bot.apply_to_vacancy('https://spb.hh.ru/vacancy/123', 'AppSec') == (False, 'wrong vacancy')
+    bot.submit_open_response_modal.assert_not_called()
+
+
+def test_unrecoverable_login_gate_stops_without_sending(bot):
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    form = MagicMock()
+    form.tag_name = 'form'
+    bot.driver.find_elements.return_value = [form]
+    bot.check_login = MagicMock(return_value=False)
+    bot.login = MagicMock(return_value=False)
+    bot.submit_open_response_modal = MagicMock()
+    ok, reason = bot.apply_to_vacancy('https://hh.ru/vacancy/123', 'AppSec')
+    assert not ok and 'вход' in reason.lower()
+    assert bot.stop_requested
+    bot.submit_open_response_modal.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['tls', 'hh_before_confirm', 'hh_after_confirm', 'hh_before_submit',
+                                     'network_after_dispatch', 'driver_after_dispatch', 'captcha_after_dispatch'])
+def test_post_navigation_failure_is_not_retried_as_network(bot, failure):
+    from hh_selenium import APPLY_NOT_CONFIRMED_MARKER, NETWORK_MESSAGE
+    bot.maybe_bump_resume = MagicMock()
+    bot.random_delay = MagicMock()
+    bot.driver.find_elements.side_effect = lambda _by, selector: [] if 'account-login-form' in selector else [MagicMock()]
+    bot.detect_response_state = MagicMock(return_value='ready')
+    bot.page_has_captcha = MagicMock(return_value=False)
+    bot.page_says_archived = MagicMock(return_value=False)
+    bot.get_vacancy_page_company = MagicMock(return_value='Synthetic')
+    bot.get_vacancy_page_description = MagicMock(return_value='AppSec')
+    bot.get_vacancy_page_skills = MagicMock(return_value=[])
+    bot.config = {'ai_config': {'enabled': False}, 'skip_keywords': []}
+    bot.click_element_with_mouse = MagicMock(return_value=True)
+    bot.find_response_modal = MagicMock(return_value=True)
+    bot.is_response_limit_reached = MagicMock(return_value=False)
+    bot.handle_warning_popups = MagicMock(return_value=False)
+    bot.application_ui_problem = MagicMock(return_value='diagnostic')
+    bot.submit_open_response_modal = MagicMock(return_value=(failure != 'hh_before_submit', False, 0,
+        'Ошибка HH после клика' if failure in ('hh_before_confirm', 'hh_before_submit') else None))
+    bot.confirm_response_submission = MagicMock(return_value=(False, 'Ошибка HH после клика'))
+    if failure == 'captcha_after_dispatch':
+        bot.submit_open_response_modal.return_value = (True, False, 0, 'Требуется капча')
+        bot.confirm_post_dispatch_captcha = MagicMock(return_value=(False, APPLY_NOT_CONFIRMED_MARKER))
+    if failure == 'tls':
+        bot.detect_response_state.side_effect = RuntimeError('net::ERR_SSL_PROTOCOL_ERROR')
+    elif failure in ('network_after_dispatch', 'driver_after_dispatch'):
+        bot.confirm_response_submission.side_effect = RuntimeError(
+            'net::ERR_CONNECTION_RESET' if failure == 'network_after_dispatch' else 'invalid session id')
+    ok, message = bot.apply_to_vacancy('https://hh.ru/vacancy/123', 'AppSec')
+    assert not ok and message != NETWORK_MESSAGE
+    assert (APPLY_NOT_CONFIRMED_MARKER in message) == (failure != 'hh_before_submit')
+    if failure == 'captcha_after_dispatch':
+        bot.confirm_post_dispatch_captcha.assert_called_once_with(False, 0)
+        bot.submit_open_response_modal.assert_called_once()
+        bot.confirm_response_submission.assert_not_called()
+    elif failure not in ('tls', 'network_after_dispatch', 'driver_after_dispatch'):
+        bot.application_ui_problem.assert_called_once_with('hh_response_error', 'Ошибка HH после клика')
 
 
 
@@ -190,6 +309,7 @@ def test_foreign_archived_card_does_not_block_response():
     bot.is_response_limit_reached = lambda: False
     bot.get_visible_page_text = lambda: 'откликнуться ... вакансия в архиве ведущий специалист по экономике'
     bot.page_says_archived = lambda: False
+    bot.page_has_captcha = lambda: False
     assert bot.get_response_blocker_message() is None
 
     bot.page_says_archived = lambda: True
@@ -289,6 +409,7 @@ def test_all_answered_questionnaire_is_submitted_despite_hint():
     bot.is_cover_letter_required = lambda: False
     bot.get_response_blocker_message = lambda: 'Не заполнены вопросы работодателя'
     bot.get_visible_page_text = lambda: 'ответьте на вопросы работодателя'
+    bot.page_has_captcha = lambda: False
     bot.click_response_submit_button = MagicMock(return_value=True)
     bot.get_modal_validation_error = lambda modal: None
 
@@ -384,3 +505,45 @@ def test_captcha_in_background_opens_window_and_delay_comes_from_settings():
     assert bot.apply_delay() == (20.0, 60.0)
     bot.config = {'apply_delay_seconds': 'abc'}
     assert bot.apply_delay() == (1, 2)
+
+
+def test_letters_are_prepared_ahead_and_taken_by_vacancy_id(monkeypatch):
+    """14.10: письма следующих вакансий пишутся в фоне, отклик забирает готовое по id."""
+    from unittest.mock import MagicMock
+    import hh_selenium
+    from hh_selenium import HHSeleniumBot
+    monkeypatch.setattr(hh_selenium, 'fetch_vacancy_text', lambda vid, timeout=15: f'описание {vid}')
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.config = {'letter_prefetch': 2, 'ai_config': {'enabled': True}}
+    bot.applied_vacancies = {'3': {'status': 'sent'}}
+    bot.ai_assistant = MagicMock()
+    bot.ai_assistant.generate_cover_letter.side_effect = lambda **kw: 'письмо: ' + kw['vacancy_description']
+    vacancies = [{'id': i, 'name': f'V{i}', 'employer': {'name': 'E'}} for i in (1, 2, 3, 4)]
+    bot.prefetch_letters(vacancies, 1)            # следующие 2: id 2 и 3 (3 уже откликались)
+    assert set(bot._prefetched) == {'2'}
+    job = bot.take_prefetched_letter('https://hh.ru/vacancy/2')
+    assert job.result(timeout=5) == 'письмо: описание 2'
+    assert bot.take_prefetched_letter('https://hh.ru/vacancy/2') is None
+    bot.config['letter_prefetch'] = 0
+    bot._prefetched.clear()
+    bot.prefetch_letters(vacancies, 0)
+    assert bot._prefetched == {}
+
+
+def test_login_form_on_one_vacancy_skips_and_three_in_row_stop():
+    """14.10: форма входа на одной вакансии при живой сессии — пропуск, а не стоп всего прогона."""
+    import hh_selenium
+    bot = hh_selenium.HHSeleniumBot.__new__(hh_selenium.HHSeleniumBot)
+    bot.stop_requested = False
+    bot.driver = MagicMock()
+    form = MagicMock(tag_name='form')
+    form.is_displayed.return_value = True
+    bot.driver.find_elements.return_value = [form]
+    for name, value in [('check_interactive_controls', None), ('maybe_bump_resume', None),
+                        ('random_delay', None), ('check_login', True)]:
+        setattr(bot, name, MagicMock(return_value=value))
+    for _ in range(2):
+        assert bot.apply_to_vacancy('https://hh.ru/vacancy/1', 'x') == (False, hh_selenium.LOGIN_FORM_SKIP_MESSAGE)
+        assert not bot.stop_requested
+    success, message = bot.apply_to_vacancy('https://hh.ru/vacancy/1', 'x')
+    assert not success and 'снова требует вход' in message and bot.stop_requested

@@ -226,6 +226,7 @@ TECHNICAL_FALLBACK_INCLUDE_KEYWORDS = (
     'implementation engineer', 'внедрени',
     'системный архитектор', 'infrastructure engineer',
 )
+TECHNICAL_FALLBACK_EXCLUDE_KEYWORDS = ('bess', 'ess', 'пищев', 'кондитер', 'химик', 'рецептур', 'технолог - разработчик')
 
 
 _EXCLUDES_CACHE = {}
@@ -409,6 +410,54 @@ def _report_save(ok: bool, message: str) -> bool:
     return ok
 
 
+def configure_opencode(config, mode='free', model='auto'):
+    from opencode_provider import settings
+    options = {'mode': mode, 'model': model}
+    settings({'opencode': options})
+    ai = config.setdefault('ai_config', {})
+    providers = list(ai.get('cli_providers', ['claude', 'codex']) or [])
+    if 'opencode' not in providers:
+        providers.append('opencode')
+    ai['cli_providers'] = providers
+    ai['opencode'] = options
+    ai['enabled'] = True
+    if mode == 'auto':
+        ai['primary_ai'] = 'opencode'
+
+
+def edit_opencode_provider():
+    from opencode_provider import catalog, go_key
+    cfg = load_config()
+    print(f"\n{CYAN}{BOLD}OPENCODE: ДОСТУП И МОДЕЛЬ{RESET}")
+    print('  [1] Free — только бесплатные модели')
+    print('  [2] Go — модели подключённой подписки OpenCode Go')
+    print('  [3] Free → Go — сначала все бесплатные, затем подписка; OpenCode первым')
+    try:
+        choice = input('Доступ (Enter — назад): ').strip()
+        if choice not in ('1', '2', '3'):
+            return
+        if choice == '3':
+            configure_opencode(cfg, 'auto')
+            _report_save(save_config(cfg), 'Очередь: OpenCode Free → Go → остальные ИИ')
+            return
+        mode = 'go' if choice == '2' else 'free'
+        if mode == 'go':
+            go_key()
+        models = catalog(mode)
+        print('  [1] Авто: первая доступная модель после проверки')
+        for index, model in enumerate(models, 2):
+            print(f'  [{index}] {model}')
+        selected = input('Модель (Enter — назад): ').strip()
+        if not selected.isdigit() or not 1 <= int(selected) <= len(models) + 1:
+            return
+        configure_opencode(cfg, mode, 'auto' if selected == '1' else models[int(selected) - 2])
+        _report_save(save_config(cfg), 'OpenCode подключён; основной ИИ сохранён')
+    except (EOFError, KeyboardInterrupt):
+        return
+    except Exception as exc:
+        logger.warning('OpenCode не настроен: %s', explain_error(exc))
+
+
 def edit_ai_filter_and_captcha():
     cfg = load_config()
     filtering = cfg.setdefault('ai_filter', {})
@@ -427,7 +476,7 @@ def edit_ai_filter_and_captcha():
         if not filtering.get('prompt'):
             print('Для custom нужны критерии; настройки не изменены')
             return
-    print('Vision отправляет только изображение текстовой капчи выбранному AI-провайдеру.')
+    print('Vision отправляет только картинку капчи доступному провайдеру; при отказе пробует другого.')
     enabled = input(f"Распознавание капчи [{'on' if captcha.get('enabled') else 'off'}], on/off: ").strip().lower()
     if enabled:
         if enabled not in ('on', 'off'):
@@ -435,9 +484,14 @@ def edit_ai_filter_and_captcha():
             return
         captcha['enabled'] = enabled == 'on'
     if captcha.get('enabled'):
-        model = input('Модель с поддержкой изображений (Enter — модель основного ИИ): ').strip()
-        if model:
+        model = input('Vision-модель (auto — автоподбор, Enter — сохранить): ').strip()
+        if model.lower() == 'auto':
+            captcha.pop('model', None)
+            captcha['provider'] = 'auto'
+        elif model:
             captcha['model'] = model
+            if captcha.get('provider') == 'auto':
+                captcha.pop('provider')
     _report_save(save_config(cfg), 'AI-фильтр и капча настроены')
 
 
@@ -1307,6 +1361,62 @@ def prompt_groq_key():
         return
     time.sleep(1.5)
 
+def prompt_tokenharbor_key():
+    """Connect the existing key through the shared compatible-provider queue."""
+    import getpass
+    import warnings
+    import requests
+    from ai_assistant import rank_tokenharbor_models
+
+    print(f"\n{CYAN}{BOLD}TOKENHARBOR — API-КЛЮЧ{RESET}")
+    print('Ключ вводится скрыто. Используются только модели :free, без перехода на платные.')
+    print('Бесплатные маршруты могут сохранять профиль и переписку после вашего согласия в кабинете.')
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            key = getpass.getpass('Ключ TokenHarbor (Enter — отмена): ').strip()
+    except (EOFError, KeyboardInterrupt, getpass.GetPassWarning):
+        print('Ввод отменён. Для скрытого ввода используйте интерактивный терминал hh.bat.')
+        return
+    if key.lower() in _KEY_PROMPT_CANCEL:
+        return
+    if not key.startswith('thk_') or any(char.isspace() for char in key):
+        print(f'{RED}[X] Ключ TokenHarbor должен начинаться с thk_. Настройки не изменены.{RESET}')
+        return
+    try:
+        response = requests.get('https://tokenharbor.ai/v1/models',
+                                headers={'Authorization': f'Bearer {key}'}, timeout=10)
+        if response.status_code != 200:
+            print(f'{RED}[X] TokenHarbor: HTTP {response.status_code}. Ключ не сохранён.{RESET}')
+            return
+        models = rank_tokenharbor_models([row.get('id') for row in (response.json().get('data') or [])
+                                         if isinstance(row, dict)])
+    except (requests.RequestException, ValueError, AttributeError, TypeError):
+        print(f'{YELLOW}[!] Каталог TokenHarbor недоступен. Настройки не изменены.{RESET}')
+        return
+    if not models:
+        print(f'{YELLOW}[!] В каталоге нет бесплатных текстовых моделей. Платные автоматически не включены.{RESET}')
+        return
+    cfg = load_config()
+    if not isinstance(cfg.get('ai_config'), dict):
+        cfg['ai_config'] = {}
+    ai = cfg['ai_config']
+    if not isinstance(ai.get('openai_compatible'), list):
+        ai['openai_compatible'] = []
+    providers = ai['openai_compatible']
+    provider = next((p for p in providers if isinstance(p, dict) and
+                     (p.get('name') == 'TokenHarbor' or p.get('base_url', '').rstrip('/') == 'https://tokenharbor.ai/v1')), None)
+    if provider is None:
+        provider = {}
+        providers.append(provider)
+    provider.update(name='TokenHarbor', base_url='https://tokenharbor.ai/v1', api_key=key,
+                    api_key_env='TOKEN_HARBOR_API_KEY', models=models,
+                    auto_models=True, enabled=True, timeout=30)
+    ai['enabled'] = True
+    if _report_save(save_config(cfg), 'TokenHarbor добавлен в очередь ИИ'):
+        print('Список моделей обновляется автоматически; доступ и скорость проверяются при запуске.')
+
+
 if __name__ == '__main__':
     args = sys.argv[1:]
     if '--pick-resume' in args:
@@ -1485,7 +1595,7 @@ def edit_bot_behavior():
             cfg['auto_apply_resume'] = not cfg.get('auto_apply_resume', True)
         elif key == 'blocked':
             _edit_word_list(cfg, 'blocked_employers', 'Нежелательные работодатели',
-                            'Название компании или его часть: «Компания-пример». На них бот не откликается.')
+                            'Название компании или его часть: «Web3 Tech». На них бот не откликается.')
             continue
         elif key == 'exclude':
             if not cfg.get('keywords_exclude'):
@@ -1503,6 +1613,63 @@ def edit_bot_behavior():
         elif key == 'topup':
             cfg['dev_topup_enabled'] = not cfg.get('dev_topup_enabled', True)
         _report_save(save_config(cfg), 'Сохранено')
+
+
+def edit_question_memory():
+    """Review questionnaire drafts; only an explicit confirmation enables reuse."""
+    from db_manager import DatabaseManager
+    from question_memory import QuestionMemory
+    try:
+        memory = QuestionMemory(DatabaseManager(), load_config())
+        while True:
+            rows = memory.records()
+            print('\nПАМЯТЬ ОТВЕТОВ НА АНКЕТЫ')
+            print('Только для текущего аккаунта, резюме и данных профиля.')
+            print('Подтверждённые ответы используются в следующих вакансиях без ИИ.')
+            print('При изменении профиля старые ответы перестают подставляться.')
+            for index, row in enumerate(rows, 1):
+                status = 'подтверждён' if row['status'] == 'confirmed' else 'ждёт проверки'
+                print(f"  [{index}] {status}: {row['question'][:110]}")
+                print('      ' + ' | '.join(row['answers'])[:150])
+            if not rows:
+                print('Пока пусто. Заполненные ботом ответы появятся здесь для проверки.')
+            selected = input('Номер ответа [Enter / 0 — назад]: ').strip()
+            if selected in ('', '0'):
+                return
+            if not selected.isdigit() or not 1 <= int(selected) <= len(rows):
+                print('[!] Нет такого ответа')
+                continue
+            row = rows[int(selected) - 1]
+            print('\nВопрос: ' + row['question'])
+            if row['source_url']:
+                print('Источник: ' + row['source_url'])
+            for index, option in enumerate(row['options'], 1):
+                print(f'  {index}. {option}')
+            print('Ответ: ' + ' | '.join(row['answers']))
+            action = input('[C] Подтвердить для следующих вакансий; [E] Исправить и подтвердить; '
+                           '[-] Забыть; Enter — назад: ').strip().lower()
+            try:
+                if action == '-':
+                    memory.forget(row['signature'])
+                    print('Ответ удалён из памяти и больше не предлагается для подтверждения.')
+                elif action in ('c', 'с', 'e', 'у'):
+                    answers = row['answers']
+                    if action in ('e', 'у'):
+                        if row['kind'] == 'text':
+                            answers = [input('Исправленный ответ: ').strip()]
+                        else:
+                            numbers = input('Номер варианта (несколько — через запятую): ').split(',')
+                            if any(not n.strip().isdigit() or not 1 <= int(n) <= len(row['options']) for n in numbers):
+                                raise ValueError('Укажите номера из списка')
+                            answers = [row['options'][int(n) - 1] for n in numbers]
+                    memory.confirm(row['signature'], answers)
+                    print('Подтверждено: ответ будет использоваться в следующих анкетах.')
+            except ValueError as exc:
+                print(f'[!] Не сохранено: {exc}')
+    except (EOFError, KeyboardInterrupt):
+        return
+    except Exception as exc:
+        print(f'[!] Память ответов недоступна: {explain_error(exc)}')
 
 
 def edit_question_answers():
@@ -1539,6 +1706,7 @@ def edit_question_answers():
         print(f"  {CYAN}[+]{RESET} Добавить свой вопрос и ответ")
         print(f"  {CYAN}[-]{RESET} Удалить ответ по ключевому слову")
         print(f"  {CYAN}[A]{RESET} Показать все ответы списком")
+        print(f"  {CYAN}[M]{RESET} Память анкет: подтвердить, исправить или удалить ответы")
         print(f"  {RED}[0]{RESET} Назад")
         print(f"{RED}{BOLD}{'=' * 62}{RESET}")
 
@@ -1549,6 +1717,10 @@ def edit_question_answers():
 
         if choice in ('0', '', 'q', 'й'):
             return
+
+        if choice in ('m', 'ь'):
+            edit_question_memory()
+            continue
 
         if choice == 'a':
             print()

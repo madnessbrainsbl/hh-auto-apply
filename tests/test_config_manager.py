@@ -39,6 +39,49 @@ def test_load_and_save_config(tmp_path):
         assert cfg_reloaded["resume_title"] == "Test Senior Python Developer"
 
 
+def test_tokenharbor_setup_preserves_other_providers_and_hides_key(monkeypatch, capsys):
+    import copy
+    cfg = {'resume_id': 'synthetic-resume', 'ai_config': {
+        'primary_ai': 'Antigravity', 'openai_compatible': [
+            {'name': 'Other', 'api_key': 'existing-private-key', 'models': ['existing-model']} ]}}
+    original = copy.deepcopy(cfg)
+    monkeypatch.setattr(config_manager, 'load_config', lambda: cfg)
+    monkeypatch.setattr('getpass.getpass', lambda _: 'thk_synthetic_private_key')
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'data': [{'id': 'deepseek-v9-flash:free'}, {'id': 'paid-model'}]}
+    monkeypatch.setattr('requests.get', MagicMock(return_value=response))
+    save = MagicMock(return_value=True)
+    monkeypatch.setattr(config_manager, 'save_config', save)
+    config_manager.prompt_tokenharbor_key()
+    provider = cfg['ai_config']['openai_compatible'][-1]
+    assert provider['name'] == 'TokenHarbor' and provider['base_url'] == 'https://tokenharbor.ai/v1'
+    assert provider['models'] == ['deepseek-v9-flash:free']
+    assert provider['auto_models'] and provider['api_key'] == 'thk_synthetic_private_key'
+    assert cfg['ai_config']['primary_ai'] == original['ai_config']['primary_ai']
+    assert cfg['ai_config']['openai_compatible'][0] == original['ai_config']['openai_compatible'][0]
+    assert cfg['resume_id'] == original['resume_id']
+    assert 'thk_synthetic_private_key' not in capsys.readouterr().out
+    config_manager.prompt_tokenharbor_key()
+    assert len(cfg['ai_config']['openai_compatible']) == 2
+
+
+@pytest.mark.parametrize('key,status', [('', 200), ('0', 200), ('wrong-key', 200), ('thk_synthetic', 401)])
+def test_tokenharbor_cancel_or_invalid_key_does_not_change_config(monkeypatch, key, status):
+    import copy
+    cfg = {'ai_config': {'primary_ai': 'Antigravity'}, 'resume_id': 'unchanged'}
+    original = copy.deepcopy(cfg)
+    monkeypatch.setattr(config_manager, 'load_config', lambda: cfg)
+    monkeypatch.setattr('getpass.getpass', lambda _: key)
+    response = MagicMock(status_code=status)
+    response.json.return_value = {'data': []}
+    monkeypatch.setattr('requests.get', MagicMock(return_value=response))
+    save = MagicMock()
+    monkeypatch.setattr(config_manager, 'save_config', save)
+    config_manager.prompt_tokenharbor_key()
+    save.assert_not_called()
+    assert cfg == original
+
+
 def test_behavior_menu_does_not_offer_salary_override(monkeypatch, capsys):
     cfg = {'chat_autoreply': {'salary_answer': 'От 350 000 руб.'}}
     monkeypatch.setattr(config_manager, 'load_config', lambda: cfg)

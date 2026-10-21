@@ -9,7 +9,9 @@
 !config_manager.py
 !ai_assistant.py
 !cli_models.py
+!opencode_provider.py
 !db_manager.py
+!question_memory.py
 !email_outreach.py
 !resume_updater.py
 !rejection_analyzer.py

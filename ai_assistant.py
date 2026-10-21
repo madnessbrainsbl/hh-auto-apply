@@ -5,9 +5,24 @@ import json
 import time
 import logging
 import threading
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger('ai_assistant')
+_AI_DEADLINE = ContextVar('hh_ai_deadline', default=None)
+# Секунды, которые фоновая задача (письма наперёд) даёт всей цепочке ИИ. С пределом занятая
+# модель пропускается, а не ждётся: параллельные письма расходятся по разным моделям.
+_AI_BUDGET = ContextVar('hh_ai_budget', default=None)
+_AI_ATTEMPTS = ContextVar('hh_ai_attempts', default=None)
+_AI_BUSY = ContextVar('hh_ai_busy', default=None)
+AI_ATTEMPT_STATUS = {
+    'ok': 'ответ принят', 'busy': 'сервис занят другим разбором',
+    'timeout': 'таймаут', 'invalid_response': 'ответ не прошёл проверку',
+    'service_error': 'служебная ошибка сервиса',
+    'no_response': 'нет ответа или сервис временно недоступен',
+    'auth': 'нужна авторизация или действующий ключ', 'quota': 'квота сервиса исчерпана',
+    'forbidden': 'сервис отказал в доступе', 'network': 'сетевая ошибка',
+}
 
 try:
     from terminal_ui import explain_error
@@ -18,20 +33,40 @@ except Exception:   # модуль запускают и отдельно, бе�
 
 DEFAULT_CANDIDATE_PROFILE: Dict[str, Any] = {
     "name": "",
-    "specialization": "",
-    "experience_years": 0,
-    "skills": [],
-    "education": "",
-    "english_level": "",
-    "location": "",
+    "specialization": "Информационная безопасность / Application Security / Pentest / Python Developer",
+    "experience_years": 3,
+    "skills": [
+        "Application Security",
+        "Web Security",
+        "OWASP Top 10",
+        "Burp Suite",
+        "SAST / DAST",
+        "Penetration Testing",
+        "DevSecOps",
+        "CI/CD Security",
+        "Python",
+        "Linux",
+        "Docker",
+        "Git",
+        "Bash",
+        "SIEM",
+        "Анализ защищенности"
+    ],
+    "education": "Высшее техническое",
+    "english_level": "B2",
+    "location": "Москва (готов к удаленной работе и гибриду)",
     "remote_preferred": True,
-    "expected_salary": "",
+    "expected_salary": "от 180 000 руб.",
     "contacts": {
         "telegram": "",
         "github": "",
         "email": ""
     },
-    "about": ""
+    "about": (
+        "Специализируюсь на практической безопасности веб-приложений (AppSec, OWASP Top 10), "
+        "поиске уязвимостей, анализе защищенности и автоматизации проверок безопасности на Python. "
+        "Имею опыт внедрения практик DevSecOps и работы с Linux-инфраструктурой."
+    )
 }
 
 
@@ -240,15 +275,36 @@ _SERVICE_MESSAGE_MAX = 400
 
 
 SALARY_ANSWER = 'Готов обсудить условия на следующем этапе.'
+
+# 16.10: принципы github.com/phuryn/work-humanizer (MIT), сжатые и переписанные под русский и под
+# чаты и письма hh. Сам навык рассчитан на Claude Code и английский; в бота идут его правила, не код.
+HUMAN_STYLE_RULES = (
+    'Стиль живого человека:\n'
+    '- Сразу по делу: ответ в первой фразе, без разгона, без пересказа вопроса.\n'
+    '- Говори как в разговоре, обычным порядком слов, короткими фразами. Допустимы «ну», «в общем», '
+    '«так что», «и ещё».\n'
+    '- Без штампов: «буду рад обсудить», «благодарю за внимание», «стремлюсь», «глубокое понимание», '
+    '«широкий спектр», «комплексный подход», «хочу отметить», «важно подчеркнуть», «безусловно», '
+    '«отличная возможность».\n'
+    '- Без «не просто X, а Y», без троек ради ритма, без лозунгов, афоризмов и пафоса.\n'
+    '- Конкретика вместо прилагательных: название инструмента или задачи. Чисел и фактов, которых нет в '
+    'профиле или в сообщении работодателя, не выдумывай.\n'
+    '- Длина фраз разная: короткая, потом подлиннее. Не повторяй одну и ту же конструкцию.\n'
+    '- Не заканчивай дежурным итогом: последняя фраза — конкретика или вопрос по делу.\n'
+)
 _SALARY_MARKERS = ('зарплат', 'заработн', 'оклад', 'доход', 'salary', 'ожидания по зп',
                    'на руки', 'финансовые ожидания', 'компенсаци', 'вознагражден',
                    # 07.10 WILIX: «В каком бюджете рассматриваете вакансии?»
-                   'каком бюджете', 'какой бюджет', 'ваш бюджет', 'бюджет рассматрива')
+                   'каком бюджете', 'какой бюджет', 'ваш бюджет', 'бюджет рассматрива',
+                   # 15.10: «от какой суммы рассматриваете уровень зп?» не распознали — ИИ ответил шаблоном
+                   'уровень зп', 'по зп', 'от какой суммы', 'какую сумму', 'желаемая зп', 'желаемую зп',
+                   'на какую оплату', 'оплату в час', 'оплата в час', 'почасов')
 
 
 def is_salary_question(text: str) -> bool:
     """Вопрос о деньгах. Сумму бот не называет: кто назвал число первым, тот и поставил потолок."""
     low = str(text or '').lower()
+    low = re.sub(r'\b(?:зарплатн\w*\s+карт\w*|payroll\s+cards?)\b', '', low)
     return any(m in low for m in _SALARY_MARKERS)
 
 
@@ -304,6 +360,10 @@ _ADDRESSED_NAME = re.compile(
 # Обращение без имени: «Уважаемые Коллеги», «Здравствуйте, Команда».
 _NOT_NAMES = {'коллеги', 'команда', 'рекрутер', 'господа', 'работодатель', 'компания',
               'специалист', 'менеджер', 'руководитель', 'друзья', 'партнеры', 'партнёры'}
+_STANDARD_REFERENCE = re.compile(
+    r'\b(?:ГОСТ(?:\s+[РR])?(?:\s+(?:ИСО|ISO)(?:\s*/\s*(?:МЭК|IEC))?)?'
+    r'|(?:ISO|ИСО)(?:\s*/\s*(?:IEC|МЭК))?|IEC|МЭК|RFC)\s+'
+    r'\d{3,6}(?:[.-]\d+)*(?::\d{4})?\b', re.IGNORECASE)
 
 
 def fabrication_problem(text: str, source: str, experience_years=None) -> Optional[str]:
@@ -322,7 +382,12 @@ def fabrication_problem(text: str, source: str, experience_years=None) -> Option
     phone_digits = [re.sub(r'\D', '', m) for m in re.findall(r'\+?\d[\d\s()\-]{8,}\d', src)]
     t = re.sub(r'\+\d{1,3}(?=[\s(\d])', '', t)   # код страны «+7» — не число
     # Remove the marker itself, not every later occurrence of its number.
-    t = re.sub(r'(?m)^[ \t]*(?:\*\*|__)?\d{1,2}[.)](?:\*\*|__)?[ \t]+', '', t)
+    t = re.sub(r'(?m)(^|[;:])[ \t]*(?:[-*•][ \t]+)?(?:\*\*|__)?\d{1,2}[.)](?:\*\*|__)?[ \t]+', r'\1', t)
+    # Standard identifiers are not metrics; unconfirmed certificates still require proof.
+    t = _STANDARD_REFERENCE.sub(
+        lambda m: m.group(0) if re.search(
+            r'\b(?:сертификат\w*|сертифицирован\w*|аттестован\w*)\b',
+            re.split(r'[.!?;\n]', t[:m.start()])[-1], re.IGNORECASE) else '', t)
     for n in _NUMBER.findall(t):
         value = n.replace(',', '.')
         if value in src_numbers:
@@ -425,13 +490,23 @@ _TENURE_RE = re.compile(
     r'(?<!\w)(?P<years>\d+(?:[.,]\d+)?\+?|' + '|'.join(_YEAR_WORDS) + r')'
     r'\s*(?:лет|года|год|years?|yrs?)\b', re.IGNORECASE)
 
+def _tidy_after_tenure(clause: str) -> str:
+    """После вырезания срока не остаётся «более чем опытом» и «с опыта»."""
+    clause = re.sub(r'(?<!\w)(?:более|свыше|около|почти|примерно)(?:\s+чем)?\s+(?=опыт|стаж)', '',
+                    clause, flags=re.IGNORECASE)
+    return re.sub(r'(?<!\w)(с)\s+опыта(?!\w)', r'\1 опытом', clause, flags=re.IGNORECASE)
+
+
 def clean_public_text(text: str, profile: Optional[Dict] = None) -> str:
     """Убирает личные условия и хронологию, не меняя технические ответы и числа."""
     employers = [str(job.get('company') or '').strip().casefold()
                  for job in (profile or {}).get('experience_highlights', []) or []
                  if isinstance(job, dict) and job.get('company')]
     # Keep decimals, versions and numbered answers intact.
-    parts = re.split(r'(\n+|(?<=[.!?;])\s+(?!\d+[.)]\s))', str(text or ''))
+    # Модель иногда отдаёт переводы строк буквами «\n» (так вышло 14.10 в образце письма):
+    # в письмо работодателю и в отчёт они попадали как видимый мусор.
+    text = str(text or '').replace('\\r\\n', '\n').replace('\\n', '\n')
+    parts = re.split(r'(\n+|(?<=[.!?;])\s+(?!\d+[.)]\s))', text)
     kept = []
     prefix = ''
     for index in range(0, len(parts), 2):
@@ -457,11 +532,14 @@ def clean_public_text(text: str, profile: Optional[Dict] = None) -> str:
         if not forbidden and clause.strip():
             clause = re.sub(r'(?<!\w)\d+(?:[.,]\d+)?\s*[-‐‑–—]\s*летн\w*\s*', '', clause,
                             flags=re.IGNORECASE)
+            # «с более чем 7-летним опытом» без срока читалось «с более чем опытом»
+            clause = _tidy_after_tenure(clause)
             without_tenure = re.sub(
                 r'(?:\b(?:более|около|почти|примерно|свыше|за|последние)\s+)?' + _TENURE_RE.pattern,
                 '', clause, flags=re.IGNORECASE)
             if without_tenure != clause:
                 clause = re.sub(r'\s+([,.;:!?])', r'\1', without_tenure).strip()
+                clause = _tidy_after_tenure(clause)
                 if re.fullmatch(r'(?:\d+[.)]\s*)?(?:общий\s+)?(?:опыт(?:\s+работы)?|стаж)\s*[.!:]?', clause, re.IGNORECASE):
                     continue
                 if clause:
@@ -552,13 +630,13 @@ def analysis_fabrication_problem(text: str, source: str, experience_years=None,
     """То же для JSON разбора отказа: проверяем поля, которые человек копирует к себе."""
     match = re.search(r'\{.*\}', str(text or ''), re.DOTALL)
     if not match:
-        return None
+        return 'нет JSON-объекта разбора'
     try:
         data = json.loads(match.group(0))
     except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
+        return 'некорректный JSON разбора'
+    if not isinstance(data, dict) or not data:
+        return 'пустой или некорректный объект разбора'
     for field in ANALYSIS_TEXT_FIELDS:
         problem = fabrication_problem(data.get(field) or '', source, experience_years)
         if problem:
@@ -629,6 +707,22 @@ def rank_service_models(ids: List[str]) -> List[str]:
     return ranked
 
 
+def rank_tokenharbor_models(ids: List[str], stats: Optional[dict] = None) -> List[str]:
+    free = {mid for mid in ids if isinstance(mid, str) and mid.endswith(':free')
+            and not any(tag in mid.lower() for tag in ('image', 'video', 'audio', 'tts', 'embedding', 'flux'))}
+    stats = stats or {}
+
+    def score(mid):
+        step = f'compat:{mid}'
+        row = stats.get(step) or {}
+        measured = row.get('n', 0) > 0
+        return (step in (stats.get('_down') or []), not measured,
+                float(row.get('avg', 12)) / max(.05, float(row.get('success', .7))),
+                not any(tag in mid.lower() for tag in ('flash', 'lite', 'mini', 'small')), mid)
+
+    return sorted(free, key=score)
+
+
 def describe_ai_chain(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Очередь ИИ для меню: [{key, name, ready, note}] в том порядке, как пишут.
 
@@ -651,6 +745,9 @@ def describe_ai_chain(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 rows.append({'key': key, 'name': name, 'ready': False, 'note': 'не запущен'})
             elif key in down:
                 rows.append({'key': key, 'name': name, 'ready': False, 'note': 'не отвечает'})
+            elif (probe._load_stats().get('_probe_version') == probe.PROBE_VERSION
+                  and time.time() - (probe._load_stats().get(key) or {}).get('ready_at', 0) >= probe.PROBE_MAX_AGE):
+                rows.append({'key': key, 'name': name, 'ready': False, 'note': 'ожидает проверки'})
             else:
                 rows.append({'key': key, 'name': name, 'ready': True, 'note': ''})
         elif key == 'gemini':
@@ -659,7 +756,7 @@ def describe_ai_chain(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             groq = bool(ai.get('groq_api_key') or os.environ.get('GROQ_API_KEY'))
             rows.append({'key': 'groq', 'name': 'Groq', 'ready': groq, 'note': '' if groq else 'нет ключа'})
         else:
-            enabled = key in (ai.get('cli_providers', ['claude', 'codex']) or [])
+            enabled = key in (ai.get('cli_providers', list(AIAssistant.CLI_NAMES)) or [])
             found = bool(AIAssistant.find_cli(key))
             note = '' if (enabled and found) else ('выключен' if not enabled else 'не установлен')
             verified = probe._load_stats().get('_cli_models', {}).get(key) or {}
@@ -727,6 +824,7 @@ class AIAssistant:
         self.refresh_resume_feedback()
         
         self.enabled = bool(self.ai_config.get('enabled', True))
+        self._background_probes = True
         self.provider = str(self.ai_config.get('provider', 'gemini')).lower()
         self.model_name = self.ai_config.get('model')
         self.api_key = self.ai_config.get('api_key') or os.environ.get('GEMINI_API_KEY') or os.environ.get('OPENAI_API_KEY') or ''
@@ -777,7 +875,7 @@ class AIAssistant:
             if not api_key:
                 # Имя переменной окружения пользователю не нужно: ключ он вводит в меню.
                 others = self._compat_providers() or [
-                    n for n in (self.ai_config.get('cli_providers', ['claude', 'codex']) or [])
+                    n for n in (self.ai_config.get('cli_providers', list(self.CLI_NAMES)) or [])
                     if self.find_cli(n)]
                 # Раньше «письма по шаблону» писалось и тогда, когда писали Claude
                 # или Antigravity: без ключа выпадает только Gemini.
@@ -895,7 +993,7 @@ class AIAssistant:
             return
         self._model_resolved = True
         api_key = getattr(self, 'api_key', '') or os.environ.get('GEMINI_API_KEY', '')
-        discovered = self.discover_gemini_models(api_key)
+        discovered = self.discover_gemini_models(api_key, timeout=self._request_timeout(10))
         if discovered:
             self._model_chain = tuple(discovered)
             if not self.model_name or 'latest' in str(self.model_name):
@@ -996,7 +1094,7 @@ class AIAssistant:
         модель, потом на запасного провайдера, потом на шаблон. Поэтому
         предикат всегда False — первая же ошибка возвращается нам сразу.
         """
-        seconds = getattr(self, 'timeout', 15)
+        seconds = self._request_timeout(getattr(self, 'timeout', 15))
         options = {'timeout': seconds}
         try:
             from google.api_core import retry as _retry
@@ -1025,6 +1123,7 @@ class AIAssistant:
 
         # Цепочка из живого списка API, если его удалось получить.
         for fallback in (getattr(self, "_model_chain", None) or self.GEMINI_FALLBACKS):
+            self._request_timeout(getattr(self, 'timeout', 15))
             if fallback == self.model_name or fallback in dead:
                 continue
             try:
@@ -1133,6 +1232,7 @@ class AIAssistant:
         return any(marker in low for marker in (
             'per day', 'per-day', 'tokens per day', 'requests per day',
             'tpd', 'rpd', 'daily limit', 'quota exceeded for the day',
+            'daily token quota', 'daily request quota', 'daily quota',
             'в сутки', 'суточн',
         ))
 
@@ -1186,6 +1286,8 @@ class AIAssistant:
                 model=getattr(self, 'backup_model', PROVIDER_DEFAULT_MODEL['groq']),
                 messages=messages,
                 temperature=self.temperature,
+                **({'timeout': self._request_timeout(getattr(self, 'timeout', 15))}
+                   if _AI_DEADLINE.get() is not None else {}),
             )
             if resp and resp.choices:
                 content = resp.choices[0].message.content
@@ -1219,8 +1321,8 @@ class AIAssistant:
 
     # Запасные ИИ через их CLI (подписки пользователя): после Gemini и Groq,
     # до шаблона. Порядок и состав — ai_config.cli_providers.
-    CLI_TIMEOUTS = {'claude': 90, 'codex': 180}
-    CLI_NAMES = {'claude': 'Claude (CLI)', 'codex': 'ChatGPT (Codex CLI)'}
+    CLI_TIMEOUTS = {'claude': 90, 'codex': 180, 'opencode': 60}
+    CLI_NAMES = {'claude': 'Claude (CLI)', 'codex': 'ChatGPT (Codex CLI)', 'opencode': 'OpenCode (CLI)'}
 
     @staticmethod
     def find_cli(name: str):
@@ -1228,6 +1330,18 @@ class AIAssistant:
         там он лежит в папке с номером версии, который меняется при обновлении."""
         import glob
         import shutil
+        if name == 'opencode':
+            found = shutil.which('opencode')
+            if found and not found.lower().endswith(('.cmd', '.ps1', '.bat')):
+                return found
+            roots = [os.path.dirname(found)] if found else []
+            roots.append(os.path.join(os.environ.get('APPDATA') or os.path.join(
+                os.path.expanduser('~'), 'AppData', 'Roaming'), 'npm'))
+            for root in roots:
+                executable = os.path.join(root, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe')
+                if os.path.isfile(executable):
+                    return executable
+            return None
         if name == 'claude':
             found = shutil.which('claude')
             if found:
@@ -1256,18 +1370,56 @@ class AIAssistant:
         exe = self.find_cli(name)
         if not exe:
             return ''
+        settings = ''
+        if name == 'opencode':
+            settings = ':all-models-v1:' + json.dumps(self.ai_config.get('opencode') or {}, sort_keys=True)
         try:
             stat = os.stat(exe)
-            return f'{exe}:{stat.st_mtime_ns}:{stat.st_size}'
+            return f'{exe}:{stat.st_mtime_ns}:{stat.st_size}' + settings
         except OSError:
-            return exe
+            return exe + settings
 
     def _cli_model_fresh(self, name, row):
+        if name == 'opencode' and row.get('available') and time.time() < getattr(
+                self, '_opencode_model_rest', {}).get((self._cli_fingerprint(name), row.get('model')), 0):
+            return False
         return (row.get('version') == self.CLI_MODEL_VERSION
                 and row.get('fingerprint') == self._cli_fingerprint(name)
                 and time.time() < float(row.get('retry_at') or 0))
 
-    def _discover_cli_models(self, name):
+    def _discover_cli_models(self, name, access=None):
+        if name == 'opencode':
+            from opencode_provider import catalog, settings
+            mode, selected = settings(self.ai_config)
+            if mode == 'auto' and access is None:
+                from itertools import chain
+                free = self._discover_cli_models(name, 'free')
+                def go_candidates():
+                    try:
+                        yield from self._discover_cli_models(name, 'go')
+                    except TimeoutError:
+                        raise
+                    except Exception as exc:
+                        logger.debug('Каталог OpenCode Go не прочитан: %s', type(exc).__name__)
+                return chain(free, go_candidates())
+            mode = access or mode
+            fingerprint = self._cli_fingerprint(name)
+            cached = (self._load_stats().get('_opencode_catalogs') or {}).get(mode) or {}
+            if (cached.get('fingerprint') == fingerprint
+                    and time.time() - float(cached.get('checked_at') or 0) < 300):
+                models = cached['models']
+            else:
+                models = catalog(mode, timeout=self._request_timeout(8))
+                with self._provider_lock('stats'):
+                    self._load_stats().setdefault('_opencode_catalogs', {})[mode] = {
+                        'fingerprint': fingerprint, 'checked_at': time.time(), 'models': models}
+                    self._save_stats()
+            if selected != 'auto':
+                models = [selected] if selected in models else []
+            provider = 'opencode-go' if mode == 'go' else 'opencode'
+            return [{'model': provider + '/' + model, 'selection_basis': 'opencode_' + mode}
+                    for model in models if time.time() >= getattr(self, '_opencode_model_rest', {}).get(
+                        (fingerprint, provider + '/' + model), 0)]
         if name == 'claude':
             # Aliases follow new releases; verify in ascending reference-price order.
             return [{'model': model, 'effort': 'low', 'selection_basis': 'official_family_order'}
@@ -1280,9 +1432,11 @@ class AIAssistant:
                 and time.time() - float(cached.get('checked_at') or 0) < self.CLI_CATALOG_MAX_AGE):
             models, prices = cached.get('models') or [], cached.get('prices') or {}
         else:
-            models = codex_catalog(self.find_cli(name))
+            models = codex_catalog(self.find_cli(name), timeout=self._request_timeout(20))
             try:
-                prices = fetch_openai_prices()
+                prices = fetch_openai_prices(timeout=self._request_timeout(10))
+            except TimeoutError:
+                raise
             except Exception:
                 prices = cached.get('prices') or {}
                 logger.info('Цены Codex сейчас недоступны: использую кеш цен или экономичное семейство')
@@ -1323,7 +1477,8 @@ class AIAssistant:
         if not ok:
             hints = {'weekly_quota': 'исчерпана недельная квота', 'daily_quota': 'исчерпана суточная квота',
                      'quota': 'сервис ограничил запросы', 'auth': 'нужно войти в CLI',
-                     'timeout': 'истекло время ожидания', 'catalog': 'каталог моделей недоступен'}
+                     'timeout': 'истекло время ожидания', 'catalog': 'каталог моделей недоступен',
+                     'global_regions': 'модель требует Global regions, настройки Privacy сохранены'}
             logger.warning('%s: %s. Сейчас пишет следующий ИИ.', self.CLI_NAMES[name],
                            hints.get(row['problem'], 'модель не ответила'))
             if row['problem'] in ('weekly_quota', 'daily_quota', 'quota', 'auth'):
@@ -1337,7 +1492,10 @@ class AIAssistant:
             if not self.find_cli(name):
                 return None
             cached = self._load_stats().get('_cli_models', {}).get(name) or {}
-            if not force and self._cli_model_fresh(name, cached):
+            fresh = not force and self._cli_model_fresh(name, cached)
+            free_first = (name == 'opencode' and (self.ai_config.get('opencode') or {}).get('mode') == 'auto'
+                          and not _AI_ATTEMPTS.get())
+            if fresh and not (free_first and str(cached.get('model') or '').startswith('opencode-go/')):
                 return cached if cached.get('available') else None
             self.__dict__.setdefault('_cli_dead', set()).discard(name)
             self.__dict__.setdefault('_cli_rest', {}).pop(name, None)
@@ -1345,15 +1503,22 @@ class AIAssistant:
                 self._load_stats().pop('_codex_catalog', None)
             try:
                 candidates = self._discover_cli_models(name)
+            except TimeoutError:
+                raise
             except Exception as e:
                 logger.debug('Каталог %s не прочитан: %s', name, type(e).__name__)
                 candidates = []
             last = {'ok': False, 'problem': 'catalog', 'seconds': 0}
             candidate = {}
-            for index, candidate in enumerate(candidates[:3]):
+            if name != 'opencode':
+                candidates = candidates[:3]
+            for index, candidate in enumerate(candidates):
+                timeout = self._request_timeout(20 if name == 'opencode' else self.CLI_PROBE_TIMEOUT)
+                if fresh and cached.get('available') and candidate.get('model') == cached.get('model'):
+                    return cached
                 last = self._run_cli_request(name, candidate, 'Ответь одним словом: готов',
                                              'Только короткий ответ, без инструментов.',
-                                             timeout=self.CLI_PROBE_TIMEOUT)
+                                             timeout=timeout)
                 content = last.get('text') or ''
                 if last.get('ok') and (not re.search(r'\bготов\b', content.lower())
                                        or service_message_problem(content)):
@@ -1363,23 +1528,31 @@ class AIAssistant:
                     logger.info('%s: выбрана %s, проверочный ответ %.1f с',
                                 self.CLI_NAMES[name], row['model'], row['seconds'])
                     return row
-                # Authentication/quota is provider-wide, not a reason to spend on another model.
-                retryable = {'model_unavailable'}
+                retryable_errors = {'model_unavailable'}
                 if name == 'claude':
-                    retryable.update(('timeout', 'invalid_probe'))
-                if last.get('problem') not in retryable:
+                    retryable_errors.update(('timeout', 'invalid_probe'))
+                can_retry = last.get('problem') in retryable_errors
+                if name == 'opencode':
+                    from opencode_provider import retryable
+                    can_retry = retryable(candidate['model'], last.get('problem'))
+                if name == 'opencode' and can_retry:
+                    self.__dict__.setdefault('_opencode_model_rest', {})[
+                        (self._cli_fingerprint(name), candidate['model'])] = time.time() + self.PROBE_MAX_AGE
+                if not can_retry:
                     break
-                if index + 1 < min(3, len(candidates)):
+                if name == 'opencode' or index + 1 < len(candidates):
                     reason = {'timeout': 'тайм-аут проверки', 'invalid_probe': 'некорректный ответ',
+                              'quota': 'лимит модели', 'daily_quota': 'суточный лимит модели',
+                              'weekly_quota': 'недельный лимит модели', 'request_failed': 'модель не ответила',
+                              'global_regions': 'модель требует Global regions — пропускаю',
                               'model_unavailable': 'модель недоступна'}[last['problem']]
-                    logger.info('%s: %s — %s; проверяю следующую модель по стоимости',
-                                self.CLI_NAMES[name], candidate['model'], reason)
+                    logger.info('%s: %s; проверяю следующую модель', self.CLI_NAMES[name], reason)
             self._remember_cli_model(name, candidate, last)
             return None
 
     def _run_cli_request(self, name, candidate, prompt, system_prompt, timeout=None):
         import subprocess
-        from cli_models import cli_problem, temporary_cli_directory
+        from cli_models import cli_problem, temporary_cli_directory, run_cli_process
         exe = self.find_cli(name)
         started = time.monotonic()
         result = {'ok': False, 'text': '', 'problem': '', 'model': candidate.get('model')}
@@ -1387,6 +1560,15 @@ class AIAssistant:
         model = candidate.get('requested_model') or candidate['model']
         effort = candidate.get('effort') or 'low'
         try:
+            if name == 'opencode':
+                from opencode_provider import request
+                logger.info('OpenCode %s: запрос', 'Go' if model.startswith('opencode-go/') else 'Free')
+                result.update(request(exe, model, prompt, system_prompt,
+                                      self._request_timeout(timeout or self.CLI_TIMEOUTS[name])))
+                if result['ok'] and service_message_problem(result['text']):
+                    result.update(ok=False, text='', problem='request_failed')
+                result['seconds'] = time.monotonic() - started
+                return result
             with temporary_cli_directory(prefix='hh_ai_') as workdir:
                 out_file = os.path.join(workdir, 'answer.txt')
                 if name == 'claude':
@@ -1399,10 +1581,9 @@ class AIAssistant:
                            '--model', model, '-c', f'model_reasoning_effort="{effort}"',
                            '--color', 'never', '-o', out_file, '-']
                     stdin_text = f'{system_prompt}\n\n{prompt}'
-                proc = subprocess.run(
-                    cmd, input=stdin_text.encode('utf-8'), capture_output=True, cwd=workdir,
-                    timeout=timeout or self.CLI_TIMEOUTS.get(name, 120),
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                proc = run_cli_process(
+                    cmd, input=stdin_text.encode('utf-8'), cwd=workdir,
+                    timeout=self._request_timeout(timeout or self.CLI_TIMEOUTS.get(name, 120)))
                 stdout = proc.stdout.decode('utf-8', errors='replace').strip()
                 stderr = proc.stderr.decode('utf-8', errors='replace').strip()
                 if name == 'codex':
@@ -1431,6 +1612,10 @@ class AIAssistant:
                     result['problem'] = cli_problem(stderr + '\n' + stdout)
         except subprocess.TimeoutExpired:
             result['problem'] = 'timeout'
+        except TimeoutError:
+            raise
+        except ValueError:
+            result['problem'] = 'auth' if name == 'opencode' and model.startswith('opencode-go/') else 'request_failed'
         except Exception as e:
             logger.debug('%s CLI не запустился: %s', name, type(e).__name__)
             result['problem'] = 'request_failed'
@@ -1442,7 +1627,34 @@ class AIAssistant:
         if not candidate:
             return None
         result = self._run_cli_request(name, candidate, prompt, system_prompt)
-        if not result['ok'] and result.get('problem') == 'model_unavailable':
+        options = getattr(self, 'ai_config', {}).get('opencode') or {}
+        opencode_auto = name == 'opencode' and options.get('model', 'auto') == 'auto'
+        # Foreground work uses a tested spare instead of rediscovering a failed catalogue.
+        has_spare = bool(_AI_ATTEMPTS.get()) and any(
+            st != name and time.time() - (self._load_stats().get(st) or {}).get('ready_at', 0) < self.PROBE_MAX_AGE
+            and st not in self._load_stats().get('_down', []) for st in self.steps())
+        opencode_auto = opencode_auto and not has_spare
+        if opencode_auto:
+            from opencode_provider import retryable
+            alternatives = None
+            while not result['ok'] and retryable(candidate['model'], result.get('problem')):
+                self.__dict__.setdefault('_opencode_model_rest', {})[
+                    (self._cli_fingerprint(name), candidate['model'])] = time.time() + self.PROBE_MAX_AGE
+                if alternatives is None:
+                    try:
+                        alternatives = iter(self._discover_cli_models(name))
+                    except TimeoutError:
+                        raise
+                    except Exception:
+                        break
+                following = next(alternatives, None)
+                if following is None:
+                    break
+                candidate = following
+                self._request_timeout(self.CLI_TIMEOUTS[name])
+                logger.info('OpenCode: пробую следующую модель выбранного доступа')
+                result = self._run_cli_request(name, candidate, prompt, system_prompt)
+        elif not has_spare and not result['ok'] and result.get('problem') == 'model_unavailable':
             candidate = self._ensure_cli_model(name, force=True)
             if candidate:
                 result = self._run_cli_request(name, candidate, prompt, system_prompt)
@@ -1453,7 +1665,7 @@ class AIAssistant:
 
     def _first_cli_label(self) -> Optional[str]:
         """Имя первого доступного CLI-помощника — для подписи «Письма пишет»."""
-        order = self.ai_config.get('cli_providers', ['claude', 'codex']) if hasattr(self, 'ai_config') else []
+        order = self.ai_config.get('cli_providers', list(self.CLI_NAMES)) if hasattr(self, 'ai_config') else []
         dead = getattr(self, '_cli_dead', set())
         for name in order or []:
             if name in self.CLI_NAMES and name not in dead and self.find_cli(name):
@@ -1469,7 +1681,7 @@ class AIAssistant:
 
         only — взять только эти (очередь ИИ ставит Claude и Codex по отдельности).
         """
-        order = self.ai_config.get('cli_providers', ['claude', 'codex']) if hasattr(self, 'ai_config') else []
+        order = self.ai_config.get('cli_providers', list(self.CLI_NAMES)) if hasattr(self, 'ai_config') else []
         if only is not None:
             order = [n for n in (order or []) if n in only]
         if not hasattr(self, '_cli_dead'):
@@ -1491,7 +1703,7 @@ class AIAssistant:
             if text:
                 if name not in self._cli_announced:
                     self._cli_announced.add(name)
-                    logger.warning(f"Пишет запасной ИИ: {self.step_label(name)} — те, кто раньше в очереди, не ответили")
+                    logger.info('Ответ получен от %s', self.CLI_NAMES[name])
                 self._using_cli = name
                 return text
         return None
@@ -1509,41 +1721,58 @@ class AIAssistant:
         for p in (items or []):
             if not (isinstance(p, dict) and p.get('base_url') and p.get('enabled', True)):
                 continue
+            if p.get('api_key_env'):
+                key = p.get('api_key') or os.environ.get(p['api_key_env'], '')
+                if not key:
+                    continue
+                p = dict(p, api_key=key)
             if p.get('auto_models'):
                 found = self._discovered_models(p)
-                if found:
+                if found is not None:
                     p = dict(p, models=found)
+            if (p.get('name') == 'TokenHarbor'
+                    or p['base_url'].rstrip('/') == 'https://tokenharbor.ai/v1'):
+                p = dict(p, models=rank_tokenharbor_models(
+                    p.get('models') or [p.get('model')], self._load_stats()))
             result.append(p)
         return result
 
-    def _discovered_models(self, provider: dict) -> list:
-        """Модели сервиса по его /models, лучшие впереди; кеш на 6 часов.
+    def _discovered_models(self, provider: dict) -> Optional[list]:
+        """Каталог /models: TokenHarbor обновляется раз в 10 минут, остальные раз в 6 часов.
 
         Сервис закрыт — берём прошлый кеш, а без него настройки. Так закрытое
         приложение не замедляет каждый вызов лишним запросом.
         """
         name = provider.get('name') or provider['base_url']
+        tokenharbor = (name == 'TokenHarbor'
+                       or provider['base_url'].rstrip('/') == 'https://tokenharbor.ai/v1')
         stats = self._load_stats()
         cache = stats.setdefault('_models', {}).get(name) or {}
-        if cache.get('models') and time.time() - cache.get('at', 0) < self.MODELS_REFRESH_SECONDS:
+        refresh = self.PROBE_MAX_AGE if tokenharbor else self.MODELS_REFRESH_SECONDS
+        if 'models' in cache and time.time() - cache.get('at', 0) < refresh:
             return cache['models']
-        if time.time() < getattr(self, '_models_retry_after', {}).get(name, 0):
-            return cache.get('models') or []
+        retry_key = (name, provider['base_url'], provider.get('api_key') or '')
+        retries = self._runtime().setdefault('catalogue_retries', {})
+        if time.time() < retries.get(retry_key, 0):
+            return cache.get('models')
         try:
             import requests
-            response = requests.get(provider['base_url'].rstrip('/') + '/models', timeout=3,
+            response = requests.get(provider['base_url'].rstrip('/') + '/models', timeout=self._request_timeout(3),
                                     headers={'Authorization': f"Bearer {provider.get('api_key') or 'none'}"})
             response.raise_for_status()
-            ids = [m.get('id') for m in (response.json().get('data') or []) if m.get('id')]
-            ranked = rank_service_models(ids)
-            if ranked:
+            data = response.json().get('data')
+            if not isinstance(data, list) or any(not isinstance(m, dict) for m in data):
+                raise ValueError('Invalid model catalogue')
+            ids = [m.get('id') for m in data if isinstance(m.get('id'), str) and m['id']]
+            ranked = (rank_tokenharbor_models(ids) if tokenharbor else rank_service_models(ids))
+            if ranked or tokenharbor:
                 stats['_models'][name] = {'at': time.time(), 'models': ranked}
                 self._save_stats()
                 return ranked
         except Exception as e:
             logger.debug(f"Список моделей {name} не получен: {str(e)[:120]}")
-        self.__dict__.setdefault('_models_retry_after', {})[name] = time.time() + 300
-        return cache.get('models') or []
+        retries[retry_key] = time.time() + 300
+        return cache.get('models')
 
     def _call_compat_providers(self, prompt: str, system_prompt: Optional[str],
                                only_model: Optional[str] = None) -> Optional[str]:
@@ -1577,6 +1806,7 @@ class AIAssistant:
                     logger.debug(f"{name}: клиент не создан: {e}")
                     continue
             for model in (p.get('models') or [p.get('model')]):
+                self._request_timeout(float(p.get('timeout') or 60))
                 if not model or (name, model) in self._compat_dead_models:
                     continue
                 if only_model and model != only_model:
@@ -1585,7 +1815,9 @@ class AIAssistant:
                     continue
                 try:
                     resp = client.chat.completions.create(
-                        model=model, messages=messages, temperature=self.temperature)
+                        model=model, messages=messages, temperature=self.temperature,
+                        **({'timeout': self._request_timeout(float(p.get('timeout') or 60))}
+                           if _AI_DEADLINE.get() is not None else {}))
                     text = (resp.choices[0].message.content or '').strip() if resp and resp.choices else ''
                     problem = service_message_problem(text) if text else None
                     if problem:
@@ -1615,6 +1847,16 @@ class AIAssistant:
                 except Exception as e:
                     low = str(e).lower()
                     status = getattr(e, 'status_code', None)
+                    attempts = _AI_ATTEMPTS.get()
+                    if attempts:
+                        if status in (401, 403):
+                            attempts[-1]['status'] = 'auth' if status == 401 else 'forbidden'
+                        elif 'timeout' in type(e).__name__.lower():
+                            attempts[-1]['status'] = 'timeout'
+                        elif status == 429:
+                            attempts[-1]['status'] = 'quota'
+                        else:
+                            attempts[-1]['status'] = 'network' if status is None else 'service_error'
                     local = any(h in p['base_url'] for h in ('127.0.0.1', 'localhost', '0.0.0.0'))
                     # Нет связи — по типу ошибки, а не по слову «connect» в тексте:
                     # 403 от Cloudflare у LLM7 тоже содержал это слово и выдавался
@@ -1625,6 +1867,10 @@ class AIAssistant:
                         no_link = isinstance(e, APIConnectionError) and not isinstance(e, APITimeoutError)
                     except ImportError:
                         no_link = 'refused' in low
+                    if isinstance(e, TimeoutError) or 'timeout' in type(e).__name__.lower():
+                        self._compat_model_rest[(name, model)] = time.time() + 120
+                        logger.info('%s: %s — таймаут; 2 минуты пробую другие модели и ИИ', name, model)
+                        continue
                     if no_link and not _connection_refused(e):
                         # Сервис жив, но бросил ответ («Server disconnected without
                         # sending a response»): у Antigravity так отваливается аккаунт.
@@ -1634,6 +1880,17 @@ class AIAssistant:
                         continue
                     if status in (500, 502, 503, 504):
                         # Модель временно недоступна (у Antigravity — упал аккаунт): минута отдыха.
+                        # 19.10: «All accounts rate-limited. Cooldown wait 515757s» у новых claude-*-5-5:
+                        # шлюз сам называет срок, ждать минуту и спрашивать снова бессмысленно.
+                        cooldown = re.search(r'cooldown wait (\d+)\s*s', low)
+                        if cooldown:
+                            pause = min(max(int(cooldown.group(1)), 60), 3600)
+                            if self._compat_model_rest.get((name, model), 0) < time.time():
+                                logger.info('%s: %s недоступна: все аккаунты на паузе (ещё около %s); '
+                                            'пропускаю на %s мин', name, model,
+                                            f'{int(cooldown.group(1)) // 3600} ч', pause // 60)
+                            self._compat_model_rest[(name, model)] = time.time() + pause
+                            continue
                         self._compat_model_rest[(name, model)] = time.time() + 60
                         logger.debug(f"{name} {model}: код {status}, отдыхает минуту")
                         continue
@@ -1649,6 +1906,18 @@ class AIAssistant:
                                            f"снова попробую через 5 минут")
                         self._compat_rest[name] = time.time() + 300
                         break
+                    if status in (400, 404):
+                        from cli_models import cli_problem
+                        if cli_problem(low) == 'model_unavailable':
+                            self._compat_dead_models.add((name, model))
+                            logger.warning('%s: %s — модель недоступна (HTTP %s); пробую следующий ИИ',
+                                           name, model, status)
+                            continue
+                    if status == 402:
+                        self._compat_dead_models.add((name, model))
+                        logger.warning('%s: %s — недостаточно баланса (402); пробую другие модели и ИИ',
+                                       name, model)
+                        continue
                     if status == 429 or 'rate limit' in low:
                         # «Retry after 1 seconds» у LLM7 — поминутный лимит, а не
                         # суточный: раньше одна такая ошибка выключала модель до
@@ -1658,6 +1927,11 @@ class AIAssistant:
                             logger.warning(f" {name}: {model} исчерпал суточную квоту — пробую следующий ИИ")
                         else:
                             wait = self.retry_after_seconds(str(e))
+                            # «Resource has been exhausted (e.g. check quota)» у Antigravity — лимит на модель у
+                            # текущего аккаунта; 14.10 такие модели дёргались каждую минуту. Квоты аккаунтов при
+                            # этом могут быть в порядке, поэтому отдых короткий — 5 минут, а не до конца прогона.
+                            if 'exhaust' in low or 'quota' in low:
+                                wait = max(wait, 300)
                             self._compat_model_rest[(name, model)] = time.time() + wait
                             logger.info(f" {name}: {model} ограничил запросы (429), повтор через {wait:.0f} с")
                     elif any(k in low for k in ('insufficient', 'quota', 'exhaust', '404', 'not found', '402')):
@@ -1668,20 +1942,47 @@ class AIAssistant:
 
     # Порядок ИИ по умолчанию. «gemini» — это Gemini и следом Groq (они связаны:
     # Groq подхватывает, когда Gemini упёрся в лимит).
-    AI_ORDER = ('compat', 'gemini', 'claude', 'codex')
+    AI_ORDER = ('compat', 'gemini', 'claude', 'codex', 'opencode')
 
     STATS_FILE = 'ai_stats.json'
+    _runtimes = {}
+    _runtime_lock = threading.RLock()
+
+    def _runtime(self):
+        with self._runtime_lock:
+            return self._runtimes.setdefault(self._stats_path(), {'locks': {}, 'available': threading.Condition()})
+
+    def _refresh_probes_in_background(self):
+        if not getattr(self, '_background_probes', False):
+            return
+        runtime = self._runtime()
+        with self._provider_lock('probe'):
+            if runtime.get('probing') or time.time() < runtime.get('next_probe', 0):
+                return
+            runtime['next_probe'] = time.time() + self.PROBE_MAX_AGE
+
+        def refresh():
+            try:
+                self.probe_providers(first_ready=True)
+            except Exception as exc:
+                logger.debug('Фоновая проверка ИИ: %s', type(exc).__name__)
+
+        threading.Thread(target=refresh, name='hh-ai-readiness', daemon=True).start()
 
     def _stats_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.STATS_FILE)
 
     def _load_stats(self) -> Dict[str, Any]:
         if getattr(self, '_ai_stats', None) is None:
-            try:
-                with open(self._stats_path(), encoding='utf-8') as f:
-                    self._ai_stats = json.load(f) or {}
-            except Exception:
-                self._ai_stats = {}
+            with self._provider_lock('stats'):
+                runtime = self._runtime()
+                if 'stats' not in runtime:
+                    try:
+                        with open(self._stats_path(), encoding='utf-8') as f:
+                            runtime['stats'] = json.load(f) or {}
+                    except (OSError, ValueError):
+                        runtime['stats'] = {}
+                self._ai_stats = runtime['stats']
         return self._ai_stats
 
     def _record(self, step: str, ok: bool, seconds: float) -> None:
@@ -1690,8 +1991,12 @@ class AIAssistant:
         with self._provider_lock('stats'):
             stats = self._load_stats()
             row = stats.setdefault(step, {'avg': self.UNKNOWN_AVG, 'success': self.UNKNOWN_SUCCESS, 'n': 0})
+            for key, default in (('avg', self.UNKNOWN_AVG), ('success', self.UNKNOWN_SUCCESS), ('n', 0)):
+                row.setdefault(key, default)
             row['success'] = round(0.8 * row['success'] + 0.2 * (1.0 if ok else 0.0), 4)
             if ok:
+                row['ready_at'] = time.time()
+                row.pop('retry_at', None)
                 row['avg'] = round(0.7 * row['avg'] + 0.3 * seconds, 2)
                 if step in stats.get('_down', []):
                     stats['_down'].remove(step)       # ожила — снова по статистике
@@ -1715,13 +2020,15 @@ class AIAssistant:
             for model in (p.get('models') or [p.get('model')]):
                 if model and f'compat:{model}' not in result:
                     result.append(f'compat:{model}')
-        return result + [st for st in self.AI_ORDER if st != 'compat']
+        enabled_cli = getattr(self, 'ai_config', {}).get('cli_providers', list(self.CLI_NAMES)) or []
+        return result + [st for st in self.AI_ORDER if st != 'compat'
+                         and (st != 'opencode' or (st in enabled_cli and self.find_cli(st)))]
 
     PROBE_MAX_AGE = 600          # не проверять чаще раза в 10 минут
     PROBE_TIMEOUT = 20
     PROBE_DEADLINE = 35          # общий срок проверки при запуске, секунд
     PROBE_MAX_TOKENS = 256
-    PROBE_VERSION = 2
+    PROBE_VERSION = 3
 
     def _probe_one(self, step: str):
         """Короткий запрос к одной модели сервиса: (шаг, ответила ли, секунды)."""
@@ -1746,10 +2053,38 @@ class AIAssistant:
             ok = (bool(re.search('[а-яё]', content.lower()))
                   and getattr(choice, 'finish_reason', None) != 'length'
                   and not service_message_problem(content))
+            if ok:
+                name = provider.get('name') or provider['base_url']
+                getattr(self, '_compat_dead_models', set()).discard((name, model))
+                getattr(self, '_compat_model_rest', {}).pop((name, model), None)
+                getattr(self, '_compat_rest', {}).pop(name, None)
         except Exception as e:
-            logger.debug(f"Проверка {step}: {str(e)[:150]}")
+            from cli_models import cli_problem
+            status = getattr(e, 'status_code', None)
+            reason = {401: 'нужна авторизация или действующий ключ',
+                      402: 'недостаточно баланса', 403: 'сервис запретил доступ'}.get(status)
+            if status == 429:
+                reason = 'суточная квота исчерпана' if self.is_daily_limit(str(e)) else 'временный лимит запросов'
+            elif status in (400, 404) and cli_problem(str(e)) == 'model_unavailable':
+                reason = 'модель недоступна'
+            if reason:
+                logger.warning('Проверка %s: %s (HTTP %s); остальные ИИ продолжают работать', step, reason, status)
+            logger.debug('Проверка %s: %s, HTTP %s', step, type(e).__name__, status)
             ok = False
         return step, ok, time.time() - started
+
+    def disabled_compat_providers(self) -> list:
+        """(имя, причина) сервисов, которые бот не использует: выключены в настройках или нет ключа."""
+        result = []
+        for p in ((self.ai_config.get('openai_compatible') if hasattr(self, 'ai_config') else None) or []):
+            if not (isinstance(p, dict) and p.get('base_url')):
+                continue
+            name = p.get('name') or p['base_url']
+            if not p.get('enabled', True):
+                result.append((name, 'выключен в настройках'))
+            elif p.get('api_key_env') and not (p.get('api_key') or os.environ.get(p['api_key_env'], '')):
+                result.append((name, f"нет ключа (переменная {p['api_key_env']})"))
+        return result
 
     def closed_compat_providers(self) -> list:
         """Сервисы, чей адрес не принимает соединение: приложение не запущено.
@@ -1762,6 +2097,8 @@ class AIAssistant:
         closed = []
         for p in self._compat_providers():
             url = urlparse(p['base_url'])
+            if url.hostname not in ('localhost', '127.0.0.1', '::1'):
+                continue
             port = url.port or (443 if url.scheme == 'https' else 80)
             try:
                 socket.create_connection((url.hostname, port), timeout=2).close()
@@ -1769,19 +2106,38 @@ class AIAssistant:
                 closed.append(p.get('name') or p['base_url'])
         return closed
 
-    def probe_providers(self, force: bool = False) -> list:
+    def probe_providers(self, force: bool = False, first_ready: bool = False) -> list:
+        runtime = self._runtime()
+        with self._provider_lock('probe'):
+            if runtime.get('probing'):
+                return []
+            runtime['probing'] = True
+        try:
+            return self._probe_providers(force, first_ready)
+        finally:
+            with self._provider_lock('probe'):
+                if not any(th.is_alive() for th in runtime.get('probe_threads', [])):
+                    runtime['probing'] = False
+
+    def _probe_providers(self, force: bool, first_ready: bool) -> list:
         """Опрашивает модели сервисов параллельно и пишет итог в статистику «Авто».
 
         Возвращает [(шаг, ответила, секунды)] или [], если проверка была недавно.
         """
         steps = [st for st in self.steps() if st.startswith('compat:')]
         stats = self._load_stats()
-        cli_steps = [name for name in (self.ai_config.get('cli_providers', ['claude', 'codex']) or [])
+        runtime = self._runtime()
+        if not force:
+            with self._provider_lock('stats'):
+                for name, cached in stats.get('_cli_models', {}).items():
+                    if name in self.CLI_NAMES and cached.get('available') and self._cli_model_fresh(name, cached):
+                        stats.setdefault(name, {})['ready_at'] = cached.get('checked_at', 0)
+        cli_steps = [name for name in (self.ai_config.get('cli_providers', list(self.CLI_NAMES)) or [])
                      if name in self.CLI_NAMES and self.find_cli(name)
                      and (force or not self._cli_model_fresh(
                          name, stats.get('_cli_models', {}).get(name) or {}))]
         # Модели закрытого сервиса не опрашиваем — сразу в конец очереди.
-        closed = set(getattr(self, '_closed_now', None) or [])
+        closed = set(getattr(self, '_closed_now', None) or runtime.get('closed_now') or [])
         closed_steps = [f"compat:{m}" for p in self._compat_providers()
                         if (p.get('name') or p['base_url']) in closed
                         for m in (p.get('models') or [p.get('model')]) if m]
@@ -1789,6 +2145,7 @@ class AIAssistant:
         # не успеть их вернуть. Во время работы закрытый сервис и так пропускается.
         steps = [st for st in steps if st not in closed_steps]
         if (not force and stats.get('_probe_version') == self.PROBE_VERSION
+                and sorted(stats.get('_probe_compat_steps') or []) == sorted(steps)
                 and time.time() - float(stats.get('_probed_at', 0) or 0) < self.PROBE_MAX_AGE):
             steps = []
         if not steps and not cli_steps:
@@ -1796,54 +2153,96 @@ class AIAssistant:
         def probe(step):
             if step.startswith('compat:'):
                 return self._probe_one(step)
-            row = self._ensure_cli_model(step, force=force)
+            # A startup check must release its CLI lock when the UI stops waiting.
+            token = _AI_DEADLINE.set(time.monotonic() + self.PROBE_DEADLINE) if step == 'opencode' else None
+            try:
+                row = self._ensure_cli_model(step, force=force)
+            finally:
+                if token is not None:
+                    _AI_DEADLINE.reset(token)
             measured = row or self._load_stats().get('_cli_models', {}).get(step) or {}
             return step, bool(row), measured.get('seconds', 0)
 
-        # Общий срок проверки. 06.10 запуск «висел» минутами на «Проверяю, какие ИИ
-        # сейчас отвечают…»: pool.map ждал самую медленную модель (CLI ChatGPT без
-        # ответа). Теперь потоки фоновые, ждём не дольше PROBE_DEADLINE; не успевшие
-        # считаются неответившими до следующей проверки, а запуск идёт дальше.
+        # Normal startup returns on the first ready model; late results still update the queue.
         gate = threading.Semaphore(8)
+        # Не больше двух проверок одновременно на один сервис: шесть разом давали
+        # всплеск, и Google отвечал 429 «Resource has been exhausted» (14.10).
+        per_service = {}
+
+        def service_gate(step):
+            if not step.startswith('compat:'):
+                return threading.Semaphore(1)
+            model = step.split(':', 1)[1]
+            base = next((p['base_url'] for p in self._compat_providers()
+                         if model in (p.get('models') or [p.get('model')])), step)
+            return per_service.setdefault(base, threading.Semaphore(2))
+
         done = {}
+        changed = threading.Event()
+        remaining = set(steps + cli_steps)
+        runtime['probing'] = True
 
         def worker(step):
-            with gate:
-                try:
-                    done[step] = probe(step)
-                except Exception as e:
-                    logger.debug(f"Проверка {step}: {str(e)[:120]}")
-                    done[step] = (step, False, 0.0)
+            result = None
+            try:
+                with gate, service_gate(step), self._provider_lock(step), self._service_gate(step):
+                    try:
+                        result = probe(step)
+                    except Exception as e:
+                        logger.debug('Проверка %s: %s', step, type(e).__name__)
+                        result = (step, False, 0.0)
+                with self._provider_lock('stats'):
+                    _, ok, seconds = result
+                    if ok:
+                        self._record(step, True, seconds)
+                    else:
+                        if step not in stats.setdefault('_down', []):
+                            stats['_down'].append(step)
+                        stats.setdefault(step, {})['retry_at'] = time.time() + self.PROBE_MAX_AGE
+                    self._save_stats()
+                    done[step] = result
+            finally:
+                with self._provider_lock('stats'):
+                    remaining.discard(step)
+                    if not remaining:
+                        runtime['probing'] = False
+                    changed.set()
 
-        threads = [threading.Thread(target=worker, args=(st,), daemon=True) for st in steps + cli_steps]
+        prefix = 'hh-ai-background-probe-' if first_ready else 'hh-ai-probe-'
+        threads = [threading.Thread(target=worker, args=(st,), daemon=True, name=prefix + st)
+                   for st in steps + cli_steps]
+        runtime['probe_threads'] = threads
         for th in threads:
             th.start()
         deadline = time.time() + self.PROBE_DEADLINE
-        for th in threads:
-            th.join(max(0.0, deadline - time.time()))
+        while time.time() < deadline:
+            changed.clear()
+            with self._provider_lock('stats'):
+                ready = any(st not in stats.get('_down', [])
+                            and time.time() - (stats.get(st) or {}).get('ready_at', 0) < self.PROBE_MAX_AGE
+                            for st in self.steps())
+                if not remaining or (first_ready and ready):
+                    break
+            changed.wait(max(0.0, deadline - time.time()))
         results = []
         for st in steps + cli_steps:
             results.append(done.get(st) or (st, False, float(self.PROBE_DEADLINE)))
         # Не ответил сейчас — в конец очереди до следующей проверки. В среднюю
         # долю успехов не пишем: одна проверка сдвигала её на 0.2, и модель,
         # которой Google сейчас отказывает по стране, оставалась второй.
-        for step, ok, seconds in results:
-            if ok:
-                self._record(step, ok, seconds)
         with self._provider_lock('stats'):
-            tested = {step for step, _, _ in results}
-            stats['_down'] = [step for step in stats.get('_down', []) if step not in tested]
-            stats['_down'].extend(step for step, ok, _ in results if not ok)
             if steps:
                 stats['_probed_at'] = time.time()
                 stats['_probe_version'] = self.PROBE_VERSION
+                stats['_probe_compat_steps'] = sorted(steps)
             self._save_stats()
-        return results
+        return [done[st] for st in steps + cli_steps if st in done] if first_ready else results
 
-    def probe_report(self, force: bool = False) -> Optional[str]:
+    def probe_report(self, force: bool = False, first_ready: bool = False) -> Optional[str]:
         """Проверка при запуске и итог для вывода, или None."""
         closed = self.closed_compat_providers()
         self._closed_now = closed
+        self._runtime()['closed_now'] = closed
         lines = []
         if closed:
             if not hasattr(self, '_compat_rest'):
@@ -1856,7 +2255,9 @@ class AIAssistant:
             nxt = next((st for st in self.ai_order() if st not in closed_models), None)
             lines.append(f"{', '.join(closed)} не запущен — похоже, его забыли включить. "
                          f"Перехожу к следующему ИИ: {self.step_label(nxt) if nxt else 'шаблон'}")
-        results = self.probe_providers(force=force)
+        for name, reason in self.disabled_compat_providers():
+            lines.append(f"{name} не используется: {reason}")
+        results = self.probe_providers(force=force, first_ready=first_ready)
         if results:
             parts = []
             for step, ok, seconds in sorted(results, key=lambda r: (not r[1], r[2])):
@@ -1885,7 +2286,7 @@ class AIAssistant:
                 if model in (p.get('models') or [p.get('model')]):
                     return f"{p.get('name') or 'Сервис'}: {model}"
             return model
-        label = {'gemini': 'Gemini', 'claude': 'Claude', 'codex': 'ChatGPT'}.get(step, step)
+        label = {'gemini': 'Gemini', 'claude': 'Claude', 'codex': 'ChatGPT', 'opencode': 'OpenCode'}.get(step, step)
         if step in self.CLI_NAMES:
             row = self._load_stats().get('_cli_models', {}).get(step) or {}
             if row.get('model'):
@@ -1896,40 +2297,65 @@ class AIAssistant:
     UNKNOWN_AVG, UNKNOWN_SUCCESS = 12.0, 0.7
 
     def ai_order(self) -> List[str]:
-        """Очередь ИИ. «Авто» (по умолчанию) — по статистике: время ответа,
-        делённое на долю успехов. Выбран конкретный — он первым ('compat' —
-        все модели сервиса первыми)."""
+        """В «Авто» доступные :free первыми, затем по времени ответа / доле успехов.
+        Закреплённый сервис даёт основную модель, запасные ранжируются отдельно.
+        'compat' сохраняет явный выбор всей группы совместимых сервисов."""
         order = self.steps()
         primary = (self.ai_config.get('primary_ai') if hasattr(self, 'ai_config') else None) or 'auto'
         stats = self._load_stats()
-        if primary != 'auto':
-            first = [st for st in order if st == primary or (primary == 'compat' and st.startswith('compat:'))]
-            if not first:
-                # Закреплён сервис целиком по имени («Antigravity»): первыми все его
-                # модели в том порядке, как они записаны в настройках (от самой
-                # быстрой и умной к слабее) — порядок задаёт пользователь, а не
-                # статистика. Закрытый сервис пропускают за миллисекунды.
-                provider = next((pr for pr in self._compat_providers()
-                                 if str(pr.get('name') or '').lower() == str(primary).lower()), None)
-                if provider:
-                    first = [f'compat:{m}' for m in (provider.get('models') or [provider.get('model')])
-                             if m and f'compat:{m}' in order]
-            if first:
-                rest = [st for st in order if st not in first]
-                return first + rest
 
         def score(step):
             row = stats.get(step) or {}
             return (float(row.get('avg', self.UNKNOWN_AVG))
                     / max(0.05, float(row.get('success', self.UNKNOWN_SUCCESS))))
+
         down = stats.get('_down') or []
-        ranked = sorted(order, key=lambda st: (st in down, score(st), order.index(st)))
+
+        def free_route(step):
+            return ((step.startswith('compat:') and step.endswith(':free'))
+                    or (step == 'opencode' and (self.ai_config.get('opencode') or {}).get('mode', 'free') in ('free', 'auto')))
+
+        def ready(step):
+            return time.time() - (stats.get(step) or {}).get('ready_at', 0) < self.PROBE_MAX_AGE
+
+        ranked = sorted(order, key=lambda st: (st in down, not ready(st), not free_route(st),
+                                               score(st), order.index(st)))
+        if primary != 'auto':
+            first = [st for st in order if st not in down and
+                     (st == primary or (primary == 'compat' and st.startswith('compat:')))]
+            if any(ready(st) for st in ranked):
+                first = [st for st in first if ready(st)]
+            if not first:
+                # Pinning a service must not pin its entire fallback catalogue.
+                provider = next((pr for pr in self._compat_providers()
+                                 if str(pr.get('name') or '').lower() == str(primary).lower()), None)
+                if provider:
+                    # 14.10, решение пользователя: «любая модель Antigravity идёт первой, потом остальное».
+                    # Все рабочие модели закреплённого сервиса в порядке настроек; не ответившие на проверке
+                    # идут на общих основаниях, чтобы не держать очередь (там их догонят после отдыха).
+                    first = [f'compat:{m}' for m in (provider.get('models') or [provider.get('model')])
+                             if m and f'compat:{m}' in order and f'compat:{m}' not in down]
+                    if any(ready(st) for st in ranked):
+                        first = [st for st in first if ready(st)]
+            if first:
+                rest = [st for st in ranked if st not in first]
+                return first + rest
+            return ranked
 
         # Изредка пробуем первым малоизученного — иначе про него так и не узнаем.
         # Только когда уже есть замеренный лидер: без данных порядок обычный.
+        active = stats.get('_active_step')
+        if (active in ranked and active not in down and ready(active)
+                and free_route(active) == free_route(ranked[0])):
+            ranked.remove(active)
+            ranked.insert(0, active)
+            return ranked
+        if any(ready(st) for st in ranked):
+            return ranked
         rate = float(self.ai_config.get('auto_explore', 0.1)) if hasattr(self, 'ai_config') else 0.0
         measured = [st for st in ranked if (stats.get(st) or {}).get('n', 0) >= 3]
-        rookies = [st for st in ranked[1:] if (stats.get(st) or {}).get('n', 0) < 3 and st not in down]
+        rookies = [st for st in ranked[1:] if (stats.get(st) or {}).get('n', 0) < 3 and st not in down
+                   and free_route(st) == free_route(ranked[0])]
         if measured and rookies and random.random() < rate:
             pick = random.choice(rookies)
             ranked.remove(pick)
@@ -1938,16 +2364,94 @@ class AIAssistant:
 
     def _provider_lock(self, key):
         # Проверка паузы и запрос должны быть атомарны для параллельных разборов.
-        locks = self.__dict__.setdefault('_request_locks', {})
-        return locks.setdefault(key, threading.RLock())
+        with self._runtime_lock:
+            return self._runtime()['locks'].setdefault(key, threading.RLock())
 
-    def _call_step(self, step: str, prompt: str, system_prompt: Optional[str]) -> Optional[str]:
-        lock_key = step
+    def _request_timeout(self, default):
+        deadline = _AI_DEADLINE.get()
+        if deadline is None:
+            return default
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Лимит времени разбора отказа')
+        return min(default, 60, remaining)
+
+    def _attempt_budget(self, step):
+        """Сколько секунд даём одной попытке разбора.
+
+        14.10: при общих 30 с модели Antigravity (gemini-3.8-flash, claude-sonnet/opus) и Claude CLI
+        на длинном запросе разбора всегда упирались в таймаут, хотя короткие ответы дают за 1–5 с.
+        Сервис из openai_compatible — по его timeout (не больше 60 с), CLI — 60 с, остальные — 30 с.
+        """
+        if step.startswith('compat:'):
+            model = step.split(':', 1)[1]
+            provider = next((p for p in self._compat_providers()
+                             if model in (p.get('models') or [p.get('model')])), {})
+            try:
+                return max(10.0, min(60.0, float(provider.get('timeout') or 30)))
+            except (TypeError, ValueError):
+                return 30.0
+        if step == 'opencode':
+            # Discovery, readiness probes and generation share one fallback budget.
+            return 30.0
+        if step in getattr(self, 'CLI_NAMES', ()):
+            return 60.0
+        return 30.0
+
+    def _step_provider_key(self, step):
         model = step.split(':', 1)[1] if ':' in step else None
         if step.startswith('compat'):
-            lock_key = next((p['base_url'] for p in self._compat_providers()
-                             if model in (p.get('models') or [p.get('model')])), step)
-        with self._provider_lock(lock_key):
+            return next((p['base_url'] for p in self._compat_providers()
+                         if model in (p.get('models') or [p.get('model')])), step)
+        return step
+
+    SERVICE_PARALLEL_DEFAULT = 3
+
+    def _service_gate(self, step):
+        """Сколько разных моделей одного сервиса могут работать одновременно (openai_compatible[].max_parallel).
+
+        14.10: «один ИИ — одна задача, а ИИ в сервисе несколько». Замок теперь на модель, а не на сервис:
+        gemini-3.8-flash пишет разбор, claude-sonnet-4-6 в это время — ответ в чат. Общий предел на сервис
+        не даёт прокси получить всплеск, из-за которого Google отвечает 429.
+        """
+        key = self._step_provider_key(step)
+        gates = self._runtime().setdefault('service_gates', {})
+        if key not in gates:
+            limit = 1
+            if step.startswith('compat'):
+                provider = next((p for p in self._compat_providers() if p.get('base_url') == key), {})
+                try:
+                    limit = max(1, int(provider.get('max_parallel', self.SERVICE_PARALLEL_DEFAULT)))
+                except (TypeError, ValueError):
+                    limit = self.SERVICE_PARALLEL_DEFAULT
+            with self._runtime_lock:
+                gates.setdefault(key, threading.BoundedSemaphore(limit))
+        return gates[key]
+
+    def _call_step(self, step: str, prompt: str, system_prompt: Optional[str]) -> Optional[str]:
+        model = step.split(':', 1)[1] if ':' in step else None
+        # Одна модель — одна задача; несколько моделей сервиса — параллельно, но не больше предела сервиса.
+        lock = self._provider_lock(step)
+        gate = self._service_gate(step)
+        deadline = _AI_DEADLINE.get()
+        if not lock.acquire(blocking=deadline is None):
+            attempts = _AI_ATTEMPTS.get()
+            if attempts:
+                attempts[-1]['status'] = 'busy'
+            logger.debug('Запрос к ИИ: %s, поток %s пропущен: модель занята другой задачей', step,
+                         threading.current_thread().name)
+            return None
+        if not gate.acquire(blocking=deadline is None):
+            lock.release()
+            attempts = _AI_ATTEMPTS.get()
+            if attempts:
+                attempts[-1]['status'] = 'busy'
+            logger.debug('Запрос к ИИ: %s, поток %s пропущен: у сервиса занят предел одновременных запросов',
+                         step, threading.current_thread().name)
+            return None
+        request_started, text = time.time(), None
+        try:
+            self._request_timeout(15)
             if step.startswith('compat'):
                 text = self._call_compat_providers(prompt, system_prompt, only_model=model)
             elif step == 'gemini':
@@ -1958,14 +2462,63 @@ class AIAssistant:
                 # Подпись «кто пишет» — ровно по тому, кто ответил.
                 if not step.startswith('compat'):
                     self._using_compat = None
-                if step not in ('claude', 'codex'):
+                if step not in self.CLI_NAMES:
                     self._using_cli = None
             return text
+        finally:
+            # Реальный запрос (после замков): по этим интервалам считают перекрытие запросов провайдерам.
+            logger.debug('Запрос к ИИ: %s, поток %s, %.3f-%.3f, %s', step, threading.current_thread().name,
+                         request_started, time.time(), 'ответ' if text else 'нет ответа')
+            gate.release()
+            lock.release()
+            with self._runtime()['available']:
+                self._runtime()['available'].notify_all()
 
     def _try_chain(self, prompt, system_prompt, validate) -> Optional[str]:
-        for step in self.ai_order():
+        deadline = _AI_DEADLINE.get()
+        steps = self.ai_order()
+        if deadline is not None:
+            # Одна задача сначала пробует по одной модели каждого сервиса, потом остальные модели:
+            # если сервис лёг, не тратим по 30 с на каждую его модель. Параллельные задачи при этом
+            # расходятся по свободным моделям — замок на модель, а не на весь сервис.
+            first, extra, seen = [], [], set()
+            for step in steps:
+                key = self._step_provider_key(step)
+                (extra if key in seen else first).append(step)
+                seen.add(key)
+            steps = first + extra
+        for step in steps:
+            self._request_timeout(15)
+            if time.time() < (self._load_stats().get(step) or {}).get('retry_at', 0):
+                continue
             started = time.time()
-            text = self._call_step(step, prompt, system_prompt)
+            attempts = _AI_ATTEMPTS.get()
+            attempt = {'provider': step, 'status': 'no_response', 'seconds': 0}
+            attempt_token = _AI_ATTEMPTS.set([attempt]) if attempts is None else None
+            if attempts is not None:
+                attempts.append(attempt)
+                logger.info('[ИИ-разбор] Попытка %s: %s, бюджет до %.0f с', len(attempts), step,
+                            self._attempt_budget(step))
+            bounded = True
+            token = (_AI_DEADLINE.set(min(deadline if deadline is not None else float('inf'),
+                                          time.monotonic() + self._attempt_budget(step)))
+                     if bounded else None)
+            try:
+                text = self._call_step(step, prompt, system_prompt)
+                self._request_timeout(15)
+            except TimeoutError:
+                if not bounded:
+                    raise
+                logger.info('%s не ответил в пределах бюджета запроса (до %.0f с) — пробую следующий ИИ',
+                            step, self._attempt_budget(step))
+                attempt['status'] = 'timeout'
+                text = None
+            finally:
+                if token is not None:
+                    _AI_DEADLINE.reset(token)
+                if attempt_token is not None:
+                    _AI_ATTEMPTS.reset(attempt_token)
+            self._request_timeout(15)
             # Служебное сообщение сервиса — для ЛЮБОГО ответа (чат, анкета,
             # разбор), а не только для писем: 24.09 такое ушло работодателям.
             problem = service_message_problem(text) if text else None
@@ -1973,13 +2526,49 @@ class AIAssistant:
                 problem = validate(text)
             if problem:
                 logger.info(f" Ответ ИИ не прошёл проверку ({problem}) — пишет следующий")
+                attempt['status'] = 'service_error' if service_message_problem(text) else 'invalid_response'
+                if 'JSON' in problem or 'объект разбора' in problem:
+                    attempt['reason'] = 'invalid_json'
+                elif 'число' in problem:
+                    attempt['reason'] = 'unsupported_number'
+                elif 'технологии' in problem:
+                    attempt['reason'] = 'unsupported_skills'
+                else:
+                    attempt['reason'] = 'validation'
+            elif text:
+                attempt['status'] = 'ok'
+            elif attempt['status'] == 'no_response' and step in self.CLI_NAMES:
+                cli = (getattr(self, '_ai_stats', None) or {}).get('_cli_models', {}).get(step) or {}
+                cause = cli.get('problem')
+                if cause in ('timeout', 'auth'):
+                    attempt['status'] = cause
+                elif cause in ('weekly_quota', 'daily_quota', 'quota'):
+                    attempt['status'] = 'quota'
+            attempt['seconds'] = round(time.time() - started, 1)
+            if attempts is not None:
+                logger.info('[ИИ-разбор] %s: %s, %.1f с', step,
+                            AI_ATTEMPT_STATUS[attempt['status']], attempt['seconds'])
+            if attempt['status'] == 'busy':
+                if _AI_BUSY.get() is not None:
+                    _AI_BUSY.get()[0] = True
+                continue
             self._record(step, bool(text) and not problem, time.time() - started)
+            with self._provider_lock('stats'):
+                stats = self._load_stats()
+                if not text or attempt['status'] == 'service_error':
+                    stats.setdefault(step, {})['retry_at'] = time.time() + 120
+                    stats[step]['retry_reason'] = attempt['status']
+                    if step not in stats.setdefault('_down', []):
+                        stats['_down'].append(step)
+                elif not problem:
+                    stats['_active_step'] = step
+                self._save_stats()
             if text and not problem:
                 return text
         return None
 
     def _call_llm(self, prompt: str, system_prompt: Optional[str] = None,
-                  validate=None) -> Optional[str]:
+                  validate=None, deadline=None) -> Optional[str]:
         """ИИ по очереди (ai_order), потом None — письмо по шаблону.
 
         validate(text) -> причина или None: ответ с причиной не принимается,
@@ -1987,19 +2576,43 @@ class AIAssistant:
         """
         if not getattr(self, 'enabled', False):
             return None
-        text = self._try_chain(prompt, system_prompt, validate)
-        if text:
-            return text
-        # Все отказали разом — часто это просто обрыв сети. 24.09 так за доли
-        # секунды провалились все 15 разборов отказов. Ждём сеть (до 2 минут) и
-        # повторяем один раз; сеть есть — значит, отказ настоящий, не ждём.
+        self._refresh_probes_in_background()
+        if deadline is None and _AI_BUDGET.get():
+            deadline = time.monotonic() + _AI_BUDGET.get()
+        token = _AI_DEADLINE.set(deadline)
+        busy = [False]
+        busy_token = _AI_BUSY.set(busy)
+        wait_until = min(deadline if deadline is not None else float('inf'), time.monotonic() + 60)
         try:
-            from terminal_ui import network_is_up, wait_for_network
-            if not network_is_up() and wait_for_network(120, logger):
-                return self._try_chain(prompt, system_prompt, validate)
-        except Exception as e:
-            logger.debug(f"Ожидание сети не удалось: {e}")
-        return None
+            while True:
+                busy[0] = False
+                text = self._try_chain(prompt, system_prompt, validate)
+                if text:
+                    return text
+                if not busy[0] or time.monotonic() >= wait_until:
+                    break
+                with self._runtime()['available']:
+                    self._runtime()['available'].wait(min(.25, max(0, wait_until - time.monotonic())))
+            if deadline is not None:
+                return None
+            # Without an analysis deadline, retain the ordinary network recovery.
+            try:
+                from terminal_ui import network_is_up, wait_for_network
+                if not network_is_up() and wait_for_network(120, logger):
+                    with self._provider_lock('stats'):
+                        for row in self._load_stats().values():
+                            if isinstance(row, dict) and row.get('retry_reason') in ('network', 'no_response', 'timeout'):
+                                row.pop('retry_at', None)
+                    return self._try_chain(prompt, system_prompt, validate)
+            except Exception as e:
+                logger.debug(f"Ожидание сети не удалось: {e}")
+            return None
+        except TimeoutError:
+            logger.info('Лимит времени разбора отказа: откладываю до следующего запуска.')
+            return None
+        finally:
+            _AI_BUSY.reset(busy_token)
+            _AI_DEADLINE.reset(token)
 
     def _call_llm_api(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
         """Отправляет запрос в LLM и возвращает чистый текст ответа."""
@@ -2150,10 +2763,14 @@ class AIAssistant:
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
-                response = self._openai_client.chat.completions.create(
+                client = (self._openai_client.with_options(max_retries=0)
+                          if _AI_DEADLINE.get() is not None else self._openai_client)
+                response = client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
-                    temperature=self.temperature
+                    temperature=self.temperature,
+                    **({'timeout': self._request_timeout(getattr(self, 'timeout', 15))}
+                       if _AI_DEADLINE.get() is not None else {})
                 )
                 if response and response.choices:
                     content = response.choices[0].message.content
@@ -2298,56 +2915,16 @@ class AIAssistant:
             return None, 'Некорректный ответ ИИ; проверка отложена'
 
     def recognize_captcha(self, image_data):
-        """Read a cropped HH text captcha using Gemini or an OpenAI-compatible API."""
-        import base64
-        import requests
-        settings = self.config.get('captcha') or {}
-        if not settings.get('enabled') or not image_data or len(image_data) > 5_000_000:
-            return None
-        provider = str(settings.get('provider') or self.provider).lower()
-        if provider not in ('gemini', 'google', 'openai', 'groq', 'openrouter', 'ollama', 'deepseek'):
-            return None
-        key_env = {'gemini': 'GEMINI_API_KEY', 'google': 'GEMINI_API_KEY',
-                   'groq': 'GROQ_API_KEY', 'openrouter': 'OPENROUTER_API_KEY'}
-        key = settings.get('api_key') or os.environ.get(key_env.get(provider, 'OPENAI_API_KEY'))
-        if not key and provider == self.provider:
-            key = self.api_key
-        model = settings.get('model') or self.model_name
-        if not model or (not key and provider != 'ollama'):
-            return None
-        encoded = base64.b64encode(image_data).decode('ascii')
-        prompt = 'Прочитай текст на картинке. Верни только символы с картинки, без пояснений.'
+        """Resolve cropped image text with the available configured Vision providers."""
+        from vision_provider import VisionRouter
+        return VisionRouter(self).recognize(image_data)
+
+    def report_captcha_result(self, outcome):
+        from vision_provider import VisionRouter
         try:
-            timeout = min(60, max(1, int(settings.get('timeout_seconds', 20))))
-            if provider in ('gemini', 'google'):
-                from urllib.parse import quote
-                response = requests.post(
-                    'https://generativelanguage.googleapis.com/v1beta/models/'
-                    + quote(str(model), safe='') + ':generateContent',
-                    headers={'x-goog-api-key': key}, timeout=timeout,
-                    json={'contents': [{'parts': [{'text': prompt},
-                          {'inline_data': {'mime_type': 'image/png', 'data': encoded}}]}]})
-                response.raise_for_status()
-                answer = ''.join(p.get('text', '') for p in
-                                 response.json()['candidates'][0]['content']['parts'])
-            else:
-                base = (settings.get('base_url') or
-                        (self.base_url if provider == self.provider else '') or
-                        PROVIDER_BASE_URL.get(provider) or 'https://api.openai.com/v1')
-                response = requests.post(base.rstrip('/') + '/chat/completions',
-                    headers={'Authorization': f'Bearer {key or "ollama"}'}, timeout=timeout,
-                    json={'model': model, 'messages': [{'role': 'user', 'content': [
-                        {'type': 'text', 'text': prompt},
-                        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}
-                    ]}], 'max_completion_tokens': 64})
-                response.raise_for_status()
-                answer = response.json()['choices'][0]['message']['content']
-            answer = str(answer).strip()
-            return answer if re.fullmatch(r'[\w -]{1,32}', answer, re.UNICODE) else None
+            VisionRouter(self).feedback(outcome)
         except Exception as exc:
-            # Do not log responses/URLs: provider errors can contain API credentials.
-            logger.debug('Captcha recognition failed: %s', type(exc).__name__)
-            return None
+            logger.warning('Vision: не удалось сохранить результат проверки (%s)', type(exc).__name__)
 
     def generate_cover_letter(
         self,
@@ -2380,9 +2957,10 @@ class AIAssistant:
             "2. Обратись вежливо (Добрый день / Здравствуйте), укажи название позиции и компании.\n"
             "3. Выдели 2-3 ключевых навыка из профиля кандидата, которые напрямую пересекаются с требованиями вакансии.\n"
             "4. Подавай опыт уверенно и в пользу кандидата, опираясь на технические задачи этой позиции.\n"
-            "5. Заверши призывом к конструктивному диалогу.\n"
+            "5. Заверши коротким конкретным вопросом или предложением по задачам позиции, без дежурных фраз.\n"
             "6. Верни ТОЛЬКО текст письма, без кавычек, markdown-тегов и вводных фраз.\n"
             "7. Не придумывай проценты улучшений, числовые достижения и точный стаж по инструментам.\n"
+            + HUMAN_STYLE_RULES
             + EXPERIENCE_ANSWER_INSTRUCTIONS
         )
 
@@ -3000,7 +3578,8 @@ class AIAssistant:
         rejection_reason: str = ""
     ) -> Dict[str, Any]:
         """Выполняет глубокий анализ отказа и ATS-фильтров."""
-        profile = self.candidate_profile
+        # Сумма в разборе превращается в «ожидаю от N» в улучшенном письме — письма идут без суммы.
+        profile = {k: v for k, v in self.candidate_profile.items() if k != 'expected_salary'}
         candidate_skills = set(s.lower() for s in profile.get('skills', []))
         desc_lower = vacancy_description.lower()
 
@@ -3050,6 +3629,8 @@ class AIAssistant:
                 "Ты — старший эксперт по техническому рекрутингу и алгоритмам ATS (Applicant Tracking Systems) на HeadHunter.\n"
                 "Проанализируй, почему резюме кандидата получило отказ на вакансию, какие ATS-фильтры не прошли "
                 "и дай четкие, практические рекомендации: ЧТО И КАК ИСПРАВИТЬ в резюме.\n"
+                "Если работодатель не назвал причину, она неизвестна: возможные причины и срабатывание "
+                "ATS-фильтров обозначай только как гипотезы ИИ, не как слова или решения работодателя.\n"
                 "Верни ответ строго в формате JSON с полями:\n"
                 "{\n"
                 ' "ats_score": 0-100,\n'
@@ -3122,16 +3703,18 @@ class AIAssistant:
         vacancy_description: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
         cover_letter: str = "",
-        employer_messages: Optional[List[str]] = None
+        employer_messages: Optional[List[str]] = None,
+        deadline=None,
     ) -> Dict[str, Any]:
         """
         Выполняет глубокий ИИ-анализ переписки в чате с отказом:
-        - Истинная причина отказа (на основе сообщений работодателя и требований).
+        - Проверенная цитата причины отдельно от гипотезы ИИ.
         - Критика исходного сопроводительного письма соискателя.
         - Генерация улучшенного варианта сопроводительного письма под этот кейс.
         - Конкретные рекомендации по изменению резюме (навыки для добавления на HH.ru, раздел «О себе»).
         """
-        profile = self.candidate_profile
+        # Сумма в разборе превращается в «ожидаю от N» в улучшенном письме — письма идут без суммы.
+        profile = {k: v for k, v in self.candidate_profile.items() if k != 'expected_salary'}
         candidate_skills = set(s.lower() for s in profile.get('skills', []))
         desc_lower = vacancy_description.lower()
         emp_msgs = employer_messages or []
@@ -3160,7 +3743,11 @@ class AIAssistant:
                 "Ты — ведущий эксперт по техническому найму и аудиту откликов на HeadHunter.\n"
                 "Перед тобой реальная переписка соискателя с работодателем, завершившаяся отказом.\n"
                 "Твоя задача — объективно разобрать диалог:\n"
-                "1. Выявить реальную причину отказа (почему работодатель отклонил кандидатуру).\n"
+                "1. Отделить дословные слова работодателя от гипотезы ИИ о причине отказа. "
+                "В employer_reason_quote приведи точную цитату, прямо называющую причину. "
+                "Если есть лишь стандартный отказ или причина не названа, оставь пустую строку. "
+                "В rejection_root_cause явно укажи, что причина неизвестна, а возможное объяснение — гипотеза. "
+                "Не утверждай, что знаешь мысли или решение рекрутера.\n"
                 "2. Оценить исходное сопроводительное письмо соискателя: что в нем было слабым или упущенным.\n"
                 "3. Составить идеальное, максимально убедительное сопроводительное письмо (improved_cover_letter), "
                 "которое закрывает все ключевые требования вакансии и возражения работодателя.\n"
@@ -3185,7 +3772,8 @@ class AIAssistant:
                 "даже если они есть в профиле. Сохраняй технические задачи и инструменты.\n"
                 "Верни ответ СТРОГО в формате JSON:\n"
                 "{\n"
-                '  "rejection_root_cause": "краткое и точное описание причины отказа",\n'
+                '  "rejection_root_cause": "оценка или гипотеза ИИ, не слова работодателя",\n'
+                '  "employer_reason_quote": "точная цитата причины из сообщений работодателя или пустая строка",\n'
                 '  "cover_letter_critique": "разбор ошибок или слабых мест в исходном ответе",\n'
                 '  "improved_cover_letter": "готовый текст идеального сопроводительного письма",\n'
                 '  "missing_skills": ["навык 1", "навык 2", ...],\n'
@@ -3214,10 +3802,16 @@ class AIAssistant:
             )
 
             exp_years = profile.get('experience_years')
-            response_text = self._call_llm(
-                prompt, system_prompt,
-                validate=lambda txt: analysis_fabrication_problem(
-                    txt, prompt, exp_years, json.dumps(profile, ensure_ascii=False)))
+            attempts = []
+            token = _AI_ATTEMPTS.set(attempts)
+            try:
+                response_text = self._call_llm(
+                    prompt, system_prompt,
+                    deadline=deadline if deadline is not None else float('inf'),
+                    validate=lambda txt: analysis_fabrication_problem(
+                        txt, prompt, exp_years, json.dumps(profile, ensure_ascii=False)))
+            finally:
+                _AI_ATTEMPTS.reset(token)
             if response_text:
                 try:
                     match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -3227,6 +3821,7 @@ class AIAssistant:
                     logger.debug(f"Ошибка парсинга JSON чат-анализа: {e}")
 
         if llm_analysis and isinstance(llm_analysis, dict):
+            from db_manager import verified_employer_quote
             # Сохраняем новые навыки в адаптивную базу знаний
             new_skills = llm_analysis.get('missing_skills', missing_skills)
             if hasattr(self, 'db') and self.db and new_skills:
@@ -3235,11 +3830,13 @@ class AIAssistant:
             return {
                 "vacancy_title": vacancy_title,
                 "company_name": company_name,
+                "employer_reason_quote": verified_employer_quote(llm_analysis.get('employer_reason_quote'), emp_msgs),
+                "employer_messages": list(emp_msgs),
                 "rejection_root_cause": llm_analysis.get('rejection_root_cause', "Отказ работодателя по результатам рассмотрения"),
                 "cover_letter_critique": llm_analysis.get('cover_letter_critique', "Письмо содержало недостаточно конкретных примеров по стеку вакансии"),
                 # Запасное письмо — только если модель его не дала. Раньше аргумент
                 # .get() вычислялся всегда: на каждый разбор уходил ещё один запрос к ИИ.
-                "improved_cover_letter": clean_public_text(llm_analysis.get('improved_cover_letter'), self.candidate_profile) or self.generate_cover_letter(vacancy_title, company_name, vacancy_description, list(candidate_skills)),
+                "improved_cover_letter": clean_public_text(llm_analysis.get('improved_cover_letter'), self.candidate_profile) or self._heuristic_cover_letter(vacancy_title, company_name, vacancy_description, list(candidate_skills)),
                 "missing_skills": new_skills,
                 "about_me_recommendation": clean_public_text(llm_analysis.get('about_me_recommendation', ''), self.candidate_profile),
                 "experience_advice": clean_public_text(llm_analysis.get('experience_advice', "Сделать акцент на решении конкретных задач ИБ и результатах проверок"), self.candidate_profile),
@@ -3273,4 +3870,5 @@ class AIAssistant:
             # отказ откладывается до следующего запуска, а не пишется в базу
             # как разобранный.
             "heuristic": True,
+            "ai_attempts": attempts if self.enabled else [],
         }

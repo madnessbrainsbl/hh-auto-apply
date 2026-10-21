@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 import pytest
 
@@ -63,7 +63,8 @@ def test_filter_blocks_before_letter_or_response_click(decision, monkeypatch):
     success, reason = bot.apply_to_vacancy('https://hh.ru/vacancy/123', 'Python')
     assert not success and reason.startswith('AI-фильтр:')
     bot.ai_assistant.generate_cover_letter.assert_not_called()
-    bot.driver.find_elements.assert_not_called()
+    bot.driver.find_elements.assert_called_once_with(
+        hh_selenium.By.CSS_SELECTOR, 'form[data-qa="account-login-form"]')
     assert bot.skipped == 1
     assert bot.save_applied.call_count == (1 if decision is False else 0)
     assert bot.db.record_skipped_vacancy.call_args.kwargs['reason'] == (
@@ -88,6 +89,18 @@ def test_vision_request_contains_only_crop(provider, monkeypatch):
     assert ai.recognize_captcha(b'png-crop') is None
 
 
+def test_vision_provider_failure_is_actionable_without_leaking_credentials(monkeypatch, caplog):
+    import requests
+    ai = assistant()
+    ai.config['captcha'] = {'enabled': True, 'provider': 'gemini', 'model': 'vision-test', 'api_key': 'private-test-key'}
+    response = MagicMock(status_code=403)
+    response.raise_for_status.side_effect = requests.HTTPError('private-test-key', response=response)
+    monkeypatch.setattr(requests, 'post', MagicMock(return_value=response))
+    assert ai.recognize_captcha(b'png-crop') is None
+    assert 'HTTP 403' in caplog.text and 'Vision' in caplog.text
+    assert 'private-test-key' not in caplog.text
+
+
 def test_vision_captcha_submits_and_verifies(monkeypatch):
     bot = HHSeleniumBot.__new__(HHSeleniumBot)
     bot.config = {'captcha': {'enabled': True}}
@@ -97,13 +110,15 @@ def test_vision_captcha_submits_and_verifies(monkeypatch):
     bot.page_has_captcha = MagicMock(return_value=False)
     picture, field = MagicMock(), MagicMock()
     picture.screenshot_as_png = b'crop'
-    bot.driver.find_elements.side_effect = [[picture], [field], []]
+    bot.driver.find_elements.side_effect = [[picture], [field], [picture], [field], []]
+    field.get_attribute.return_value = 'Ab123'
     bot.ai_assistant = MagicMock()
     bot.ai_assistant.recognize_captcha.return_value = 'Ab123'
     assert bot.try_vision_captcha() is True
     bot.ai_assistant.recognize_captcha.assert_called_once_with(b'crop')
     field.send_keys.assert_any_call('Ab123')
-    assert field.send_keys.call_count == 2
+    field.send_keys.assert_any_call(hh_selenium.Keys.ENTER)
+    field.clear.assert_not_called()
     bot.driver.current_url = 'https://example.test/'
     assert bot.try_vision_captcha() is False
 
@@ -113,7 +128,10 @@ def test_vision_retries_are_bounded(monkeypatch):
     bot.config = {'captcha': {'enabled': True, 'max_attempts': 100}}
     bot.driver = MagicMock()
     bot.driver.current_url = 'https://hh.ru/account/captcha'
-    bot.driver.find_elements.return_value = [MagicMock()]
+    element = MagicMock()
+    element.screenshot_as_png = b'crop'
+    element.get_attribute.return_value = '1234'
+    bot.driver.find_elements.return_value = [element]
     bot.check_interactive_controls = MagicMock(return_value=None)
     bot.ai_assistant = MagicMock()
     bot.ai_assistant.recognize_captcha.return_value = '1234'
@@ -122,6 +140,61 @@ def test_vision_retries_are_bounded(monkeypatch):
     monkeypatch.setattr(hh_selenium, 'WebDriverWait', lambda *_: wait)
     assert bot.try_vision_captcha() is False
     assert bot.ai_assistant.recognize_captcha.call_count == 3
+
+
+def test_changed_challenge_is_not_filled_with_a_stale_vision_answer():
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.config = {'captcha': {'enabled': True}}
+    bot.driver = MagicMock()
+    bot.driver.current_url = 'https://hh.ru/account/captcha'
+    bot.check_interactive_controls = MagicMock(return_value=None)
+    picture, field = MagicMock(), MagicMock()
+    type(picture).screenshot_as_png = PropertyMock(
+        side_effect=[b'first-image', b'new-image'])
+    bot.driver.find_elements.side_effect = [[picture], [field], [picture], [field]]
+    bot.ai_assistant = MagicMock()
+    bot.ai_assistant.recognize_captcha.return_value = 'Ab123'
+    assert bot.try_vision_captcha() is False
+    field.send_keys.assert_not_called()
+    assert bot._captcha_attempts[-1]['outcome'] == 'challenge_changed'
+
+
+@pytest.mark.parametrize('value,expected', [('different', 'input_mismatch'),
+                                         ('Ab123', 'server_rejected')])
+def test_vision_distinguishes_input_failure_from_server_rejection(value, expected, monkeypatch):
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.config = {'captcha': {'enabled': True, 'max_attempts': 1}}
+    bot.driver = MagicMock()
+    bot.driver.current_url = 'https://hh.ru/account/captcha'
+    bot.check_interactive_controls = MagicMock(return_value=None)
+    picture, field, error = MagicMock(), MagicMock(), MagicMock()
+    picture.screenshot_as_png = b'crop'
+    field.get_attribute.return_value = value
+    error.text = 'Неверный текст. Пожалуйста, повторите попытку.'
+    bot.driver.find_elements.side_effect = [[picture], [field], [picture], [field], [error]]
+    bot.ai_assistant = MagicMock()
+    bot.ai_assistant.recognize_captcha.return_value = 'Ab123'
+    bot.ai_assistant.last_captcha_source = {'provider': 'test', 'model': 'vision',
+                                            'seconds': 1.2, 'api_key': 'private-key'}
+    wait = MagicMock()
+    wait.until.side_effect = hh_selenium.TimeoutException()
+    monkeypatch.setattr(hh_selenium, 'WebDriverWait', lambda *_: wait)
+    assert bot.try_vision_captcha() is False
+    submitted = any(call.args == (hh_selenium.Keys.ENTER,) for call in field.send_keys.call_args_list)
+    assert submitted == (expected == 'server_rejected')
+    assert bot._captcha_attempts[-1]['outcome'] == expected
+    record = json.dumps(bot._captcha_attempts)
+    assert 'Ab123' not in record and 'private-key' not in record
+    files = list(Path(hh_selenium.SCRIPT_DIR, '.apply_diagnostics').glob('*-vision-attempts.json'))
+    saved = json.loads(files[0].read_text(encoding='utf-8'))
+    assert saved['attempts'][-1]['outcome'] == expected
+    assert saved['attempts'][-1]['expected_length'] == 5
+    assert saved['attempts'][-1]['input_length'] == len(value)
+    assert 'Ab123' not in files[0].read_text(encoding='utf-8')
+    if expected == 'input_mismatch':
+        bot.ai_assistant.report_captcha_result.assert_not_called()
+    else:
+        bot.ai_assistant.report_captcha_result.assert_called_once_with('server_rejected')
 
 
 def test_profile_paths_and_lock(tmp_path):
@@ -245,7 +318,9 @@ def test_scheduler_waits_between_completed_runs(monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get('HH_BROWSER_SMOKE') != '1', reason='Run explicitly with HH_BROWSER_SMOKE=1')
-def test_captcha_in_real_chrome(tmp_path, monkeypatch):
+@pytest.mark.parametrize('post_dispatch', [False, True])
+@pytest.mark.parametrize('controlled', [False, True])
+def test_captcha_in_real_chrome(tmp_path, monkeypatch, post_dispatch, controlled):
     from urllib.parse import quote
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -255,9 +330,11 @@ def test_captcha_in_real_chrome(tmp_path, monkeypatch):
     options.add_argument('--window-size=1280,900')
     options.add_argument(f'--user-data-dir={tmp_path / "chrome"}')
     svg = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="white"/><text x="10" y="40" font-size="28">Ab123</text></svg>'
+    input_attrs = (' value="old" data-state="old" onchange="this.value=this.dataset.state" '
+                   'oninput="this.dataset.state=this.value"' if controlled else '')
     html = ('<form onsubmit="event.preventDefault(); if(this.elements[0].value === \'Ab123\') this.remove()">'
             '<img data-qa="account-captcha-picture" src="data:image/svg+xml,' + quote(svg) + '">'
-            '<input data-qa="account-captcha-input"><button type="submit">OK</button></form>')
+            '<input data-qa="account-captcha-input"' + input_attrs + '><button type="submit">OK</button></form>')
     driver = webdriver.Chrome(options=options)
     try:
         driver.get('data:text/html;charset=utf-8,' + quote(html))
@@ -271,7 +348,24 @@ def test_captcha_in_real_chrome(tmp_path, monkeypatch):
             assert png.startswith(b'\x89PNG') and len(png) > 100
             return 'Ab123'
         bot.ai_assistant.recognize_captcha.side_effect = recognize
-        assert bot.try_vision_captcha() is True
+        if post_dispatch:
+            bot.headless = True
+            bot.stop_requested = False
+            bot.wait_for_response_state = MagicMock(side_effect=['blocked', 'success'])
+            bot.get_response_blocker_message = lambda: 'Требуется капча' if bot.page_has_captcha() else None
+            bot.handle_warning_popups = lambda: False
+            bot.build_success_message = lambda *_: 'confirmed'
+            bot.submit_open_response_modal = MagicMock()
+            bot.click_lowest_visible_apply_button = MagicMock()
+            bot.show_browser_for_captcha = MagicMock()
+            url = driver.current_url
+            assert bot.confirm_response_submission('', True, 0, modal_submitted=True) == (True, 'confirmed')
+            assert driver.current_url == url
+            bot.submit_open_response_modal.assert_not_called()
+            bot.click_lowest_visible_apply_button.assert_not_called()
+            bot.show_browser_for_captcha.assert_not_called()
+        else:
+            assert bot.try_vision_captcha() is True
         assert bot.page_has_captcha() is False
     finally:
         driver.quit()

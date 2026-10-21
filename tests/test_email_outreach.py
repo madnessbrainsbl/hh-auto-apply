@@ -10,7 +10,7 @@ import pytest
 
 import email_outreach
 
-PASSWORD = "fixture-password-123"
+PASSWORD = 'SeCrEt-app-pass-123'
 
 
 @pytest.fixture(autouse=True)

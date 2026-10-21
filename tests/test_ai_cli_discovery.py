@@ -35,7 +35,7 @@ def test_cli_weekly_quota_is_reported_even_with_stderr_warning(tmp_path, monkeyp
     assistant.find_cli = lambda _name: 'synthetic-cli'
     result = subprocess.CompletedProcess(
         [], 1, b"You've hit your weekly limit", b'synthetic startup warning')
-    monkeypatch.setattr('subprocess.run', Mock(return_value=result))
+    monkeypatch.setattr('cli_models.run_cli_process', Mock(return_value=result))
 
     assert assistant._call_cli_providers('synthetic prompt', None) is None
     assert 'недельная квота' in caplog.text

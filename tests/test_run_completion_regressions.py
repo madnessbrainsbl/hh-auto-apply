@@ -35,6 +35,18 @@ def open_form(driver, tmp_path, html):
     return bot
 
 
+def test_offscreen_native_delivery_controls_confirm_response(local_browser, tmp_path):
+    bot = open_form(local_browser, tmp_path, '''
+      <button data-qa="vacancy-response-link-top-again">Откликнуться другим резюме</button>
+      <button data-qa="vacancy-response-link-view-topic">Чат</button>
+      <div style="height:3000px"></div><p>Резюме доставлено</p>''')
+    local_browser.execute_script('window.scrollTo(0, document.body.scrollHeight)')
+    assert bot.get_visible_response_state()['controls'] == []
+    assert bot.detect_response_state() == 'success'
+    local_browser.execute_script("document.querySelectorAll('button').forEach(el => el.hidden = true)")
+    assert bot.detect_response_state() == 'unknown'
+
+
 def test_checkbox_batch_mismatch_asks_for_available_options(local_browser, tmp_path):
     bot = open_form(local_browser, tmp_path, '''
       <div id="q">Оцените уровень работы с Linux:
@@ -179,6 +191,108 @@ def test_application_ui_diagnostic_failure_does_not_hide_problem(tmp_path, monke
     message = bot.application_ui_problem('apply_button_missing', 'Кнопка недоступна')
     assert 'apply_button_missing' in message and 'PRIVATE_EXCEPTION' not in message
     assert 'не удалось сохранить' in message
+
+
+def test_diagnostics_never_use_submit_button_as_dialog(local_browser, tmp_path, monkeypatch):
+    import hh_selenium
+    monkeypatch.setattr(hh_selenium, 'SCRIPT_DIR', str(tmp_path))
+    bot = open_form(local_browser, tmp_path, '''
+      <form><label>Технический вопрос<input name="answer"></label>
+        <button data-qa="vacancy-response-submit-popup">Откликнуться</button></form>''')
+    bot.application_ui_problem('questionnaire_unreadable', 'Synthetic diagnostic')
+    data = json.loads(next((tmp_path / '.apply_diagnostics').glob('*.json')).read_text(encoding='utf-8'))
+    assert data['dom']['modals'] == []
+    assert any(n['tag'] == 'INPUT' for n in data['dom']['nodes'])
+
+
+@pytest.mark.parametrize('scenario', ['empty', 'unrecognized_field', 'unrecognized_textarea', 'dispatch_pending', 'wrong_vacancy'])
+def test_full_response_page_guards_and_letter_readback(local_browser, tmp_path, monkeypatch, scenario):
+    import hh_selenium
+    bot = open_form(local_browser, tmp_path, '''
+      <h1>Отклик на вакансию</h1><p>Для отклика необходимо ответить на несколько вопросов работодателя</p>
+      <form><span data-qa="resume-title">Application Security Engineer</span>
+        <textarea name="letter"></textarea>
+        <button data-qa="vacancy-response-submit-popup" type="button" onclick="
+          window.clicks=(window.clicks||0)+1;
+          window.submittedLetter=document.querySelector('textarea').value;">Откликнуться</button></form>''')
+    if scenario == 'unrecognized_field':
+        local_browser.execute_script("document.querySelector('form').insertAdjacentHTML('afterbegin','<input required name=unrecognized>')")
+    if scenario == 'unrecognized_textarea':
+        local_browser.execute_script("document.querySelector('form').insertAdjacentHTML('afterbegin','<textarea required name=unrecognized></textarea>')")
+        # Even a broad legacy letter heuristic cannot authorize an unknown answer field.
+        bot.find_cover_letter_fields = lambda: local_browser.find_elements(By.CSS_SELECTOR, 'textarea')
+    virtual_url = 'https://hh.ru/applicant/vacancy_response?vacancyId=' + ('1234' if scenario == 'wrong_vacancy' else '123')
+    # Keep all navigation local while exercising the application's trusted-URL shape.
+    monkeypatch.setattr(type(local_browser), 'current_url', property(lambda _: virtual_url))
+    monkeypatch.setattr(local_browser, 'get', Mock())
+    ticks = iter(range(0, 10000, 10))
+    monkeypatch.setattr(hh_selenium.time, 'time', lambda: next(ticks))
+    monkeypatch.setattr(hh_selenium.time, 'sleep', lambda _: None)
+    monkeypatch.setattr('config_manager.get_active_resume', lambda: ('target', 'Application Security Engineer'))
+    bot.current_vacancy_id = lambda: '123'
+    bot.unanswered_questions = []
+    bot.letter_skip_reason = ''
+    bot.open_cover_letter_in_modal = Mock()
+    bot.get_response_blocker_message = lambda: None
+    bot.detect_response_state = lambda: 'unknown' if scenario == 'dispatch_pending' else 'success'
+    bot.application_ui_problem = lambda code, detail: code
+    result = bot.apply_on_response_page('Synthetic cover letter', True)
+    expected = scenario in ('empty', 'dispatch_pending')
+    assert result[0] is expected
+    assert local_browser.execute_script('return window.clicks||0') == int(expected)
+    if expected:
+        assert result[1] is True
+        assert local_browser.execute_script('return submittedLetter') == 'Synthetic cover letter'
+    if scenario == 'dispatch_pending':
+        assert result[3] is None  # Dispatched, not yet confirmed: caller must only observe.
+
+
+@pytest.mark.parametrize('mode', ['confirmed_after_reload', 'still_unknown', 'draft', 'open_modal', 'wrong_vacancy'])
+def test_confirmation_readback_never_dispatches_a_second_application(monkeypatch, mode):
+    import hh_selenium
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.driver = Mock()
+    bot.driver.current_url = 'https://hh.ru/vacancy/' + ('999' if mode == 'wrong_vacancy' else '123')
+    bot.driver.execute_script.return_value = mode != 'draft'
+    bot.last_application_meta = {'url': 'https://spb.hh.ru/vacancy/123'}
+    bot.handle_warning_popups = lambda: False
+    bot.get_response_blocker_message = lambda: None
+    bot.find_response_modal = lambda: Mock() if mode == 'open_modal' else None
+    bot.get_visible_page_text = lambda: ''
+    states = iter(['ready'] * 2 + ['success'])
+    bot.wait_for_response_state = lambda: next(states) if mode == 'confirmed_after_reload' else 'ready'
+    bot.build_success_message = lambda *_: 'confirmed'
+    bot.application_ui_problem = Mock(return_value='diagnostic')
+    bot.submit_open_response_modal = Mock()
+    bot.click_lowest_visible_apply_button = Mock()
+    monkeypatch.setattr(hh_selenium.time, 'sleep', lambda _: None)
+    result = bot.confirm_response_submission('Synthetic letter', True, 0, modal_submitted=True)
+    assert result[0] is (mode == 'confirmed_after_reload')
+    assert bot.driver.get.call_count == int(mode in ('confirmed_after_reload', 'still_unknown'))
+    bot.submit_open_response_modal.assert_not_called()
+    bot.click_lowest_visible_apply_button.assert_not_called()
+    if not result[0]:
+        assert hh_selenium.APPLY_NOT_CONFIRMED_MARKER in result[1]
+
+
+def test_login_gate_is_not_persisted_as_a_permanent_skip(tmp_path):
+    from hh_selenium import LOGIN_FORM_SKIP_MESSAGE
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.config = {'skip_applied': False}
+    bot.applied_vacancies = {}
+    bot.applied_today = bot.skipped = bot.errors = 0
+    bot.stop_requested = False
+    bot.check_interactive_controls = lambda: None
+    bot.local_application_limit_reached = lambda: False
+    bot.employer_is_blocked = lambda *_: False
+    bot.is_api_vacancy_suitable = lambda _: (True, '')
+    bot.random_delay = lambda _: None
+    bot.delay_between_vacancies = (0, 0)
+    bot.save_applied = Mock()
+    bot.apply_to_vacancy = Mock(return_value=(False, LOGIN_FORM_SKIP_MESSAGE))
+    bot.process_api_vacancies([{'id': '42', 'name': 'AppSec', 'alternate_url': 'https://hh.ru/vacancy/42', 'employer': {}}])
+    bot.save_applied.assert_not_called()
+    assert bot.skipped == 1 and not bot.applied_vacancies
 
 
 def test_unread_resume_guard_saves_diagnostic_without_clicking(local_browser, tmp_path, monkeypatch):

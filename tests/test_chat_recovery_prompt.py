@@ -113,3 +113,86 @@ def test_user_closed_browser_does_not_offer_recovery(analyzer, monkeypatch):
     monkeypatch.setattr(builtins, 'input', ask)
     assert module.run_chat_analysis_with_recovery(analyzer)['status'] == 'user_closed'
     ask.assert_not_called()
+
+
+def test_unread_only_cli_cannot_analyze_or_save_resume(analyzer, monkeypatch):
+    analyzer.config = {}
+    analyzer.messenger_summary = {'viewed': 0, 'sent': 0, 'complete': True}
+    analyzer._chat_preparation_intervals = []
+    analyzer._chat_confirmed_keys = []
+    analyzer._load_chat_actions.return_value = {}
+    monkeypatch.setattr(module, 'RejectionAnalyzer', lambda: analyzer)
+    monkeypatch.setattr(module, 'auto_apply_resume_enabled', Mock(side_effect=AssertionError('No resume mode')))
+    module.run_rejection_analysis_cli(['--unread-chats-only', '--show-browser'])
+    analyzer.process_unread_messenger_chats.assert_called_once_with(max_chats=0)
+    analyzer.run_chat_analysis.assert_not_called()
+    analyzer.run_analysis.assert_not_called()
+    assert analyzer.auto_apply_skills is False
+    assert analyzer.headless is False
+    analyzer.close.assert_called_once()
+
+
+@pytest.mark.parametrize('args,limit', [([], 4), (['--limit', '9'], 9)])
+def test_input_inspection_cli_never_analyzes_or_sends(analyzer, monkeypatch, args, limit):
+    analyzer.config = {}
+    monkeypatch.setattr(module, 'RejectionAnalyzer', lambda: analyzer)
+    monkeypatch.setattr(module, 'auto_apply_resume_enabled', Mock(side_effect=AssertionError('No resume mode')))
+    module.run_rejection_analysis_cli(['--inspect-chat-inputs', '--show-browser'] + args)
+    analyzer.inspect_chat_inputs.assert_called_once_with(limit=limit)
+    analyzer.process_unread_messenger_chats.assert_not_called()
+    analyzer.run_chat_analysis.assert_not_called()
+    analyzer.run_analysis.assert_not_called()
+    analyzer.send_chat_reply.assert_not_called()
+    assert analyzer.auto_apply_skills is False
+    analyzer.close.assert_called_once()
+
+
+def test_resume_draft_cli_scopes_actions_to_selected_chat(analyzer, monkeypatch):
+    analyzer.config = {}
+    analyzer.resume_chat_draft.return_value = {'status': 'not_completed', 'sent': 0}
+    monkeypatch.setattr(module, 'RejectionAnalyzer', lambda: analyzer)
+    monkeypatch.setattr(module, 'auto_apply_resume_enabled', Mock(side_effect=AssertionError('No resume mode')))
+    module.run_rejection_analysis_cli(['--resume-chat-draft', 'abcdef123456', '--show-browser'])
+    analyzer.resume_chat_draft.assert_called_once_with('abcdef123456')
+    analyzer.process_unread_messenger_chats.assert_not_called()
+    analyzer.run_chat_analysis.assert_not_called()
+    analyzer.run_analysis.assert_not_called()
+    assert analyzer.auto_apply_skills is False
+    analyzer.close.assert_called_once()
+
+
+def test_script_lazy_import_reuses_module_and_log_handler():
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = r'''
+import importlib
+import logging
+import runpy
+import sys
+
+class NoFile(logging.NullHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+logging.FileHandler = NoFile
+
+def before_cli(frame, event, arg):
+    if event == 'call' and frame.f_code.co_name == 'run_rejection_analysis_cli':
+        imported = importlib.import_module('rejection_analyzer')
+        assert imported is sys.modules['__main__'], 'Script imported a second copy of itself'
+        assert sum(isinstance(h, NoFile) for h in imported.logger.handlers) == 1
+        print('single-module')
+        raise SystemExit(0)
+
+# Stop before configuration, database, browser or provider initialization.
+sys.setprofile(before_cli)
+runpy.run_path('rejection_analyzer.py', run_name='__main__')
+'''
+    result = subprocess.run([sys.executable, '-c', script], cwd=Path(module.__file__).parent,
+                            capture_output=True, text=True, timeout=30,
+                            env=dict(os.environ, PYTHONUTF8='1'))
+    assert result.returncode == 0, result.stderr
+    assert 'single-module' in result.stdout

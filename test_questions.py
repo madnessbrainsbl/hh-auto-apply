@@ -3,13 +3,12 @@
 
 Запуск: python test_questions.py
 
-Ветки отправки и заполнения анкеты проверяются на подставном драйвере,
-без реальных вакансий и переписки.
+Живьём такие вакансии встречаются нечасто — в выдаче по ИБ их около 84 из
+нескольких сотен (см. vacancies_with_tests.json). Ждать, пока прогон на них
+наткнётся, дорого, поэтому ветки проверяются на подставном драйвере.
 """
 import os
 import sys
-from types import SimpleNamespace
-from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,14 +27,14 @@ def _bot(config=None):
 
 def test_custom_answer_from_config():
     """Ответ из конфига подбирается по ключевому слову в вопросе."""
-    b = _bot({'answer_policy': {'yes_to_conditions': False}, 'question_answers': {
-        'опыт работы': 'Применял SIEM для мониторинга.',
+    b = _bot({'question_answers': {
+        'опыт работы': '6 лет',
         'готовы к переезду': 'Нет',
     }})
-    assert b.get_answer_for_question('Какой у вас опыт работы в ИБ?') == 'Применял SIEM для мониторинга.'
+    assert b.get_answer_for_question('Какой у вас опыт работы в ИБ?') == '6 лет'
     assert b.get_answer_for_question('Готовы к переезду в Москву?') == 'Нет'
     # регистр вопроса роли не играет
-    assert b.get_answer_for_question('ОПЫТ РАБОТЫ?') == 'Применял SIEM для мониторинга.'
+    assert b.get_answer_for_question('ОПЫТ РАБОТЫ?') == '6 лет'
 
 
 def test_unknown_question_is_not_guessed():
@@ -114,26 +113,13 @@ def test_success_message_never_silent_about_reason():
     assert msg.rstrip().endswith(('определена', 'определена.')) or len(msg) > len('Отклик отправлен БЕЗ письма: ')
 
 
-def _questionnaire_bot():
-    b = _bot()
-    b.driver = SimpleNamespace(current_url='https://hh.ru/vacancy/42')
-    b.driver.get = lambda url: setattr(b.driver, 'current_url', url)
-    b.current_vacancy_id = lambda: '42'
-    b.collect_question_blocks = lambda: [object()]
-    b.open_cover_letter_in_modal = lambda: None
-    b.fill_cover_letter = lambda *args, **kwargs: False
-    b.get_response_blocker_message = lambda: None
-    b.detect_response_state = lambda: 'success'
-    return b
-
-
 def test_questionnaire_page_branch():
     """Вакансия с анкетой открывается отдельной страницей, без модалки.
 
     Ветка обязана: ответить на вопросы, отметить причину отсутствия письма
     и нажать кнопку отклика на самой странице.
     """
-    b = _questionnaire_bot()
+    b = _bot()
     calls = {'answered': 0, 'clicked': False}
 
     b.find_response_modal = lambda wait_seconds=2: None
@@ -150,8 +136,7 @@ def test_questionnaire_page_branch():
         return True
     b.click_lowest_visible_apply_button = fake_click
 
-    with patch('hh_selenium.time.sleep'):
-        ok, letter_sent, answered, err = b.submit_open_response_modal('текст письма', False)
+    ok, letter_sent, answered, err = b.submit_open_response_modal('текст письма', False)
 
     assert ok is True, f'отклик через анкету не прошёл: {err}'
     assert answered == 2
@@ -160,14 +145,13 @@ def test_questionnaire_page_branch():
     assert 'анкет' in b.letter_skip_reason.lower()
 
 
-
 def test_questionnaire_blocks_apply_when_unanswered():
     """Есть неотвеченный вопрос — отклик не отправляется.
 
     Отправить анкету с пустым обязательным полем значит засветиться у
     работодателя с недозаполненной формой.
     """
-    b = _questionnaire_bot()
+    b = _bot()
     b.find_response_modal = lambda wait_seconds=2: None
     clicked = {'yes': False}
 
@@ -181,13 +165,11 @@ def test_questionnaire_blocks_apply_when_unanswered():
         return True
     b.click_lowest_visible_apply_button = fake_click
 
-    with patch('hh_selenium.time.sleep'):
-        ok, letter_sent, answered, err = b.submit_open_response_modal('текст', False)
+    ok, letter_sent, answered, err = b.submit_open_response_modal('текст', False)
 
     assert ok is False, 'отклик ушёл с неотвеченным вопросом'
     assert not clicked['yes'], 'кнопка нажата, хотя вопрос без ответа'
     assert err and 'КИИ' in err, f'пользователю не показано, что именно осталось без ответа: {err}'
-
 
 
 def test_neutral_fallback_when_configured():
@@ -202,9 +184,9 @@ def test_neutral_fallback_when_configured():
               'neutral_answer': 'Готов обсудить этот вопрос на собеседовании'})
     ans = b.get_answer_for_question('Какой ваш любимый цвет?')
     assert ans == 'Готов обсудить этот вопрос на собеседовании'
-    # На вопрос о зарплате действует нейтральная политика условий, даже при готовом ответе.
+    # готовый ответ из конфига важнее нейтрального — но про деньги только без суммы
     b.config['question_answers'] = {'зарплат': 'Готов обсудить, какая вилка у позиции?'}
-    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'Готов обсудить условия на следующем этапе.'
+    assert b.get_answer_for_question('Ваши зарплатные ожидания?') == 'Готов обсудить, какая вилка у позиции?'
     b.config['question_answers'] = {'зарплат': 'от 180 000 руб.'}
     assert not any(ch.isdigit() for ch in b.get_answer_for_question('Ваши зарплатные ожидания?'))
 
@@ -249,8 +231,6 @@ def test_multi_checkbox_marks_everything_model_named():
         def __init__(self, label): self.label = label; self.id = id(self); self.sel = False
         def is_selected(self): return self.sel
         def is_displayed(self): return True
-        def get_attribute(self, key):
-            return {'id': str(self.id), 'type': 'checkbox', 'value': self.label}.get(key, '')
 
     class Block:
         def __init__(self, text, boxes): self.text = text; self._c = [El(x) for x in boxes]
@@ -258,7 +238,6 @@ def test_multi_checkbox_marks_everything_model_named():
             return self._c if 'checkbox' in sel else []
 
     b = _bot({'question_answers': {}})
-    b.driver = SimpleNamespace(execute_script=lambda *args: None)
     b.get_option_label = lambda el: el.label
     clicked = []
     def click(el):

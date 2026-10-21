@@ -15,6 +15,7 @@ def make_bot(headless=False, pages=()):
     bot.stop_requested = False
     bot.check_interactive_controls = MagicMock(return_value=None)
     bot.get_visible_page_text = MagicMock(side_effect=list(pages))
+    bot.page_has_captcha = MagicMock(side_effect=[p == 'подтвердите, что вы не робот' for p in pages])
     return bot
 
 
@@ -33,11 +34,30 @@ def test_headless_returns_false_and_hints_once(monkeypatch, caplog):
     bot.get_visible_page_text.assert_not_called()
 
 
+def test_post_dispatch_headless_tries_vision_without_restarting_browser():
+    bot = make_bot(headless=True)
+    bot.try_vision_captcha = MagicMock(return_value=False)
+    bot.show_browser_for_captcha = MagicMock()
+    assert bot.wait_for_human_captcha(allow_browser_restart=False) is False
+    bot.try_vision_captcha.assert_called_once()
+    bot.show_browser_for_captcha.assert_not_called()
+    bot.driver.quit.assert_not_called()
+
+
+def test_post_dispatch_vision_success_needs_no_manual_wait():
+    bot = make_bot(headless=True)
+    bot.try_vision_captcha = MagicMock(return_value=True)
+    bot.show_browser_for_captcha = MagicMock()
+    assert bot.wait_for_human_captcha(allow_browser_restart=False) is True
+    bot.page_has_captcha.assert_not_called()
+    bot.show_browser_for_captcha.assert_not_called()
+
+
 def test_returns_true_when_captcha_gone(monkeypatch):
     no_sleep(monkeypatch)
     bot = make_bot(pages=['подтвердите, что вы не робот', 'подтвердите, что вы не робот', 'вакансия'])
     assert bot.wait_for_human_captcha() is True
-    assert bot.get_visible_page_text.call_count == 3
+    assert bot.page_has_captcha.call_count == 3
 
 
 def test_stop_request_aborts_wait(monkeypatch):
@@ -123,6 +143,8 @@ def test_word_captcha_in_vacancy_text_is_not_a_captcha():
     """07.10 VillaCarte: «CAPTCHA» в описании вакансии принималось за проверку hh."""
     bot = make_bot(pages=['senior information security engineer: защита сайтов, recaptcha, captcha, waf'])
     bot.driver.find_elements.return_value = []
-    assert bot.page_has_captcha() is False
-    bot = make_bot(pages=['подтвердите, что вы не робот'])
-    assert bot.page_has_captcha() is True
+    assert HHSeleniumBot.page_has_captcha(bot) is False
+    control = MagicMock()
+    control.is_displayed.return_value = True
+    bot.driver.find_elements.return_value = [control]
+    assert HHSeleniumBot.page_has_captcha(bot) is True

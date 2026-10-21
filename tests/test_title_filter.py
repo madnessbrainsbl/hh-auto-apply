@@ -9,6 +9,32 @@ import pytest
 import test as menu
 from hh_selenium import HHSeleniumBot
 
+
+@pytest.mark.parametrize('title, expected', [
+    ('Ведущий инженер / Системный архитектор (BESS/ESS)', False),
+    ('Технолог-разработчик (пищевое производство)', False),
+    ('Разработчик кондитерских изделий', False),
+    ('Ведущий химик-технолог / Разработчик рецептур автомасел', False),
+    ('Технолог - разработчик (проектный технолог)', False),
+    ('Application Security Engineer (химическое производство)', True),
+    ('Application Security Engineer (BESS)', True),
+    ('Application Security Engineer (пищевое производство)', True),
+    ('Разработчик Salesforce', True),
+    ('Системный архитектор', True),
+])
+def test_energy_systems_are_not_it_fallback(title, expected, monkeypatch):
+    import config_manager
+    monkeypatch.setattr(config_manager, 'get_active_preset', lambda: {'id': 'security'})
+    monkeypatch.setattr(menu, 'get_active_preset', lambda: {'id': 'security'})
+    monkeypatch.setattr(menu, 'title_excludes', lambda: ('фотограф',))
+    bot = HHSeleniumBot.__new__(HHSeleniumBot)
+    bot.config = {'keywords_exclude': ['фотограф'], 'allow_technical_fallback': True}
+    assert menu.validate_apply_title(title)[0] is expected
+    assert bot.validate_security_title(title)[0] is expected
+    applicant = menu.HHAutoApplicant.__new__(menu.HHAutoApplicant)
+    applicant.allow_technical_fallback = True
+    assert applicant.is_vacancy_suitable({'name': title}) is expected
+
 TITLES = {
     'Ведущий инженер-проектировщик (прикладные и хостовые СрЗИ)': True,
     'Эксперт SOAR': True,

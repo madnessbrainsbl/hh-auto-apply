@@ -196,6 +196,111 @@ def test_chat_analysis_reports_waiting_without_repeating_requests(analyzer, monk
     assert summary['total_analyzed'] == 0
 
 
+def test_chat_analysis_does_not_drop_remaining_chats_after_five_minutes(analyzer, monkeypatch, caplog):
+    import rejection_analyzer as module
+    from unittest.mock import Mock
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    chats = [{'vacancy_title': 'AppSec', 'company_name': f'Synthetic {i}'} for i in range(10)]
+    analyzer._load_cached_chats = lambda limit=0: list(chats)
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.probe_report = lambda: ''
+    def analyze(**kwargs):
+        assert kwargs.get('deadline') is None
+        clock[0] += 301
+        return {'rejection_root_cause': 'Synthetic reason'}
+    call = Mock(side_effect=analyze)
+    analyzer.ai_assistant.analyze_chat_rejection = call
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    with caplog.at_level('INFO', logger='rejection_analyzer'):
+        result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert call.call_count == 10
+    assert result['total_deferred'] == 0
+    assert result['total_analyzed'] == 10
+    assert analyzer.db.record_rejection_analysis.call_count == 10
+    assert len(analyzer._load_cached_chats()) == 10
+    assert 'Время этапа разбора исчерпано' not in caplog.text
+
+
+def test_failed_parallel_analysis_is_retried_after_other_jobs_finish(analyzer):
+    from collections import Counter
+    from threading import Lock
+    from unittest.mock import Mock
+    chats = [{'vacancy_title': 'AppSec', 'company_name': f'Synthetic {i}'} for i in range(9)]
+    analyzer._load_cached_chats = lambda limit=0: list(chats)
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.enabled = True
+    analyzer.ai_assistant.probe_report = lambda: ''
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    calls, guard = Counter(), Lock()
+    def analyze(**kwargs):
+        company = kwargs['company_name']
+        with guard:
+            calls[company] += 1
+            attempt = calls[company]
+            if attempt > 1:
+                assert all(calls[c['company_name']] >= 1 for c in chats)
+        return {'heuristic': True} if attempt == 1 else {'rejection_root_cause': 'Synthetic reason'}
+    analyzer.ai_assistant.analyze_chat_rejection = analyze
+    result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert result['total_analyzed'] == 9
+    assert result['total_deferred'] == 0
+    assert all(n == 2 for n in calls.values())
+    assert analyzer.db.record_rejection_analysis.call_count == 9
+
+
+def test_all_ai_unavailable_stops_after_one_retry_without_fake_analysis(analyzer):
+    from unittest.mock import Mock
+    chats = [{'vacancy_title': 'AppSec', 'company_name': f'Synthetic {i}'} for i in range(9)]
+    analyzer._load_cached_chats = lambda limit=0: list(chats)
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.enabled = True
+    analyzer.ai_assistant.probe_report = lambda: ''
+    analyzer.ai_assistant.analyze_chat_rejection = Mock(return_value={'heuristic': True})
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert analyzer.ai_assistant.analyze_chat_rejection.call_count == 18
+    assert result['total_analyzed'] == 0 and result['total_deferred'] == 9
+    assert result['status'] == 'deferred'
+    analyzer.db.record_rejection_analysis.assert_not_called()
+
+
+def test_deferred_analysis_logs_attempts_without_chat_content(analyzer, caplog):
+    from unittest.mock import Mock
+    analyzer._load_cached_chats = lambda limit=0: [{'vacancy_title': 'Private title', 'company_name': 'Private name'}]
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.enabled = True
+    analyzer.ai_assistant.probe_report = lambda: ''
+    attempts = [{'provider': 'codex', 'status': 'timeout', 'seconds': 30}]
+    analyzer.ai_assistant.analyze_chat_rejection = Mock(return_value={'heuristic': True, 'ai_attempts': attempts})
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    with caplog.at_level('INFO', logger='rejection_analyzer'):
+        result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert result['total_deferred'] == 1
+    assert len(result['deferred_details'][0]['ai_attempts']) == 2
+    assert '[Разбор 1/1] Отложен: codex: таймаут (30.0 с)' in caplog.text
+    assert 'Private title' not in caplog.text and 'Private name' not in caplog.text
+
+
+def test_analysis_worker_error_is_retried_and_counted_as_deferred(analyzer):
+    from unittest.mock import Mock
+    analyzer._load_cached_chats = lambda limit=0: [{'vacancy_title': 'Synthetic', 'company_name': 'Synthetic'}]
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.probe_report = lambda: ''
+    analyzer.ai_assistant.analyze_chat_rejection = Mock(side_effect=ValueError('private contents'))
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert result['total_deferred'] == 1 and result['status'] == 'deferred'
+    assert result['deferred_details'][0]['error_type'] == 'ValueError'
+    assert analyzer.ai_assistant.analyze_chat_rejection.call_count == 2
+    analyzer.db.record_rejection_analysis.assert_not_called()
+
+
 def test_entrypoint_logs_survive_config_import(tmp_path):
     import subprocess
 
@@ -249,6 +354,17 @@ def test_chat_reply_system_prompt_is_a_string():
     assert '\\n' not in seen['system_prompt']  # буквальный «\n» — след той же порчи
 
 
+def test_chat_generation_does_not_return_a_claim_of_external_delivery():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from chat_workflow import CHAT_ONLY_REPLY
+    analyzer = RejectionAnalyzer.__new__(RejectionAnalyzer)
+    model = Mock(return_value='Спасибо! Я уже написал вам в Telegram.')
+    analyzer.ai_assistant = SimpleNamespace(enabled=True, candidate_profile={}, _call_llm=model)
+    assert analyzer.compose_chat_reply('Напишите в Telegram', 'AppSec', 'Test') == CHAT_ONLY_REPLY
+    assert 'только в hh.ru' in model.call_args.args[1]
+
+
 
 def test_browser_failure_is_not_reported_as_no_new_rejections(analyzer, capsys):
     """24.09: браузер не открылся, а бот написал «новых отказов нет» — hh.ru не проверяли."""
@@ -261,3 +377,29 @@ def test_browser_failure_is_not_reported_as_no_new_rejections(analyzer, capsys):
     assert res == {'status': 'browser_failed'}
     assert 'не проверены' in out
     assert 'новых отказов нет' not in out
+
+
+def test_analysis_finishes_all_refusals_even_after_old_ten_minute_budget(analyzer, monkeypatch, caplog):
+    """The retired global deadline must not leave valid refusals for the next run."""
+    import rejection_analyzer as module
+    from unittest.mock import Mock
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    chats = [{'vacancy_title': 'AppSec', 'company_name': f'Synthetic {i}'} for i in range(10)]
+    analyzer._load_cached_chats = lambda limit=0: list(chats)
+    analyzer.seen_rejection_keys = lambda: set()
+    analyzer.ai_assistant.probe_report = lambda: ''
+    analyzer.config['analysis_time_budget_seconds'] = 600
+
+    def analyze(**kwargs):
+        clock[0] += 301
+        return {'rejection_root_cause': 'Synthetic reason'}
+    analyzer.ai_assistant.analyze_chat_rejection = Mock(side_effect=analyze)
+    analyzer.apply_resume_feedback = Mock()
+    analyzer.db.record_rejection_analysis = Mock()
+    with caplog.at_level('WARNING', logger='rejection_analyzer'):
+        result = analyzer.run_chat_analysis(fetch_live=False, auto_apply=False)
+    assert 'Время на разбор отказов вышло' not in caplog.text
+    assert result['total_deferred'] == 0
+    assert result['total_analyzed'] == 10
+    assert len(analyzer._load_cached_chats()) == 10

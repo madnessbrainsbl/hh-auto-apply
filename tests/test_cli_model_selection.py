@@ -136,7 +136,7 @@ def test_codex_command_overrides_global_model_and_effort(monkeypatch):
             f.write('готов')
         return subprocess.CompletedProcess(cmd, 0, b'', b'')
     runner = Mock(side_effect=run)
-    monkeypatch.setattr('subprocess.run', runner)
+    monkeypatch.setattr('cli_models.run_cli_process', runner)
     result = a._run_cli_request('codex', candidates()[0], 'test', None)
     cmd = runner.call_args.args[0]
     assert cmd[cmd.index('--model') + 1] == 'gpt-future-luna'
@@ -145,12 +145,34 @@ def test_codex_command_overrides_global_model_and_effort(monkeypatch):
     assert result['ok'] and result['text'] == 'готов'
 
 
+def test_cli_timeout_does_not_wait_for_inherited_output_pipes(tmp_path):
+    import sys
+    import time
+    from cli_models import run_cli_process
+    child = 'import time; time.sleep(2)'
+    script = ('import subprocess, sys, time; '
+              f'subprocess.Popen([sys.executable, "-c", {child!r}]); time.sleep(2)')
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_cli_process([sys.executable, '-c', script], input=b'', cwd=tmp_path, timeout=.15)
+    assert time.monotonic() - started < 1.5
+
+
+def test_cli_process_returns_stdout_stderr_and_code(tmp_path):
+    import sys
+    from cli_models import run_cli_process
+    script = 'import sys; print(sys.stdin.read()); print("notice", file=sys.stderr); sys.exit(3)'
+    result = run_cli_process([sys.executable, '-c', script], input=b'fixture', cwd=tmp_path, timeout=3)
+    assert result.returncode == 3
+    assert b'fixture' in result.stdout and b'notice' in result.stderr
+
+
 def test_claude_alias_tracks_actual_model_and_blocks_expensive_fallback(monkeypatch):
     a = assistant(monkeypatch)
     result = {'type': 'result', 'is_error': False, 'result': 'готов',
               'modelUsage': {'claude-haiku-future': {'inputTokens': 10}}}
     runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(result).encode(), b''))
-    monkeypatch.setattr('subprocess.run', runner)
+    monkeypatch.setattr('cli_models.run_cli_process', runner)
     row = {'model': 'haiku', 'effort': 'low'}
     output = a._run_cli_request('claude', row, 'test', None)
     cmd = runner.call_args.args[0]
@@ -296,7 +318,7 @@ def test_catalog_timeout_kills_and_reaps_stuck_process(monkeypatch):
 def test_claude_does_not_accept_a_silent_expensive_model(monkeypatch):
     a = assistant(monkeypatch)
     payload = {'is_error': False, 'result': 'готов', 'modelUsage': {'claude-opus-future': {}}}
-    monkeypatch.setattr('subprocess.run', Mock(return_value=subprocess.CompletedProcess(
+    monkeypatch.setattr('cli_models.run_cli_process', Mock(return_value=subprocess.CompletedProcess(
         [], 0, json.dumps(payload).encode(), b'')))
     assert not a._run_cli_request('claude', {'model': 'haiku'}, 'test', None)['ok']
 
@@ -339,7 +361,7 @@ def test_locked_cli_directory_does_not_discard_response(monkeypatch, caplog, pro
                 payload = {'result': 'готов', 'modelUsage': {'claude-haiku-future': {}}}
                 return subprocess.CompletedProcess(cmd, 0, json.dumps(payload).encode(), b'')
 
-            monkeypatch.setattr('subprocess.run', run)
+            monkeypatch.setattr('cli_models.run_cli_process', run)
             a = assistant(monkeypatch)
             row = {'model': 'haiku' if provider == 'claude' else 'gpt-future-luna'}
             result = a._run_cli_request(provider, row, 'test', None)
@@ -350,6 +372,33 @@ def test_locked_cli_directory_does_not_discard_response(monkeypatch, caplog, pro
     finally:
         for path in directories:
             original_rmtree(path)
+
+
+def test_temporary_cli_directory_retries_transient_windows_lock(monkeypatch, caplog):
+    from pathlib import Path
+    from cli_models import temporary_cli_directory
+    import shutil
+    original = shutil.rmtree
+    attempts = []
+
+    def remove(path):
+        attempts.append(path)
+        if len(attempts) < 3:
+            raise PermissionError('Synthetic transient Windows lock')
+        original(path)
+
+    monkeypatch.setattr('cli_models.shutil.rmtree', remove)
+    monkeypatch.setattr('cli_models.time.sleep', Mock())
+    path = None
+    try:
+        with temporary_cli_directory('hh_synthetic_') as path:
+            Path(path, 'probe.txt').write_text('synthetic', encoding='utf-8')
+        assert len(attempts) == 3
+        assert not Path(path).exists()
+        assert 'недоступна для удаления' not in caplog.text
+    finally:
+        if path and Path(path).exists():
+            original(path)
 
 
 @pytest.mark.parametrize('detail', [

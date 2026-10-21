@@ -229,11 +229,17 @@ def test_get_response_blocker_message_detects_captcha():
     class BodyElement:
         text = "Подтвердите, что вы не робот"
 
+        def is_displayed(self):
+            return True
+
     class FakeDriver:
         page_source = BodyElement.text
 
         def find_element(self, *_args):
             return BodyElement()
+
+        def find_elements(self, *_args):
+            return [BodyElement()]
 
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.driver = FakeDriver()
@@ -736,6 +742,50 @@ def test_get_vacancies_keeps_partial_results_after_network_error(tmp_path):
     assert [vacancy["id"] for vacancy in cache["vacancies"]] == ["123"]
 
 
+def test_search_refreshes_warm_cache_and_preserves_queue_on_network_failure(tmp_path):
+    module = load_auto_module()
+    bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
+    bot.processed_vacancy_ids = {'3'}
+    bot.vacancies_cache_file = str(tmp_path / 'vacancies_cache.json')
+    bot.base_url = 'https://api.hh.ru'
+    bot.sync_cache_with_applied = lambda: None
+    bot.load_vacancies_cache = lambda: [{'id': '1', 'name': 'AppSec'}]
+    bot.is_vacancy_suitable = lambda _: True
+    bot.get_vacancy_priority = lambda _: 1
+    calls = []
+    def request(*args, **kwargs):
+        calls.append(kwargs['params'])
+        if len(calls) > 1:
+            raise requests.ReadTimeout('synthetic')
+        class Response:
+            def json(self):
+                return {'items': [{'id': '1', 'name': 'AppSec'}, {'id': '2', 'name': 'Pentester'},
+                                  {'id': '3', 'name': 'Processed'}], 'pages': 2}
+        return Response()
+    bot.make_application_request = request
+    result = bot.get_vacancies({})
+    assert {v['id'] for v in result} == {'1', '2'}
+    assert len(calls) == 2
+    assert calls[0]['order_by'] == 'publication_time'
+    assert {v['id'] for v in json.loads(Path(bot.vacancies_cache_file).read_text(encoding='utf-8'))['vacancies']} == {'1', '2'}
+
+
+def test_expired_queue_is_retained_for_refresh(tmp_path):
+    from datetime import datetime, timedelta
+    module = load_auto_module()
+    bot = module.HHAutoApplicant.__new__(module.HHAutoApplicant)
+    bot.processed_vacancy_ids = {'2'}
+    bot.vacancies_cache_file = str(tmp_path / 'vacancies_cache.json')
+    bot.cache_lifetime_hours = 6
+    bot.min_vacancies_in_cache = 1
+    bot._is_apply_priority = lambda _: True
+    Path(bot.vacancies_cache_file).write_text(json.dumps({
+        'timestamp': (datetime.now() - timedelta(days=2)).isoformat(),
+        'vacancies': [{'id': '1', 'name': 'AppSec'}, {'id': '2', 'name': 'Applied'}],
+    }), encoding='utf-8')
+    assert [v['id'] for v in bot.load_vacancies_cache()] == ['1']
+
+
 def test_process_api_vacancies_stops_on_hh_response_limit():
     module = load_selenium_module()
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
@@ -897,6 +947,9 @@ def test_handle_warning_popups_clicks_relocation_confirm():
         def is_displayed(self):
             return True
 
+        def click(self):
+            self.clicked = True
+
     class FakeDriver:
         def __init__(self, btn):
             self.btn = btn
@@ -904,15 +957,15 @@ def test_handle_warning_popups_clicks_relocation_confirm():
         def find_elements(self, *_args):
             return [self.btn]
 
-        def execute_script(self, *_args):
-            return False
+        def execute_script(self, _script, *args):
+            # Скрипт только находит кнопку; отправка выполняется отдельной командой.
+            return self.btn if len(args) == 2 else False
 
     btn = FakeButton("Все равно откликнуться")
     bot = module.HHSeleniumBot.__new__(module.HHSeleniumBot)
     bot.driver = FakeDriver(btn)
     bot.get_visible_page_text = lambda: "Вы откликаетесь на вакансию в другой стране. Все равно откликнуться"
     bot.is_disabled_element = lambda _el: False
-    bot.click_element_with_mouse = lambda el: setattr(el, 'clicked', True) or True
 
     assert bot.handle_warning_popups() is True
     assert btn.clicked is True

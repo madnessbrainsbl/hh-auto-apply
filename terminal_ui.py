@@ -132,7 +132,10 @@ _ERROR_HINTS = (
     ('err_internet_disconnected', 'нет подключения к интернету'),
     ('err_connection_timed_out', 'hh.ru не отвечает — попробуйте позже'),
     ('err_connection_reset', 'соединение с hh.ru оборвалось'),
+    ('err_ssl_protocol_error', 'сбой TLS-соединения с hh.ru — проверьте VPN или прокси'),
     ('err_proxy_connection_failed', 'не удалось подключиться через прокси'),
+    ('connection aborted', 'соединение с сервером оборвалось до получения ответа'),
+    ('remote end closed connection', 'сервер закрыл соединение без ответа'),
     # Так пишет клиент Groq/OpenAI при обрыве сети — раньше это был «неизвестный сбой».
     ('connection error', 'нет связи с сервисом ИИ — проверьте интернет или VPN'),
     ('invalid session id', 'окно браузера закрыто'),
@@ -245,6 +248,13 @@ def chrome_service(log_dir: str = ''):
     except Exception:
         return None
 
+    os.environ.setdefault('SE_TIMEOUT', '20')
+    if not os.environ.get('CHROMEDRIVER'):
+        logging.getLogger(__name__).info(
+            'Подготовка ChromeDriver: проверяю совместимость с Chrome; '
+            'может потребоваться загрузка. Таймаут сетевого запроса: %s с.',
+            os.environ['SE_TIMEOUT'])
+
     stream = subprocess.DEVNULL
     try:
         base = log_dir or os.path.dirname(os.path.abspath(__file__))
@@ -279,6 +289,8 @@ _TECHNICAL_LOGGERS = (
 
 class _TechnicalNoiseFilter(logging.Filter):
     def filter(self, record):
+        if (record.threadName or '').startswith('hh-ai-background-probe-'):
+            return False
         name = record.name or ''
         return not any(name == lib or name.startswith(lib + '.')
                        for lib in _TECHNICAL_LOGGERS)
@@ -308,6 +320,10 @@ def is_hh_logged_in(driver) -> bool:
     for button in driver.find_elements(By.CSS_SELECTOR, '[data-qa="login"]'):
         if button.is_displayed():
             return False
+    for profile in driver.find_elements(By.CSS_SELECTOR, '[data-qa="mainmenu_applicantProfileMobileDrop"]'):
+        if (profile.is_displayed()
+                and profile.get_attribute('data-qa') == 'mainmenu_applicantProfileMobileDrop'):
+            return True
     if url.path.rstrip('/') == '/applicant/profile/me':
         markers = ('applicant-profile-common-name', 'applicant-profile-common-edit')
         if all(any(element.is_displayed() for element in driver.find_elements(
@@ -367,13 +383,37 @@ def wait_for_hh_login(driver, should_stop=None, log=None) -> bool:
 
 def ensure_hh_login(driver, headless=False, should_stop=None, log=None) -> bool:
     """Проверяет защищённую страницу перед операциями с аккаунтом."""
-    from selenium.common.exceptions import WebDriverException
+    import time
+    from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
 
     log = log or logging.getLogger(__name__)
     try:
-        driver.get(HH_RESUMES_URL)
-        if is_hh_logged_in(driver):
-            return True
+        for attempt in range(3):
+            if should_stop and should_stop():
+                return False
+            try:
+                driver.get(HH_RESUMES_URL)
+                break
+            except WebDriverException as error:
+                if not is_network_error(error) or attempt == 2:
+                    raise
+                log.warning('Сетевой сбой при открытии hh.ru: %s. '
+                            'Проверяю связь и повторяю загрузку (%s/2).',
+                            explain_error(error), attempt + 1)
+                if not wait_for_network(60, log=log, should_stop=should_stop):
+                    return False
+        for attempt in range(3):
+            if should_stop and should_stop():
+                return False
+            try:
+                if is_hh_logged_in(driver):
+                    return True
+                break
+            except StaleElementReferenceException:
+                if attempt == 2:
+                    raise
+                log.info('Страница входа обновилась; повторяю проверку без перезагрузки.')
+                time.sleep(0.5)
         if headless:
             log.warning('Нет входа в hh.ru. Запустите бот с окном браузера и войдите в аккаунт.')
             return False
@@ -452,6 +492,7 @@ NETWORK_ERROR_MARKERS = (
     'err_name_not_resolved', 'err_internet_disconnected', 'err_connection_reset',
     'err_connection_refused', 'err_connection_timed_out', 'err_network_changed',
     'err_proxy_connection_failed', 'err_address_unreachable', 'timeout',
+    'err_ssl_protocol_error',
     'connection error', 'max retries exceeded', 'nameresolutionerror', 'getaddrinfo',
     'connectionerror', 'remotedisconnected', 'connection aborted', 'network is unreachable',
 )

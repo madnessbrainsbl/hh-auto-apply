@@ -83,6 +83,8 @@ def main(argv=None):
     parser.add_argument('--filter-prompt')
     parser.add_argument('--captcha', choices=('on', 'off'))
     parser.add_argument('--captcha-model')
+    parser.add_argument('--opencode-mode', choices=('free', 'go', 'auto'))
+    parser.add_argument('--opencode-model', help='OpenCode model ID or auto')
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error('--limit должен быть больше нуля')
@@ -117,11 +119,20 @@ def main(argv=None):
                     config.setdefault('captcha', {})['enabled'] = args.captcha == 'on'
                 if args.captcha_model:
                     config.setdefault('captcha', {})['model'] = args.captcha_model
+                if args.opencode_mode is not None or args.opencode_model is not None:
+                    from config_manager import configure_opencode
+                    options = (config.get('ai_config') or {}).get('opencode') or {}
+                    mode = args.opencode_mode or options.get('mode', 'free')
+                    model = args.opencode_model
+                    if model is None:
+                        model = 'auto' if args.opencode_mode else options.get('model', 'auto')
+                    configure_opencode(config, mode, model)
                 if not save_config(config):
                     return 1
                 print(json.dumps({'profile': args.profile_id, 'directory': DATA_DIR,
                     'ai_filter': (config.get('ai_filter') or {}).get('mode', 'off'),
-                    'captcha': bool((config.get('captcha') or {}).get('enabled'))}, ensure_ascii=False))
+                    'captcha': bool((config.get('captcha') or {}).get('enabled')),
+                    'opencode': (config.get('ai_config') or {}).get('opencode')}, ensure_ascii=False))
                 return 0
             if args.command == 'menu':
                 import runpy

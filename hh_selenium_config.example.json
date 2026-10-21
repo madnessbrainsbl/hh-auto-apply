@@ -23,9 +23,25 @@
     "temperature": 0.3,
     "cli_providers": [
       "claude",
-      "codex"
+      "codex",
+      "opencode"
     ],
-    "primary_ai": "auto"
+    "opencode": {"mode": "free", "model": "auto"},
+    "primary_ai": "auto",
+    "openai_compatible": [
+      {
+        "name": "TokenHarbor",
+        "base_url": "https://tokenharbor.ai/v1",
+        "api_key": "",
+        "api_key_env": "TOKEN_HARBOR_API_KEY",
+        "models": [
+          "deepseek-v4-flash:free"
+        ],
+        "auto_models": true,
+        "enabled": true,
+        "timeout": 30
+      }
+    ]
   },
   "candidate_profile": {},
   "answer_policy": {
@@ -39,7 +55,8 @@
     "ask_rejection_reason": true,
     "open_external_interviews": true,
     "tenure_years": null,
-    "experience_yes_template": false
+    "experience_yes_template": false,
+    "style_examples": []
   },
   "neutral_answer": "Готов обсудить этот вопрос на собеседовании",
   "ai_filter": {
@@ -56,5 +73,10 @@
   "apply_delay_seconds": [
     1,
     2
-  ]
+  ],
+  "analysis_time_budget_seconds": 0,
+  "analysis_workers": 3,
+  "letter_prefetch": 6,
+  "search_refresh_hours": 6,
+  "max_apply_priority": 5
 }

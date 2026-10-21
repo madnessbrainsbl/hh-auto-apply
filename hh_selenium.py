@@ -4,6 +4,7 @@
 """
 
 import json
+import hashlib
 import time
 import random
 import os
@@ -18,7 +19,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, parse_qs, quote_plus
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -30,6 +31,7 @@ from selenium.common.exceptions import (
     TimeoutException, 
     NoSuchElementException,
     ElementClickInterceptedException,
+    ElementNotInteractableException,
     StaleElementReferenceException
 )
 
@@ -54,6 +56,8 @@ STATUS_SKIPPED_FILTER = 'skipped_filter'
 # Отдельный статус, а не skipped_filter: тот перепроверяется при каждом
 # запуске, и архивная вакансия с подходящим названием вернулась бы в работу.
 STATUS_ARCHIVED = 'archived'
+LOGIN_FORM_SKIP_MESSAGE = 'Вход на странице вакансии не восстановлен; вакансия остаётся в очереди'
+ACCESS_RESTRICTED_MESSAGE = 'HH сообщает: эта вакансия недоступна текущему аккаунту. Вход сохранён; отклик не отправлен, вакансия остаётся в очереди'
 # hh временно прячет резюме от откликов и просит «поменять видимость», хотя
 # она уже нужная. Через несколько минут проходит само.
 HIDDEN_RESUME_TEXT = 'поменяйте видимость резюме'
@@ -67,7 +71,6 @@ SHARED_APPLIED_STATUSES = (STATUS_SENT, STATUS_SENT_WRONG_FILTER)
 RESPONSE_SUCCESS_TEXTS = (
     'отклик отправлен',
     'вы откликнулись',
-    'ваш отклик',
     'you applied',
     'you have applied',
     'application sent',
@@ -110,6 +113,7 @@ RESPONSE_CHAT_TEXTS = (
 )
 RESPONSE_OTHER_RESUME_TEXTS = (
     'отклик другим резюме',
+    'откликнуться другим резюме',
     'apply with another resume',
 )
 RESPONSE_MODAL_SELECTOR = (
@@ -199,8 +203,32 @@ from config_manager import (  # один список для всех фильт
     SECURITY_TITLE_KEYWORDS as STRICT_TITLE_INCLUDE_KEYWORDS,
     NON_IT_SAFETY_MARKERS, SECURITY_PROTECTION_CONTEXT, security_title_by_meaning,
     find_title_keyword, STRICT_TITLE_EXCLUDE_KEYWORDS, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS,
-    title_excludes, commercial_title_keyword,
+    TECHNICAL_FALLBACK_EXCLUDE_KEYWORDS, title_excludes, commercial_title_keyword,
 )
+
+
+def fetch_vacancy_text(vacancy_id, timeout=15):
+    """Описание вакансии с публичной страницы hh без браузера, для заранее готовых писем.
+
+    API вакансий для соискателей закрыт (403), а страница вакансии открыта всем.
+    Пустая строка — не получилось; тогда письмо напишется как раньше, по странице в браузере.
+    """
+    import html as _html
+    import requests
+    try:
+        response = requests.get(f'https://hh.ru/vacancy/{vacancy_id}', timeout=timeout, headers={
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/154.0 Safari/537.36'),
+            'Accept-Language': 'ru-RU,ru;q=0.9'})
+        if response.status_code != 200:
+            return ''
+        match = re.search(r'data-qa="vacancy-description"[^>]*>(.*?)</div>\s*</div>', response.text, re.S)
+        if not match:
+            return ''
+        text = re.sub(r'<[^>]+>', ' ', match.group(1))
+        return _html.unescape(' '.join(text.split()))
+    except Exception:
+        return ''
 
 
 def is_short_question(text) -> bool:
@@ -254,11 +282,15 @@ function controlInfo(element) {
 
 const bodyText = document.body ? document.body.innerText : '';
 const controls = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+  .filter(element => !element.closest('[data-qa^="vacancy-serp"], [data-qa="vacancy-description"], [data-qa^="chat-"], [contenteditable="true"]'))
   .map((element, index) => ({ index, ...controlInfo(element) }))
   .filter((control) => control.visible && control.inViewport && control.text);
 
 return {
   hasModal: /Отклик на вакансию|другой стране|другом регионе|все равно откликнуться|всё равно откликнуться/i.test(bodyText),
+  hasPendingForm: Array.from(document.querySelectorAll('[data-qa="vacancy-response-submit-popup"]'))
+    .map(controlInfo)
+    .some(control => control.visible && !(arguments[0] || []).includes(control.text.toLowerCase())),
   controls,
 };
 """
@@ -795,6 +827,8 @@ class HHSeleniumBot:
     def get_response_blocker_message(self):
         if self.is_response_limit_reached():
             return "Лимит откликов"
+        if self.page_has_captcha():
+            return "Требуется капча"
 
         page_text = self.get_visible_page_text()
 
@@ -804,7 +838,7 @@ class HHSeleniumBot:
         for text, message in RESPONSE_BLOCKER_TEXTS:
             # Архив проверяется отдельно: по тексту всей страницы он ловил
             # пометку чужой карточки внизу страницы.
-            if message == 'Вакансия в архиве':
+            if message in ('Вакансия в архиве', 'Требуется капча'):
                 continue
             if text in page_text:
                 if message == 'Не заполнены вопросы работодателя':
@@ -833,26 +867,39 @@ class HHSeleniumBot:
             should_stop=lambda: self.check_interactive_controls() == 'stop' or self.stop_requested)
 
     def page_has_captcha(self):
-        """На странице всё ещё висит проверка «вы не робот»."""
-        page_text = self.get_visible_page_text()
-        has_text = any(text in page_text
-                   for text, message in RESPONSE_BLOCKER_TEXTS
-                   if message == 'Требуется капча')
-        if has_text:
-            return True
-        return any(el.is_displayed() for el in self.driver.find_elements(
-            By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"], img[data-qa="account-captcha-picture"], '
-                             'iframe[src*="captcha"], [data-qa*="captcha"]'))
+        """Только видимые элементы проверки, не упоминание CAPTCHA в вакансии."""
+        try:
+            return any(el.is_displayed() for el in self.driver.find_elements(
+                By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"], img[data-qa="account-captcha-picture"], '
+                                 'iframe[src*="captcha"], input[name="captcha"]'))
+        except (NoSuchElementException, StaleElementReferenceException):
+            return False
 
-    def wait_for_human_captcha(self, timeout_seconds=180):
-        """Ждёт, пока человек сам решит капчу в окне браузера.
+    def vacancy_access_restricted(self):
+        from terminal_ui import is_hh_logged_in
+        notice = self.driver.execute_script("""
+            return [...document.querySelectorAll('body *')].some(el =>
+                el.getClientRects().length
+                && getComputedStyle(el).visibility !== 'hidden'
+                && !el.closest('[data-qa="vacancy-description"], [data-qa^="vacancy-serp"]')
+                && !el.querySelector('[data-qa="vacancy-description"], [data-qa^="vacancy-serp"]')
+                && (el.innerText || '').length < 500
+                && (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+                    .startsWith('вам недоступна эта вакансия'));
+        """) is True
+        return notice and is_hh_logged_in(self.driver)
 
-        Капчу бот не решает и не пытается: её решает человек. Раньше вакансия
-        с капчей просто уходила в ошибки, хотя достаточно было пары кликов.
-        Возвращает True, если капча пропала со страницы, иначе False.
-        """
+    def wait_for_human_captcha(self, timeout_seconds=180, *, allow_browser_restart=True):
+        """Сначала Vision, затем ручное решение. После отправки сохраняем живую страницу."""
         if self.try_vision_captcha():
             return True
+        if getattr(self, 'stop_requested', False):
+            return False
+        if self.headless and not allow_browser_restart:
+            logging.warning('Vision не решил капчу после отправки в фоновом браузере. '
+                            'Браузер не перезапускаю и повторный отклик не выполняю; '
+                            'результат нужно проверить в истории HH')
+            return False
         if self.headless and self.show_browser_for_captcha():
             pass  # окно открыто — ниже обычное ожидание, как в видимом режиме
         elif self.headless:
@@ -952,7 +999,9 @@ class HHSeleniumBot:
 
     def try_vision_captcha(self):
         settings = (getattr(self, 'config', {}) or {}).get('captcha') or {}
+        self._captcha_attempts = []
         if not settings.get('enabled'):
+            logging.info('Vision для капчи выключен в настройках')
             return False
         try:
             attempts = min(3, max(1, int(settings.get('max_attempts', 2))))
@@ -966,12 +1015,38 @@ class HHSeleniumBot:
                 picture = next((p for p in pictures if p.is_displayed()), None)
                 field = next((f for f in inputs if f.is_displayed()), None)
                 if picture is None or field is None:
+                    logging.info('Vision: нет доступной текстовой картинки или поля капчи; нужно ручное решение')
                     return False
-                answer = self.ai_assistant.recognize_captcha(picture.screenshot_as_png)
+                logging.info('Vision: распознаю только картинку капчи, попытка %s/%s', _ + 1, attempts)
+                image = picture.screenshot_as_png
+                record = {'attempt': _ + 1, 'image_sha256': hashlib.sha256(image).hexdigest(),
+                          'outcome': 'inference_requested'}
+                self._captcha_attempts.append(record)
+                answer = self.ai_assistant.recognize_captcha(image)
+                source = getattr(self.ai_assistant, 'last_captcha_source', None)
+                if isinstance(source, dict):
+                    record['source'] = {key: value for key, value in source.items()
+                                        if key in ('provider', 'model', 'seconds') and isinstance(value, (str, int, float))}
                 if not answer:
+                    record['outcome'] = 'no_valid_answer'
+                    logging.warning('Vision не вернул текст капчи; проверьте причину отказа ИИ выше')
                     return False
-                field.clear()
-                field.send_keys(answer)
+                pictures = self.driver.find_elements(By.CSS_SELECTOR, 'img[data-qa="account-captcha-picture"]')
+                inputs = self.driver.find_elements(By.CSS_SELECTOR, 'input[data-qa="account-captcha-input"]')
+                picture = next((p for p in pictures if p.is_displayed()), None)
+                field = next((f for f in inputs if f.is_displayed()), None)
+                if picture is None or field is None or hashlib.sha256(picture.screenshot_as_png).hexdigest() != record['image_sha256']:
+                    record['outcome'] = 'challenge_changed'
+                    logging.warning('Vision: картинка или поле изменились за время запроса; устаревший ответ не ввожу')
+                    return False
+                record['expected_length'] = len(answer)
+                filled = self.set_text_input_value(field, answer)
+                value = field.get_attribute('value')
+                record['input_length'] = len(value) if isinstance(value, str) else None
+                if not filled or value != answer:
+                    record['outcome'] = 'input_mismatch'
+                    logging.warning('Vision: текст в поле не совпал с ответом; команда подтверждения не выполнялась')
+                    return False
                 field.send_keys(Keys.ENTER)
 
                 def cleared(driver):
@@ -980,12 +1055,34 @@ class HHSeleniumBot:
 
                 try:
                     WebDriverWait(self.driver, 10).until(cleared)
+                    record['outcome'] = 'accepted'
+                    self.ai_assistant.report_captcha_result('accepted')
                     logging.info('[OK] Текстовая капча решена')
                     return True
                 except TimeoutException:
+                    errors = self.driver.find_elements(By.CSS_SELECTOR, '[data-qa="account-captcha-error"]')
+                    rejected = any(e.is_displayed() and 'неверный текст' in e.text.lower() for e in errors)
+                    record['outcome'] = 'server_rejected' if rejected else 'not_confirmed'
+                    if rejected:
+                        self.ai_assistant.report_captcha_result('server_rejected')
+                    logging.warning('Vision: %s; ответ модели сам по себе не подтверждает решение',
+                                    'HH отклонил введённый текст' if rejected else 'HH не подтвердил снятие проверки')
                     continue
         except Exception as exc:
-            logging.debug('Vision captcha failed: %s', type(exc).__name__)
+            if self._captcha_attempts:
+                self._captcha_attempts[-1].update(outcome='exception', error_type=type(exc).__name__)
+            logging.warning('Vision: распознавание капчи не завершено (%s)', type(exc).__name__)
+        finally:
+            if self._captcha_attempts:
+                try:
+                    directory = os.path.join(SCRIPT_DIR, '.apply_diagnostics')
+                    os.makedirs(directory, exist_ok=True)
+                    path = os.path.join(directory, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-vision-attempts.json')
+                    vacancy_id = self.get_vacancy_id_from_url(self.driver.current_url or '')
+                    write_json_atomic(path, {'vacancy_id': vacancy_id if str(vacancy_id or '').isdigit() else None,
+                                             'attempts': self._captcha_attempts})
+                except Exception:
+                    logging.warning('Vision: не удалось сохранить безопасную диагностику попыток')
         return False
 
     def find_response_modal(self, wait_seconds=0):
@@ -1013,7 +1110,9 @@ class HHSeleniumBot:
         counts = getattr(self, '_application_ui_errors', {})
         counts[code] = counts.get(code, 0) + 1
         self._application_ui_errors = counts
-        message = (f'[{code}] {detail}. Финальная отправка ботом остановлена; '
+        action = ('Команда отправки уже выполнена; повторная отправка запрещена; '
+                  if code in ('confirmation_missing', 'captcha_required') else 'Финальная отправка ботом остановлена; ')
+        message = (f'[{code}] {detail}. {action}'
                    'успех не подтверждён, история отправок не изменена.')
         try:
             directory = os.path.join(SCRIPT_DIR, '.apply_diagnostics')
@@ -1021,8 +1120,13 @@ class HHSeleniumBot:
             path = os.path.join(directory, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-' + code)
             dom = self.driver.execute_script("""
                 const visible = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
-                const modals = [...document.querySelectorAll(arguments[0])].filter(visible);
-                const root = modals.find(el => el.getAttribute('data-qa') === 'vacancy-response-popup')
+                const modals = [...document.querySelectorAll(arguments[0])].filter(el => visible(el)
+                    && !el.matches('button, input, textarea, a'));
+                const challenge = arguments[1] === 'captcha_required'
+                    ? [...document.querySelectorAll('input[data-qa="account-captcha-input"], img[data-qa="account-captcha-picture"]')].find(visible)
+                    : null;
+                const root = (challenge && challenge.closest('[role="dialog"], .bloko-modal'))
+                    || modals.find(el => el.getAttribute('data-qa') === 'vacancy-response-popup')
                     || modals[0] || document;
                 const nodes = [...root.querySelectorAll(
                     '[data-qa], [role="dialog"], input, textarea, button, [contenteditable]')].filter(visible);
@@ -1034,7 +1138,7 @@ class HHSeleniumBot:
                     nodes: nodes.slice(0, 150).map(el => ({tag: el.tagName, qa: el.getAttribute('data-qa'),
                         role: el.getAttribute('role'), class: typeof el.className === 'string' ? el.className : '',
                         text_length: (el.innerText || '').trim().length, disabled: !!el.disabled}))};
-            """, RESPONSE_MODAL_SELECTOR)
+            """, RESPONSE_MODAL_SELECTOR, code)
             screenshot = None
             # ponytail: три снимка на тип ошибки за запуск; структура сохраняется для каждого случая.
             if counts[code] <= 3:
@@ -1049,6 +1153,7 @@ class HHSeleniumBot:
                 vacancy_id = None
             with open(path + '.json', 'w', encoding='utf-8') as stream:
                 json.dump({'code': code, 'vacancy_id': vacancy_id,
+                           'captcha_attempts': getattr(self, '_captcha_attempts', []),
                            'dom': dom, 'screenshot': screenshot}, stream, ensure_ascii=False, indent=2)
             return message + f' Диагностика: {path}.json'
         except Exception:
@@ -1063,6 +1168,8 @@ class HHSeleniumBot:
         - Предупреждения о несоответствии требованиям
         Кликает по кнопке «Все равно откликнуться» / «Apply anyway».
         """
+        if getattr(self, '_response_warning_dispatched', False):
+            return False
         confirm_keywords = (
             'все равно откликнуться',
             'всё равно откликнуться',
@@ -1101,47 +1208,92 @@ class HHSeleniumBot:
                 '[role="button"]',
             ]
 
-            for sel in button_selectors:
-                try:
-                    elements = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in elements:
-                        if not el.is_displayed() or self.is_disabled_element(el):
-                            continue
-                        text = el.text.strip().lower()
-                        if any(kw in text for kw in confirm_keywords):
-                            logging.info(f" [OK] Подтверждено предупреждение HH: «{el.text.strip()}»")
-                            if self.click_element_with_mouse(el):
-                                time.sleep(0.8)
-                                return True
-                except Exception:
-                    continue
-
-            # JavaScript fallback
-            clicked = self.driver.execute_script("""
-                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-                for (const b of buttons) {
-                    const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    if (txt.includes('все равно откликнуться') || txt.includes('всё равно откликнуться') || txt.includes('apply anyway')) {
-                        b.scrollIntoView({ block: 'center' });
-                        b.click();
-                        return true;
+            # 14.10: перебор десяти селекторов с чтением .text у каждой кнопки стоил 2-4 с
+            # на отклик (по запросу к браузеру на элемент). Один скрипт находит кнопку сразу;
+            # порядок тот же: сначала кнопки внутри окон, потом любые.
+            try:
+                target = self.driver.execute_script(
+                    """
+                    const keys = arguments[0], sels = arguments[1];
+                    for (const sel of sels) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            if (!el.offsetParent && getComputedStyle(el).position !== 'fixed') continue;
+                            if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                            const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if (txt && keys.some(k => txt.includes(k))) return el;
+                        }
                     }
-                }
-                return false;
-            """)
-            if clicked:
-                logging.info(" [OK] Подтверждено предупреждение HH через JS: «Все равно откликнуться»")
-                time.sleep(0.8)
-                return True
+                    return null;
+                    """, list(confirm_keywords), button_selectors)
+            except Exception:
+                target = None
+            if target:
+                if self.dispatch_response_button(target):
+                    self._response_warning_dispatched = True
+                    logging.info(' Команда подтверждения предупреждения HH выполнена; ожидаю результат без повторного клика')
+                    return True
 
         except Exception as e:
             logging.debug(f"Ошибка проверки предупреждающих окон: {e}")
 
         return False
 
+    def inspect_application(self, vacancy_id):
+        """Read a vacancy and negotiations without clicking, solving checks or rewriting history."""
+        report = {'vacancy_id': vacancy_id, 'status': 'invalid_vacancy'}
+        if not re.fullmatch(r'\d{1,15}', vacancy_id):
+            return report
+        if not self.init_driver():
+            return dict(report, status='browser_failed')
+        directory = os.path.join(SCRIPT_DIR, '.live_runs')
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-application-inspection')
+        self.driver.get('https://hh.ru/vacancy/' + vacancy_id)
+        state = 'unknown'
+        for _ in range(40):
+            if self.page_has_captcha():
+                state = 'captcha'
+                break
+            if self.vacancy_access_restricted():
+                state = 'restricted'
+                break
+            if not is_allowed_hh_url(self.driver.current_url) or '/account/login' in self.driver.current_url:
+                state = 'login_required'
+                break
+            state = self.detect_response_state()
+            if state != 'unknown':
+                break
+            time.sleep(.25)
+        report.update(vacancy_state=state, controls=self.get_response_control_texts(),
+                      status='confirmed' if state in ('success', 'already') else
+                      'access_restricted' if state == 'restricted' else
+                      'captcha_required' if state == 'captcha' else 'not_confirmed')
+        self.driver.save_screenshot(path + '-vacancy.png')
+        if state not in ('captcha', 'login_required', 'restricted'):
+            self.driver.get('https://hh.ru/applicant/negotiations')
+            time.sleep(2)
+            report['negotiations_links'] = self.driver.execute_script(r"""
+                return [...document.querySelectorAll('a[href]')].filter(a => {
+                    const u = new URL(a.href);
+                    return (u.hostname === 'hh.ru' || u.hostname.endsWith('.hh.ru'))
+                        && u.pathname === '/vacancy/' + arguments[0] && a.getClientRects().length;
+                }).map(a => ({title:(a.innerText || '').trim().slice(0,150),
+                    parent_qa:a.parentElement.getAttribute('data-qa')}));
+            """, vacancy_id)
+            self.driver.save_screenshot(path + '-negotiations.png')
+        with open(path + '.json', 'w', encoding='utf-8') as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=2)
+        detail = {'confirmed': 'HH показывает подтверждение отклика',
+                  'access_restricted': ACCESS_RESTRICTED_MESSAGE,
+                  'captcha_required': 'показана капча; проверка не завершена',
+                  'not_confirmed': 'подтверждение не найдено; это не доказательство отсутствия отклика'}
+        logging.info('Проверка отклика %s без отправки: %s. История не изменена; отчёт: %s.json',
+                     vacancy_id, detail[report['status']], path)
+        return report
+
     def get_visible_response_state(self):
         try:
-            state = self.driver.execute_script(VISIBLE_RESPONSE_STATE_SCRIPT)
+            state = self.driver.execute_script(VISIBLE_RESPONSE_STATE_SCRIPT, list(RESPONSE_SUCCESS_TEXTS))
             if isinstance(state, dict):
                 return state
         except Exception as e:
@@ -1153,31 +1305,22 @@ class HHSeleniumBot:
         selectors = [
             '[data-qa="vacancy-response-link-top"]',
             '[data-qa="vacancy-response-link-bottom"]',
-            'a[data-qa*="vacancy-response"]',
-            'button[data-qa*="vacancy-response"]',
+            '[data-qa="vacancy-response-link-top-again"]',
+            '[data-qa="vacancy-response-link-view-topic"]',
         ]
         texts = []
-
-        for selector in selectors:
+        try:
+            elements = self.driver.find_elements(By.CSS_SELECTOR, ', '.join(selectors))
+        except Exception:
+            return texts
+        for element in elements:
             try:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if element.is_displayed():
+                    text = element.text.lower().strip()
+                    if text:
+                        texts.append(text)
             except Exception:
                 continue
-
-            for element in elements:
-                try:
-                    if element.is_displayed():
-                        text = element.text.lower().strip()
-                        if text:
-                            texts.append(text)
-                except Exception:
-                    continue
-
-        visible_state = self.get_visible_response_state()
-        for control in visible_state.get('controls', []):
-            text = str(control.get('text', '')).lower().strip()
-            if text:
-                texts.append(text)
 
         return texts
 
@@ -1186,6 +1329,9 @@ class HHSeleniumBot:
             return 'limit'
 
         visible_state = self.get_visible_response_state()
+        # Background delivery controls do not confirm the still-open response form.
+        if visible_state.get('hasPendingForm') is True:
+            return 'ready'
         visible_control_texts = [
             str(control.get('text', '')).lower().strip()
             for control in visible_state.get('controls', [])
@@ -1205,7 +1351,7 @@ class HHSeleniumBot:
 
         if has_chat and has_other_resume:
             return 'success'
-        if any(text in visible_control_text for text in RESPONSE_SUCCESS_TEXTS):
+        if any(text in RESPONSE_SUCCESS_TEXTS for text in visible_control_texts):
             return 'success'
         if any(text in visible_control_text for text in RESPONSE_DENIED_TEXTS):
             return 'denied'
@@ -1214,7 +1360,7 @@ class HHSeleniumBot:
         if has_apply:
             return 'ready'
 
-        if any(text in response_control_text for text in RESPONSE_SUCCESS_TEXTS):
+        if any(text in RESPONSE_SUCCESS_TEXTS for text in response_control_texts):
             return 'success'
         if any(text in response_control_text for text in RESPONSE_READY_TEXTS):
             return 'ready'
@@ -1225,16 +1371,23 @@ class HHSeleniumBot:
 
         return 'unknown'
 
-    def wait_for_response_state(self):
-        deadline = time.time() + RESPONSE_STATE_WAIT_SECONDS
+    def wait_for_response_state(self, *, allow_warning_dispatch=True):
+        started = time.time()
+        deadline = started + RESPONSE_STATE_WAIT_SECONDS
         while time.time() < deadline:
-            self.handle_warning_popups()
+            if allow_warning_dispatch:
+                self.handle_warning_popups()
             state = self.detect_response_state()
             if state not in ('unknown', 'ready'):
+                logging.debug(f"Состояние отклика «{state}» через {time.time() - started:.1f} с")
                 return state
-            time.sleep(0.5)
+            if self.get_response_blocker_message():
+                return 'blocked'
+            time.sleep(0.25)
 
-        return self.detect_response_state()
+        state = self.detect_response_state()
+        logging.debug(f"Состояние отклика «{state}» после ожидания {time.time() - started:.1f} с")
+        return state
 
     def find_visible_apply_text_buttons(self):
         buttons = []
@@ -1358,7 +1511,7 @@ class HHSeleniumBot:
                 logging.debug(f"Точка клика занята другим элементом (попытка {attempt + 1})")
                 continue
             if self.click_viewport_coordinates(point[0], point[1]):
-                time.sleep(0.8)
+                time.sleep(0.3)
                 return True
             break
 
@@ -1366,7 +1519,7 @@ class HHSeleniumBot:
         # по перекрытому элементу, поэтому ложного успеха здесь не будет.
         try:
             element.click()
-            time.sleep(0.8)
+            time.sleep(0.3)
             return True
         except Exception as e:
             logging.debug(f"Обычный клик по элементу не сработал: {e}")
@@ -1504,9 +1657,22 @@ class HHSeleniumBot:
 
         self.focus_text_field(element)
 
+        # 14.10: send_keys печатает письмо по символу — 4-7 с на отклик. Input.insertText
+        # вставляет текст одним настоящим событием ввода (React его принимает, в отличие
+        # от подстановки значения через JS) — доли секунды. Не сработало — печатаем как раньше.
         try:
             element.send_keys(Keys.CONTROL, 'a')
             element.send_keys(Keys.DELETE)
+            if len(text) > 40 and not self.config.get('slow_typing'):
+                try:
+                    self.driver.execute_cdp_cmd('Input.insertText', {'text': text})
+                    time.sleep(0.1)
+                    if self.text_value_matches(element, text):
+                        return True
+                    element.send_keys(Keys.CONTROL, 'a')
+                    element.send_keys(Keys.DELETE)
+                except Exception as e:
+                    logging.debug(f"Быстрая вставка текста не сработала: {e}")
             element.send_keys(text)
             time.sleep(0.3)
         except Exception as e:
@@ -1582,7 +1748,7 @@ class HHSeleniumBot:
             for submit_button in submit_buttons:
                 try:
                     if submit_button.is_displayed() and not self.is_disabled_element(submit_button):
-                        if self.click_element_with_mouse(submit_button):
+                        if self.dispatch_response_button(submit_button):
                             return True
                 except Exception:
                     continue
@@ -1603,7 +1769,7 @@ class HHSeleniumBot:
                     if btn.is_displayed() and not self.is_disabled_element(btn):
                         txt = btn.text.strip().lower()
                         if any(ct in txt for ct in confirm_texts):
-                            if self.click_element_with_mouse(btn):
+                            if self.dispatch_response_button(btn):
                                 return True
                 except Exception:
                     continue
@@ -1611,6 +1777,20 @@ class HHSeleniumBot:
             pass
 
         return False
+
+    def dispatch_response_button(self, button):
+        """Один финальный клик; неопределённый результат разрешает только чтение."""
+        if not button.is_displayed() or self.is_disabled_element(button):
+            return False
+        self._response_submit_dispatched = True
+        try:
+            button.click()
+        except (ElementClickInterceptedException, ElementNotInteractableException, StaleElementReferenceException):
+            self._response_submit_dispatched = False
+            return False
+        except Exception as exc:
+            logging.warning('Результат команды отправки неизвестен (%s); повторного клика не будет', type(exc).__name__)
+        return True
 
     def open_cover_letter_in_modal(self, modal=None):
         """Раскрывает поле ввода сопроводительного письма в модальном окне, если оно свернуто."""
@@ -1895,13 +2075,16 @@ class HHSeleniumBot:
         if blocker_message and blocker_message != "Сопроводительное письмо не заполнено":
             return False, letter_sent, questions_answered, blocker_message
 
-        if self.click_response_submit_button(modal):
-            val_error = self.get_modal_validation_error(modal)
-            if val_error:
-                return False, letter_sent, questions_answered, val_error
-            return True, letter_sent, questions_answered, None
-
-        if self.click_lowest_visible_apply_button():
+        modal = self.find_response_modal() or modal
+        resume_ok, resume_err = self.ensure_target_resume_selected(modal)
+        if not resume_ok:
+            return False, letter_sent, questions_answered, resume_err
+        submitted = self.click_response_submit_button(modal)
+        if not submitted:
+            submitted = self.click_lowest_visible_apply_button()
+        if submitted:
+            if self.page_has_captcha():
+                return True, letter_sent, questions_answered, 'Требуется капча'
             val_error = self.get_modal_validation_error(modal)
             if val_error:
                 return False, letter_sent, questions_answered, val_error
@@ -1948,6 +2131,7 @@ class HHSeleniumBot:
 
     def submit_popup_by_keyboard(self) -> bool:
         """Последняя попытка отправить отклик: прокрутка окна до низа и Enter на кнопке."""
+        dispatched = False
         try:
             buttons = [b for b in self.driver.find_elements(By.CSS_SELECTOR, self.SUBMIT_POPUP)
                        if b.is_displayed()]
@@ -1959,20 +2143,14 @@ class HHSeleniumBot:
                 "while (el) { if (el.scrollHeight > el.clientHeight + 1) el.scrollTop = el.scrollHeight;"
                 " el = el.parentElement; }", button)
             time.sleep(0.4)
+            dispatched = True
+            self._response_submit_dispatched = True
             button.send_keys(Keys.ENTER)
-            deadline = time.time() + 6
-            while time.time() < deadline:
-                time.sleep(0.5)
-                try:
-                    if not any(b.is_displayed() for b in self.driver.find_elements(By.CSS_SELECTOR, self.SUBMIT_POPUP)):
-                        logging.info(" Кнопка отправки нажата клавишей Enter; ожидаю подтверждение HH")
-                        return True
-                except StaleElementReferenceException:
-                    continue
-            return False
+            logging.info(" Команда отправки клавишей Enter выполнена; ожидаю подтверждение HH")
+            return True
         except Exception as e:
             logging.debug(f"Отправка клавишей не удалась: {e}")
-            return False
+            return dispatched
 
     def get_modal_validation_error(self, modal):
         """Проверяет наличие подсвеченных ошибок валидации полей в модальном окне."""
@@ -2031,7 +2209,8 @@ class HHSeleniumBot:
         работодателя» и дальше не пускает. Замер 2026-09-21: на странице отклика
         5 блоков вопросов и 9 полей, в модалке той же вакансии — ноль.
 
-        Возвращает (успех, letter_sent, отвечено_вопросов, сообщение_об_ошибке).
+        Возвращает (команда_отправки_выполнена, letter_sent, отвечено_вопросов, ошибка).
+        Доставка отдельно подтверждается в confirm_response_submission.
         """
         vacancy_id = self.current_vacancy_id()
         if not vacancy_id:
@@ -2055,7 +2234,10 @@ class HHSeleniumBot:
         # откликнуться на чужую вакансию.
         time.sleep(1.0)
         landed_url = self.driver.current_url or ''
-        if 'vacancy_response' not in landed_url or vacancy_id not in landed_url:
+        landed = urlparse(landed_url)
+        if (not is_allowed_hh_url(landed_url) or landed.username or landed.password
+                or landed.path != '/applicant/vacancy_response'
+                or parse_qs(landed.query).get('vacancyId') != [vacancy_id]):
             logging.debug(f"Страница анкеты подменилась: {landed_url}")
             return (False, letter_sent, 0,
                     'Вместо анкеты открылась другая страница — отклик не отправлен')
@@ -2075,30 +2257,70 @@ class HHSeleniumBot:
                 break
         logging.info(f" Вопросов на странице отклика: {found_blocks}")
 
-        if not found_blocks:
-            # Сюда приходят только когда hh уже сказал, что анкета не заполнена.
-            # Ноль вопросов означает, что мы её не распознали, а не что её нет.
-            # Отправлять отклик в этом случае — отправлять пустую анкету.
+        form = self.driver.execute_script("""
+            const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+            const buttons = [...document.querySelectorAll(arguments[0])].filter(visible);
+            return buttons.length === 1 ? (buttons[0].closest('form') || document.body) : null;
+        """, self.SUBMIT_POPUP)
+        if form is None:
             return (False, letter_sent, 0,
-                    'Анкету работодателя не удалось прочитать — отклик не отправлен')
+                    self.application_ui_problem('questionnaire_unreadable',
+                        'Не найдена однозначная форма отклика на странице анкеты'))
 
-        questions_answered = self.answer_employer_questions()
+        resume_ok, resume_error = self.ensure_target_resume_selected(form)
+        if not resume_ok:
+            return False, False, 0, resume_error
+
+        if not found_blocks:
+            # Some response pages have the questionnaire heading but no questions.
+            empty_form_ready = self.driver.execute_script("""
+                const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+                const fields = [...arguments[0].querySelectorAll('input:not([type="hidden"]),textarea,select,[contenteditable="true"]')];
+                return document.readyState === 'complete'
+                    && ![...document.querySelectorAll('[role="progressbar"],[data-qa*="loading"],[data-qa*="spinner"]')].some(visible)
+                    && !fields.some(el => visible(el) && !(arguments[1].includes(el)
+                        && el.matches('textarea[name="letter"],[data-qa="vacancy-response-letter-text"],'
+                            + '[data-qa="vacancy-response-popup-form-letter-input"],'
+                            + 'textarea[placeholder*="Сопровод"],textarea[placeholder*="сопровод"],textarea[placeholder*="письмо"]')));
+            """, form, self.find_cover_letter_fields())
+            if not empty_form_ready or self.get_response_blocker_message():
+                return (False, False, 0,
+                        self.application_ui_problem('questionnaire_unreadable',
+                            'Форма ещё загружается или содержит нераспознанные поля; отправка не выполнялась'))
+            logging.info(' Страница отклика загружена: полей вопросов нет, целевое резюме подтверждено')
+
+        questions_answered = self.answer_employer_questions(form) if found_blocks else 0
         if self.unanswered_questions:
             return False, letter_sent, questions_answered, self.describe_unanswered_questions()
 
+        # Navigating here creates a new form: the previous modal's letter is not proof.
+        letter_sent = bool(cover_letter.strip()) and any(
+            ' '.join((field.get_attribute('value') or field.text or '').split()) == ' '.join(cover_letter.split())
+            for field in self.find_cover_letter_fields())
         if not letter_sent:
             self.open_cover_letter_in_modal()
             letter_sent = self.fill_cover_letter(cover_letter, wait_seconds=3)
             if not letter_sent and not self.letter_skip_reason:
                 self.letter_skip_reason = 'на странице-анкете поля для письма нет'
+        if self.is_cover_letter_required() and not letter_sent:
+            return False, False, questions_answered, 'Сопроводительное письмо не заполнено'
 
-        if not self.click_lowest_visible_apply_button():
+        landed = urlparse(self.driver.current_url or '')
+        if (not is_allowed_hh_url(self.driver.current_url or '')
+                or landed.path != '/applicant/vacancy_response'
+                or parse_qs(landed.query).get('vacancyId') != [vacancy_id]):
+            return False, letter_sent, questions_answered, 'Страница анкеты изменилась до отправки'
+        resume_ok, resume_error = self.ensure_target_resume_selected(form)
+        if not resume_ok:
+            return False, letter_sent, questions_answered, resume_error
+        buttons = [b for b in self.driver.find_elements(By.CSS_SELECTOR, self.SUBMIT_POPUP)
+                   if b.is_displayed() and not self.is_disabled_element(b)]
+        if len(buttons) != 1 or not self.dispatch_response_button(buttons[0]):
             return False, letter_sent, questions_answered, 'Кнопка отклика на странице анкеты не нажалась'
 
-        time.sleep(2.5)
         blocker = self.get_response_blocker_message()
         if blocker:
-            return False, letter_sent, questions_answered, blocker
+            return blocker in ('Ошибка HH после клика', 'Требуется капча'), letter_sent, questions_answered, blocker
 
         state = self.detect_response_state()
         if state == 'already':
@@ -2108,11 +2330,8 @@ class HHSeleniumBot:
         if state == 'success':
             return True, letter_sent, questions_answered, None
 
-        page_text = self.get_visible_page_text()
-        if any(t in page_text for t in RESPONSE_SUCCESS_TEXTS):
-            return True, letter_sent, questions_answered, None
-
-        return False, letter_sent, questions_answered, 'Отклик через страницу анкеты не подтвердился'
+        logging.info(' Команда отправки на странице анкеты выполнена; ожидаю подтверждение HH без повторного клика')
+        return True, letter_sent, questions_answered, None
 
     ATTACH_LETTER_BUTTON = '[data-qa="responded-success-attach-cover-letter"]'
     ATTACH_LETTER_INPUT = '[data-qa="vacancy-response-popup-form-letter-input"]'
@@ -2185,7 +2404,7 @@ class HHSeleniumBot:
 
         У вакансий с анкетой hh часто не даёт ни поля письма в форме, ни кнопки
         «Приложить сопроводительное» после отклика — только «Чат». 29.09 так
-        могут уйти без письма отклики, а в чате останется «Без
+        ушли без письма отклики в Кион и МТС Банк, а в чате висело «Без
         сопроводительного письма».
 
         Чат открывается с этой же страницы вакансии, поэтому это чат именно по
@@ -2306,23 +2525,51 @@ class HHSeleniumBot:
 
         return None
 
+    def confirm_post_dispatch_captcha(self, letter_sent, questions_answered):
+        """Resolve the challenge on the original page; never dispatch or navigate again."""
+        solved = False
+        if not getattr(self, '_response_captcha_attempted', False):
+            self._response_captcha_attempted = True
+            solved = self.wait_for_human_captcha(allow_browser_restart=False)
+        if solved:
+            logging.info('Капча снята; проверяю результат исходного отклика без повторной отправки')
+            state = self.wait_for_response_state(allow_warning_dispatch=False)
+            blocker = self.get_response_blocker_message()
+            if not blocker:
+                resolved = self.resolve_response_state(state, letter_sent, questions_answered)
+                if resolved is not None:
+                    return resolved
+                return False, APPLY_NOT_CONFIRMED_MARKER + '. ' + self.application_ui_problem(
+                    'confirmation_missing', 'Капча снята, но HH не подтвердил доставку исходного отклика. Проверьте историю HH')
+            if blocker == 'Лимит откликов':
+                return False, blocker
+            if blocker != 'Требуется капча':
+                return False, APPLY_NOT_CONFIRMED_MARKER + '. ' + self.application_ui_problem(
+                    'confirmation_missing', 'Капча снята, но HH заблокировал исходный отклик: ' + blocker)
+        return False, APPLY_NOT_CONFIRMED_MARKER + '. ' + self.application_ui_problem(
+            'captcha_required', 'Проверка HH после отправки не завершена. Vision не подтвердил решение; '
+            'в видимом окне решите проверку вручную. Повторный отклик не выполняется')
+
     def confirm_response_submission(self, cover_letter, letter_sent, questions_answered, modal_submitted=False):
         last_state = 'unknown'
 
         for attempt in range(1, APPLY_CONFIRM_ATTEMPTS + 1):
             if self.handle_warning_popups():
-                time.sleep(0.8)
+                time.sleep(0.3)
 
             state = self.wait_for_response_state()
+            modal_submitted = modal_submitted or getattr(self, '_response_submit_dispatched', False)
             last_state = state
+
+            blocker_message = self.get_response_blocker_message()
+            if blocker_message:
+                if modal_submitted and blocker_message == 'Требуется капча':
+                    return self.confirm_post_dispatch_captcha(letter_sent, questions_answered)
+                return False, blocker_message
 
             resolved_state = self.resolve_response_state(state, letter_sent, questions_answered)
             if resolved_state is not None:
                 return resolved_state
-
-            blocker_message = self.get_response_blocker_message()
-            if blocker_message:
-                return False, blocker_message
 
             modal = self.find_response_modal()
             if modal and not modal_submitted:
@@ -2332,36 +2579,15 @@ class HHSeleniumBot:
                 )
                 questions_answered += answered_now
                 if blocker_message:
+                    if (submitted or getattr(self, '_response_submit_dispatched', False)) and blocker_message == 'Требуется капча':
+                        return self.confirm_post_dispatch_captcha(letter_sent, questions_answered)
                     return False, blocker_message
                 if submitted:
                     modal_submitted = True
-                    time.sleep(1.5)
-                    state_now = self.detect_response_state()
-                    res = self.resolve_response_state(state_now, letter_sent, questions_answered)
-                    if res is not None:
-                        return res
                     continue
 
-            # Если модалка была отправлена и закрылась
-            if modal_submitted:
-                time.sleep(1.0)
-                state = self.wait_for_response_state()
-                resolved_state = self.resolve_response_state(state, letter_sent, questions_answered)
-                if resolved_state is not None:
-                    return resolved_state
-
-                # Проверяем текст страницы на подтверждение отправки
-                pt = self.get_visible_page_text()
-                # Проверка по тексту ВСЕЙ страницы ловила и «Отклик НЕ отправлен»,
-                # и пункт бокового меню «Мои отклики» рядом со словом «отправлен».
-                # Отсюда брались отклики, засчитанные без отправки.
-                negative = ('отклик не отправлен', 'не удалось отправить',
-                            'отклик не был отправлен')
-                if not any(n in pt for n in negative):
-                    if any(s in pt for s in RESPONSE_SUCCESS_TEXTS) or 'вы откликнулись' in pt:
-                        return True, self.build_success_message(letter_sent, questions_answered)
-
             if state == 'ready' and not modal_submitted and self.click_lowest_visible_apply_button():
+                modal_submitted = True
                 continue
 
             if attempt < APPLY_CONFIRM_ATTEMPTS:
@@ -2371,8 +2597,28 @@ class HHSeleniumBot:
         # говорит — он уходит в журнал, а на экран идёт человеческая фраза.
         logging.debug(f"Состояние отклика после попыток: {last_state}")
         if modal_submitted:
+            # A closed modal can leave stale controls on the vacancy card; read it once afresh.
+            try:
+                expected_url = (getattr(self, 'last_application_meta', {}) or {}).get('url', '')
+                vacancy_id = self.get_vacancy_id_from_url(expected_url)
+                current_url = self.driver.current_url or ''
+                if (vacancy_id and vacancy_id.isdigit() and is_allowed_hh_url(expected_url)
+                        and is_allowed_hh_url(current_url)
+                        and urlparse(current_url).path.rstrip('/') == f'/vacancy/{vacancy_id}'
+                        and not self.find_response_modal()
+                        and self.driver.execute_script("""
+                            return ![...document.querySelectorAll('textarea,input[type="text"],input:not([type]),[contenteditable="true"]')].some(el =>
+                                el.getClientRects().length && (el.value || el.innerText || '').trim());
+                        """) is True):
+                    self.driver.get(f'https://hh.ru/vacancy/{vacancy_id}')
+                    resolved = self.resolve_response_state(self.wait_for_response_state(), letter_sent, questions_answered)
+                    if resolved is not None:
+                        return resolved
+            except Exception as exc:
+                logging.debug('Проверка результата без повторной отправки не завершена: %s', type(exc).__name__)
             return False, (f"{APPLY_NOT_CONFIRMED_MARKER} ({last_state}). "
-                           "Отправка не подтверждена; не повторяю автоматически. Проверьте отклики на HH.")
+                           + self.application_ui_problem('confirmation_missing',
+                               'HH не подтвердил доставку отклика. Проверьте историю откликов'))
         return False, 'Кнопка отправки недоступна — отклик не отправлен'
 
     def collect_question_field_ids(self):
@@ -2516,19 +2762,6 @@ class HHSeleniumBot:
             time.sleep(0.5)
 
     def click_lowest_visible_apply_button(self):
-        try:
-            target = self.driver.execute_script(VISIBLE_APPLY_TARGET_SCRIPT)
-        except Exception as e:
-            logging.debug(f"Не удалось выбрать видимую кнопку отклика: {e}")
-            target = {'found': False}
-
-        # hitsTarget: под координатами кнопки действительно кнопка, а не шапка и
-        # не оверлей. Без этой проверки промах возвращался как отправленный отклик.
-        if target.get('found') and target.get('hitsTarget'):
-            if self.click_viewport_coordinates(target['centerX'], target['centerY']):
-                time.sleep(0.8)
-                return True
-
         buttons = self.find_visible_apply_text_buttons()
         if not buttons:
             return False
@@ -2540,7 +2773,7 @@ class HHSeleniumBot:
                 return 0
 
         button = sorted(buttons, key=vertical_position)[-1]
-        return self.click_element_with_mouse(button)
+        return self.dispatch_response_button(button)
 
     def is_dead_session_message(self, message):
         lower_message = str(message).lower()
@@ -2707,7 +2940,7 @@ class HHSeleniumBot:
                 logging.error(f"[X] Ошибка подключения к Chrome debugger {self.debugger_address}: {explain_error(e)}")
                 return False
         
-
+                
         # eager: не ждать load-событие сторонних скриптов hh. Без него driver.get() в фоне висел вечно (05.10),
         # а в окне страница выдачи грузилась ~35 с вместо ~7 с (06.10: 12 страниц = 6 минут «тишины»).
         options.page_load_strategy = 'eager'
@@ -2918,7 +3151,8 @@ class HHSeleniumBot:
         if preset_id == 'security':
             strict_match = self.find_keyword(title, STRICT_TITLE_INCLUDE_KEYWORDS)
             fallback_match = None
-            if self.config.get('allow_technical_fallback', True):
+            if (self.config.get('allow_technical_fallback', True)
+                    and not self.find_keyword(title, TECHNICAL_FALLBACK_EXCLUDE_KEYWORDS)):
                 fallback_match = self.find_keyword(title, TECHNICAL_FALLBACK_INCLUDE_KEYWORDS)
 
             if not strict_match and not fallback_match:
@@ -3213,6 +3447,102 @@ class HHSeleniumBot:
                 return idx
         return None
 
+    def question_memory(self):
+        from question_memory import QuestionMemory, profile_scope
+        if getattr(self, 'db', None) is None:
+            return None
+        memory = getattr(self, '_question_memory', None)
+        if memory is None or memory.scope != profile_scope(self.config):
+            memory = self._question_memory = QuestionMemory(self.db, self.config)
+        return memory
+
+    def describe_memory_question(self, block, question_text):
+        """Only unambiguous blocks with one answer type can be reused."""
+        from question_memory import question_signature
+        radios = block.find_elements(By.CSS_SELECTOR, 'input[type="radio"]')
+        boxes = block.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
+        selects = [e for e in block.find_elements(By.CSS_SELECTOR, 'select') if e.is_displayed()]
+        texts = [e for e in block.find_elements(By.CSS_SELECTOR, 'input, textarea')
+                 if e.is_displayed() and (e.get_attribute('type') or 'text').lower()
+                 in ('text', 'textarea', 'email', 'tel', 'url', 'number')]
+        groups = [bool(radios), bool(boxes), bool(selects), bool(texts)]
+        if sum(groups) != 1 or len(selects) > 1 or len(texts) > 1:
+            return None
+        if radios or boxes:
+            fields = radios or boxes
+            options = [self.get_option_label(e) for e in fields]
+            kind = 'single' if radios else 'multi'
+            if radios and len({e.get_attribute('name') for e in radios}) > 1:
+                return None
+        elif selects:
+            if selects[0].get_attribute('multiple'):
+                return None
+            fields = [e for e in selects[0].find_elements(By.CSS_SELECTOR, 'option') if e.text.strip()]
+            options = [e.text.strip() for e in fields]
+            kind = 'single'
+        else:
+            fields, options, kind = texts, [], 'text'
+        signature = question_signature(question_text, kind, options)
+        return signature, kind, options, fields
+
+    def confirmed_question_answer(self, question, kind='text', options=()):
+        from question_memory import question_signature
+        try:
+            signature = question_signature(question, kind, options)
+            if signature in getattr(self, '_question_memory_ambiguous', set()):
+                return None
+            memory = self.question_memory()
+            return memory.find(question, kind, options) if memory else None
+        except Exception as exc:
+            logging.debug('Память анкеты недоступна: %s', type(exc).__name__)
+            return None
+
+    def stage_question_answer(self, block, question):
+        try:
+            descriptor = self.describe_memory_question(block, question)
+            if descriptor is None:
+                return
+            signature, kind, options, fields = descriptor
+            if signature in getattr(self, '_question_memory_ambiguous', set()):
+                return
+            answers = ([fields[0].get_attribute('value')] if kind == 'text' else
+                       [label for field, label in zip(fields, options) if field.is_selected()])
+            memory = self.question_memory()
+            if memory:
+                from urllib.parse import urlsplit, urlunsplit
+                url = urlsplit(self.driver.current_url)
+                memory.stage(question, kind, options, answers, urlunsplit((url.scheme, url.netloc, url.path, '', '')))
+        except ValueError:
+            pass  # Mixed, contextual or restricted answers are not reusable.
+        except Exception as exc:
+            logging.debug('Черновик ответа не сохранён: %s', type(exc).__name__)
+
+    def fill_confirmed_question(self, descriptor, answers):
+        from question_memory import normalize
+        _, kind, options, fields = descriptor
+        wanted = {normalize(a) for a in answers}
+        if kind == 'text':
+            return self.set_text_input_value(fields[0], answers[0])
+        if kind == 'multi':
+            for field, label in zip(fields, options):
+                selected = normalize(label) in wanted
+                if field.is_selected() != selected:
+                    if selected:
+                        if not self.click_choice(field):
+                            return False
+                    else:
+                        self.driver.execute_script('arguments[0].click()', field)
+            return {normalize(label) for field, label in zip(fields, options) if field.is_selected()} == wanted
+        for field, label in zip(fields, options):
+            if normalize(label) in wanted:
+                if field.is_selected():
+                    return True
+                if (field.tag_name or '').lower() == 'option':
+                    field.click()
+                    return field.is_selected()
+                return self.click_choice(field)
+        return False
+
     def batch_answer_for(self, question_text):
         """Ответ модели на ЭТОТ вопрос из пакетного разбора анкеты.
 
@@ -3346,6 +3676,24 @@ class HHSeleniumBot:
         """
         answered = 0
         short_q = ' '.join(question_text.split())[:120]
+
+        try:
+            descriptor = self.describe_memory_question(block, question_text)
+        except Exception:
+            descriptor = None
+        if descriptor:
+            _, kind, options, fields = descriptor
+            saved = self.confirmed_question_answer(question_text, kind, options)
+            if saved is not None:
+                try:
+                    ok = self.fill_confirmed_question(descriptor, saved)
+                except Exception:
+                    ok = False
+                handled.update(field.id for field in block.find_elements(By.CSS_SELECTOR, 'input, textarea, select'))
+                if ok:
+                    logging.info('Анкета: использован подтверждённый ответ из памяти')
+                    return max(1, len(saved)), None
+                return 0, f'{short_q} [подтверждённый ответ не удалось заполнить]'
 
         def fresh(elements, hidden_ok=False):
             out = []
@@ -3598,6 +3946,8 @@ class HHSeleniumBot:
             questions_answered += answered
             if unresolved:
                 self.unanswered_questions.append(unresolved)
+            elif answered:
+                self.stage_question_answer(block, question_text)
 
         # Отдельные поля ответа вне распознанных блоков
         try:
@@ -3623,6 +3973,7 @@ class HHSeleniumBot:
                     continue
                 if self.set_text_input_value(inp, str(answer)):
                     questions_answered += 1
+                    self.stage_question_answer(inp.find_element(By.XPATH, '..'), placeholder)
                 else:
                     # Тот же молчаливый провал, что уже закрыт в answer_single_question:
                     # ответ не встал в поле, но вопрос нигде не отмечался — отклик
@@ -3646,6 +3997,16 @@ class HHSeleniumBot:
         self._batch_answers = {}
         self._batch_answers_by_block = {}
         self._current_block_id = None
+        from collections import Counter
+        signatures = []
+        for block in blocks:
+            try:
+                descriptor = self.describe_memory_question(block, block.text)
+                if descriptor:
+                    signatures.append(descriptor[0])
+            except Exception:
+                pass
+        self._question_memory_ambiguous = {key for key, count in Counter(signatures).items() if count > 1}
         ai = getattr(self, 'ai_assistant', None)
         if not ai or not getattr(ai, 'enabled', False):
             return
@@ -3665,6 +4026,12 @@ class HHSeleniumBot:
                 continue
             if not text:
                 continue
+            try:
+                descriptor = self.describe_memory_question(block, text)
+                if descriptor and self.confirmed_question_answer(text, descriptor[1], descriptor[2]) is not None:
+                    continue
+            except Exception:
+                pass
             # Варианты ответа отдаём модели вместе с вопросом: иначе на
             # «отметьте нужное» она вернёт свободный текст, который некуда деть.
             options, multi = [], False
@@ -3703,7 +4070,7 @@ class HHSeleniumBot:
 
         # Один свободный вопрос ИИ разберёт и без пакета. Вопрос с вариантами —
         # нет: для флажков иного пути к ИИ нет, и «Какой формат работы вы
-        # рассматриваете? ☐Офис ☐Гибрид ☐Удалённо» оставался без ответа (вариант с несколькими флажками).
+        # рассматриваете? ☐Офис ☐Гибрид ☐Удалённо» оставался без ответа (Солар, 25.09).
         if not pending or (len(pending) == 1 and not pending[0]['options']):
             return
 
@@ -3725,7 +4092,7 @@ class HHSeleniumBot:
     def yes_policy_question(self, text) -> bool:
         """Вопрос «подходит ли / готовы ли» при включённой политике «да».
 
-        Готовый ответ «Рассматриваю удалённую работу» на «Наш формат 4/1 в
+        Готовый ответ «Живу в другом регионе, рассматриваю удалённо» на «Наш формат 4/1 в
         пользу офиса. Подходит?» звучал как отказ (25.09). Такие вопросы отдаём ИИ.
         """
         policy = (self.config or {}).get('answer_policy') or {}
@@ -3744,9 +4111,13 @@ class HHSeleniumBot:
         if is_restricted_question(q_clean):
             return SALARY_ANSWER
 
+        saved = self.confirmed_question_answer(q_clean)
+        if saved is not None:
+            return saved[0]
+
         # 1. Готовые ответы из конфига — только на короткие вопросы. Ключ ищется
         # подстрокой, и на длинный вопрос «Опишите случай подключения источника
-        # логов к SIEM…» бот отвечал «Рассматриваю удалённую работу» (25.09).
+        # логов к SIEM…» бот отвечал «Живу в другом регионе» (25.09).
         if is_short_question(q_clean) and not self.yes_policy_question(q_clean):
             for keyword, answer in custom_answers.items():
                 if keyword.lower() in q_lower:
@@ -3947,7 +4318,7 @@ class HHSeleniumBot:
         # Один раз называем, чем будут писаться письма.
         try:
             if getattr(self, "ai_assistant", None):
-                report = self.ai_assistant.probe_report()
+                report = self.ai_assistant.probe_report(first_ready=True)
                 if report:
                     logging.info(report)
                 logging.info(f"Письма пишет: {self.ai_assistant.active_model_label()}")
@@ -3988,13 +4359,61 @@ class HHSeleniumBot:
         low = (employer_name or '').lower()
         return bool(low) and any(part in low for part in names)
 
+    def prefetch_letters(self, vacancies, start):
+        """Письма для следующих вакансий пишут ИИ в фоне, пока браузер занят текущим откликом.
+
+        14.10: письмо ждали 5-16 с внутри каждого отклика. Описание берём с публичной
+        страницы вакансии (без браузера), письмо — свободными моделями ИИ параллельно.
+        Сколько вакансий вперёд — настройка letter_prefetch (0 — выключено).
+        """
+        try:
+            ahead = int(self.config.get('letter_prefetch', 3))
+        except (TypeError, ValueError):
+            ahead = 3
+        if ahead <= 0 or not getattr(self, 'ai_assistant', None):
+            return
+        if not self.config.get('ai_config', {}).get('enabled', True):
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        if getattr(self, '_prefetch_pool', None) is None:
+            self._prefetch_pool = ThreadPoolExecutor(max_workers=ahead)
+            self._prefetched = {}
+        for vacancy in vacancies[start:start + ahead]:
+            vacancy_id = str(vacancy.get('id') or '')
+            if not vacancy_id or vacancy_id in self._prefetched or vacancy_id in self.applied_vacancies:
+                continue
+            title = vacancy.get('name', '')
+            company = (vacancy.get('employer') or {}).get('name', '')
+
+            def job(vacancy_id=vacancy_id, title=title, company=company):
+                description = fetch_vacancy_text(vacancy_id)
+                if not description:
+                    return None
+                # 14.10: без предела письма ждали замок одной модели друг за другом (15 с на
+                # письмо, 54 с у третьего). С пределом занятая модель пропускается.
+                from ai_assistant import _AI_BUDGET
+                token = _AI_BUDGET.set(150)
+                try:
+                    return self.ai_assistant.generate_cover_letter(
+                        vacancy_title=title, company_name=company,
+                        vacancy_description=description, skills_list=[])
+                finally:
+                    _AI_BUDGET.reset(token)
+            self._prefetched[vacancy_id] = self._prefetch_pool.submit(job)
+
+    def take_prefetched_letter(self, vacancy_url):
+        """Готовое заранее письмо для этой вакансии или None."""
+        vacancy_id = self.get_vacancy_id_from_url(vacancy_url)
+        return (getattr(self, '_prefetched', None) or {}).pop(str(vacancy_id or ''), None)
+
     def process_api_vacancies(self, vacancies):
         """Откликается через браузер на вакансии из API-кеша."""
         vacancies_processed = 0
         for index, vacancy in enumerate(vacancies, 1):
             if self.check_interactive_controls() == 'stop' or self.stop_requested:
-                logging.info("[СТОП] Остановка по запросу пользователя")
+                self.log_stop_reason()
                 break
+            self.prefetch_letters(vacancies, index - 1)
 
             if self.local_application_limit_reached():
                 logging.info("[СТОП] Достигнут пользовательский локальный предел откликов")
@@ -4121,6 +4540,9 @@ class HHSeleniumBot:
                 self.save_applied(vacancy_id, vacancy_name, STATUS_ALREADY_APPLIED)
                 if hasattr(self, 'db') and self.db:
                     self.db.record_skipped_vacancy(vacancy_id, vacancy_name, employer, vacancy_url, reason='already_applied')
+            elif message in (LOGIN_FORM_SKIP_MESSAGE, ACCESS_RESTRICTED_MESSAGE):
+                logging.info(f" [ПРОПУСК] {message}")
+                self.skipped += 1
             elif message == "Вам отказали":
                 logging.info(" [ПРОПУСК] Вам отказали")
                 self.skipped += 1
@@ -4158,6 +4580,9 @@ class HHSeleniumBot:
 
     def apply_to_vacancy(self, vacancy_url, vacancy_name):
         """Откликается на конкретную вакансию с сопроводительным письмом"""
+        self._response_submit_dispatched = False
+        self._response_warning_dispatched = False
+        self._response_captcha_attempted = False
         if self.check_interactive_controls() == 'stop' or self.stop_requested:
             return False, "Остановлено пользователем"
         self.letter_skip_reason = ''
@@ -4165,9 +4590,51 @@ class HHSeleniumBot:
         # Прогон идёт часами, а бесплатное поднятие доступно каждые 4 часа —
         # поднимаем, как только подошло время, а не раз за запуск.
         self.maybe_bump_resume()
+        page_opened = False
         try:
+            t_get = time.perf_counter()
             self.driver.get(vacancy_url)
-            self.random_delay((0.8, 1.2))
+            logging.debug(f"Страница вакансии открылась за {time.perf_counter() - t_get:.1f} с")
+            page_opened = True
+            self.random_delay((0.2, 0.4))
+
+            login_selector = 'form[data-qa="account-login-form"]'
+            if any(el.tag_name == 'form' and el.is_displayed()
+                   for el in self.driver.find_elements(By.CSS_SELECTOR, login_selector)):
+                if self.vacancy_access_restricted():
+                    self._login_form_streak = 0
+                    return False, ACCESS_RESTRICTED_MESSAGE
+                logging.warning('HH показал форму входа вместо вакансии; проверяю сессию до отправки')
+                if not self.check_login() and not self.login():
+                    self.stop_requested = True
+                    return False, 'Требуется вход в HH: запустите бот с окном браузера и войдите в аккаунт'
+                vacancy_id = self.get_vacancy_id_from_url(vacancy_url)
+                if not vacancy_id or not vacancy_id.isdigit() or not is_allowed_hh_url(vacancy_url):
+                    return False, LOGIN_FORM_SKIP_MESSAGE
+                # Discard regional/login tracking parameters, never follow an arbitrary redirect target.
+                self.driver.get(f'https://hh.ru/vacancy/{vacancy_id}')
+                if self.vacancy_access_restricted():
+                    self._login_form_streak = 0
+                    return False, ACCESS_RESTRICTED_MESSAGE
+                try:
+                    WebDriverWait(self.driver, 3, poll_frequency=.2,
+                                  ignored_exceptions=(StaleElementReferenceException,)).until(
+                        lambda driver: not any(el.tag_name == 'form' and el.is_displayed()
+                                               for el in driver.find_elements(By.CSS_SELECTOR, login_selector)))
+                except TimeoutException:
+                    # 14.10: сессия жива, а форма входа только на этой вакансии —
+                    # пропускаем её; стоп, только если так подряд на трёх вакансиях.
+                    self._login_form_streak = getattr(self, '_login_form_streak', 0) + 1
+                    if self._login_form_streak >= 3:
+                        self.stop_requested = True
+                        return False, 'HH снова требует вход; отклик не отправлен. Проверьте аккаунт в окне браузера'
+                    return False, LOGIN_FORM_SKIP_MESSAGE
+                recovered_url = self.driver.current_url or ''
+                if (not is_allowed_hh_url(recovered_url)
+                        or urlparse(recovered_url).path.rstrip('/') != f'/vacancy/{vacancy_id}'):
+                    return False, self.application_ui_problem(
+                        'vacancy_login_redirect', 'После входа открылась не та вакансия; отправка не выполнялась')
+            self._login_form_streak = 0
 
             initial_state = self.detect_response_state()
             if initial_state == 'denied':
@@ -4253,7 +4720,20 @@ class HHSeleniumBot:
                 from concurrent.futures import ThreadPoolExecutor
                 if getattr(self, '_letter_pool', None) is None:
                     self._letter_pool = ThreadPoolExecutor(max_workers=1)
-                letter_job = self._letter_pool.submit(
+                prefetched = self.take_prefetched_letter(vacancy_url)
+                # Заранее готовое письмо годится, если оно уже написано или пишется; пустое — пишем заново.
+                def _ready_empty(job):
+                    try:
+                        return job.done() and not job.result()
+                    except Exception:
+                        return True
+                if prefetched is not None and not _ready_empty(prefetched):
+                    letter_job = prefetched
+                    logging.info(" Письмо подготовлено заранее")
+                else:
+                    letter_job = None
+                if letter_job is None:
+                    letter_job = self._letter_pool.submit(
                     self.ai_assistant.generate_cover_letter,
                     vacancy_title=vacancy_name,
                     company_name=company_name,
@@ -4343,7 +4823,7 @@ class HHSeleniumBot:
 
             # Проверяем и подтверждаем предупреждающие окна (другая страна / релокация)
             if self.handle_warning_popups():
-                time.sleep(0.8)
+                time.sleep(0.3)
 
             # Забираем письмо из фона: форма открыта, дальше ввод.
             if letter_job is not None:
@@ -4364,25 +4844,42 @@ class HHSeleniumBot:
 
             letter_sent = False
             questions_answered = 0
+            t_form = time.perf_counter()
             submitted, letter_sent, answered_now, blocker_message = self.submit_open_response_modal(
                 cover_letter,
                 letter_sent,
             )
+            t_submitted = time.perf_counter()
+            self._response_submit_dispatched = submitted or self._response_submit_dispatched
             questions_answered += answered_now
             self.last_application_meta['questions_count'] = questions_answered
 
             if blocker_message:
+                if self._response_submit_dispatched and blocker_message == 'Требуется капча':
+                    return self.confirm_post_dispatch_captcha(letter_sent, questions_answered)
+                if blocker_message == 'Ошибка HH после клика':
+                    prefix = APPLY_NOT_CONFIRMED_MARKER + '. ' if submitted else ''
+                    return False, prefix + self.application_ui_problem(
+                        'hh_response_error', blocker_message)
                 return False, blocker_message
 
             # Повторная проверка предупреждений после отправки формы
             if self.handle_warning_popups():
-                time.sleep(0.8)
+                time.sleep(0.3)
 
             if submitted:
-                time.sleep(0.5)
+                time.sleep(0.2)
 
+            t_confirm = time.perf_counter()
             ok, message = self.confirm_response_submission(
                 cover_letter, letter_sent, questions_answered, modal_submitted=submitted)
+            # 15.10: в живом прогоне «письмо заполнено -> отклик отправлен» занимало 8.8 с,
+            # а замер в одиночку давал 2 с. По этой строке видно, где уходит время.
+            logging.debug(f"Время отклика: форма и отправка {t_submitted - t_form:.1f} с, "
+                          f"подтверждение {time.perf_counter() - t_confirm:.1f} с")
+            if not ok and message == 'Ошибка HH после клика':
+                return False, APPLY_NOT_CONFIRMED_MARKER + '. ' + self.application_ui_problem(
+                    'hh_response_error', message)
             # В форме с анкетой у hh нет поля письма. После отклика на странице
             # вакансии появляется «Приложить сопроводительное письмо» — дописываем
             # туда: разбор отказов раз за разом называл причиной «откликнулся без
@@ -4398,9 +4895,14 @@ class HHSeleniumBot:
             return ok, message
             
         except ElementClickInterceptedException:
+            if self._response_submit_dispatched:
+                return False, APPLY_NOT_CONFIRMED_MARKER + ': проверка после отправки перекрыта'
             return False, "Элемент перекрыт"
         except Exception as e:
             msg = str(e)
+            if self._response_submit_dispatched:
+                logging.warning('После команды отправки не удалось прочитать результат (%s); повторов нет', type(e).__name__)
+                return False, APPLY_NOT_CONFIRMED_MARKER + ': результат отправки не прочитан; ' + type(e).__name__
             if self.is_dead_session_message(msg):
                 file_handler.emit(logging.LogRecord(
                     name='hh_selenium', level=logging.DEBUG,
@@ -4415,6 +4917,10 @@ class HHSeleniumBot:
                 from terminal_ui import is_network_error
                 if is_network_error(e):
                     logging.debug(f"Сетевой сбой при отклике: {e}")
+                    if 'err_ssl_protocol_error' in msg.lower():
+                        logging.warning('%s', explain_error(e))
+                        if page_opened:
+                            return False, APPLY_NOT_CONFIRMED_MARKER + ': сбой TLS после открытия вакансии'
                     return False, NETWORK_MESSAGE
             except Exception:
                 pass
@@ -4550,6 +5056,9 @@ class HHSeleniumBot:
                     self.skipped += 1
                     if vacancy_id:
                         self.save_applied(vacancy_id, vacancy_name, STATUS_ARCHIVED)
+                elif message in (LOGIN_FORM_SKIP_MESSAGE, ACCESS_RESTRICTED_MESSAGE):
+                    logging.info(f" [ПРОПУСК] {message}")
+                    self.skipped += 1
                 elif str(message).startswith(("Токсичный маркер", "AI-фильтр:")):
                     # Уже помечено и выведено как [ПРОПУСК] внутри apply_to_vacancy.
                     pass
@@ -4711,6 +5220,12 @@ class HHSeleniumBot:
         не копится (иначе серия «странных» вакансий зря оборвёт прогон до 200).
         """
         text = message or ''
+        if '[captcha_required]' in text:
+            self.stop_requested = True
+            self.stop_reason = 'Требуется ручная проверка капчи HH; неподтверждённый отклик не повторяется'
+            logging.warning('[СТОП] HH показал капчу после команды отправки. '
+                            'Требуется ручная проверка; отклик сохранён как неподтверждённый, повторов нет.')
+            return True
         if APPLY_NOT_CONFIRMED_MARKER not in text or '(ready)' not in text:
             return False
 
@@ -4728,6 +5243,9 @@ class HHSeleniumBot:
             )
             return True
         return False
+
+    def log_stop_reason(self):
+        logging.info('[СТОП] %s', getattr(self, 'stop_reason', '') or 'Остановка по запросу пользователя')
 
     def build_site_search_url(self, query):
         """URL поиска hh.ru по названию вакансии (свежие сверху). Без area - поиск по всему миру."""
@@ -4845,7 +5363,7 @@ class HHSeleniumBot:
             except Exception as e:
                 logging.warning(f"Вакансии для резюме не собраны: {explain_error(e)}")
             if self.stop_requested:
-                logging.info("[СТОП] Остановка по запросу пользователя")
+                self.log_stop_reason()
                 return
 
             # ЯРУС 1: ИБ-вакансии из API-кеша (уже отфильтрованы test.py до приоритетов 1..5)
@@ -4856,7 +5374,7 @@ class HHSeleniumBot:
                 print("\n[ИНФО] В сохранённом списке нет подходящих вакансий — ищу на сайте")
 
             if self.stop_requested:
-                logging.info("[СТОП] Остановка по запросу пользователя")
+                self.log_stop_reason()
                 return
 
             # Направление: для ИБ — ИБ-запросы и добор разработкой, для других —
@@ -4880,7 +5398,7 @@ class HHSeleniumBot:
             )
 
             if self.stop_requested:
-                logging.info("[СТОП] Остановка по запросу пользователя")
+                self.log_stop_reason()
                 return
 
             # ЯРУС 3: если вся ИБ исчерпана, а до лимита не дотянули — добор разработкой/IT
@@ -4915,8 +5433,18 @@ def main():
     print("\n" + "="*60)
 
     args = sys.argv[1:]
+    if '--inspect-application' in args:
+        index = args.index('--inspect-application') + 1
+        vacancy_id = args[index] if index < len(args) else ''
+        bot = HHSeleniumBot(headless=False, pause_before_close=False)
+        try:
+            bot.inspect_application(vacancy_id)
+        finally:
+            bot.close_driver()
+        return
     if '--help' in args:
         print("\nКоманды:")
+        print(" python hh_selenium.py --inspect-application ID          - проверить статус на HH без отправки и изменения истории")
         print(" python hh_selenium.py --api-cache --limit 200            - отклики по сохранённому списку, до 200 за раз")
         print(" python hh_selenium.py --api-cache --headless --limit 200 - то же, но в фоне, без окна браузера")
         print(" python hh_selenium.py --api-cache --debugger 127.0.0.1:9122 --limit 200  - подключиться к уже открытому браузеру")
@@ -4992,6 +5520,38 @@ def main():
         bot.run_api_cache()
     else:
         bot.run()
+
+
+def _log_slow_steps(cls, names, threshold=0.7):
+    """15.10: живой отклик занимает ~24 с, а замер в одиночку давал 10. Шаги дольше threshold с
+    пишутся в журнал (уровень DEBUG), чтобы по прогону было видно, где уходит время."""
+    import functools
+
+    for name in names:
+        original = getattr(cls, name, None)
+        if original is None:
+            continue
+
+        def make(fn, label):
+            @functools.wraps(fn)
+            def timed(*args, **kwargs):
+                started = time.perf_counter()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    spent = time.perf_counter() - started
+                    if spent >= threshold:
+                        logging.debug(f"Медленный шаг {label}: {spent:.1f} с")
+            return timed
+        setattr(cls, name, make(original, name))
+
+
+_log_slow_steps(HHSeleniumBot, (
+    'find_response_modal', 'ensure_target_resume_selected', 'open_cover_letter_in_modal',
+    'fill_cover_letter', 'answer_employer_questions', 'get_response_blocker_message',
+    'click_response_submit_button', 'handle_warning_popups', 'wait_for_response_state',
+    'click_element_with_mouse', 'detect_response_state', 'get_vacancy_page_description',
+    'page_has_captcha', 'page_says_archived', 'attach_letter_after_response'))
 
 
 if __name__ == '__main__':
